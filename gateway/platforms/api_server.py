@@ -1405,6 +1405,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            approval_session_key = gateway_session_key or session_id or completion_id
+            self._run_approval_sessions[completion_id] = approval_session_key
+            self._set_run_status(
+                completion_id,
+                "running",
+                created_at=time.time(),
+                session_id=session_id,
+                model=model_name,
+                gateway_session_key=gateway_session_key,
+            )
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -1465,6 +1475,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            def _on_approval_request(approval_data: Dict[str, Any]) -> None:
+                event = dict(approval_data or {})
+                event.update({
+                    "run_id": completion_id,
+                    "session_id": session_id,
+                    "gateway_session_key": gateway_session_key,
+                    "timestamp": time.time(),
+                    "choices": ["once", "session", "always", "deny"],
+                })
+                self._set_run_status(
+                    completion_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
+                )
+                _stream_q.put(("__approval_request__", event))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -1485,6 +1511,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 model_override=model_name,
+                approval_notify_callback=_on_approval_request,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1666,6 +1693,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__approval_request__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: approval.request\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -1707,8 +1739,29 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                if isinstance(result, dict) and result.get("failed"):
+                    self._set_run_status(
+                        completion_id,
+                        "failed",
+                        error=result.get("error") or "agent run failed",
+                        last_event="run.failed",
+                    )
+                else:
+                    self._set_run_status(
+                        completion_id,
+                        "completed",
+                        output=(result.get("final_response", "") if isinstance(result, dict) else ""),
+                        usage=usage,
+                        last_event="run.completed",
+                    )
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                self._set_run_status(
+                    completion_id,
+                    "failed",
+                    error=str(exc),
+                    last_event="run.failed",
+                )
 
             # Finish chunk
             finish_chunk = {
@@ -1756,6 +1809,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(b"data: [DONE]\n\n")
             except Exception:
                 pass
+
+        finally:
+            self._run_approval_sessions.pop(completion_id, None)
 
         return response
 
@@ -3069,6 +3125,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
+        approval_notify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3084,6 +3141,9 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            approval_session_key = gateway_session_key or session_id or ""
+            approval_token = None
+            session_tokens = []
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
@@ -3097,23 +3157,57 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+            try:
+                if approval_session_key:
+                    try:
+                        from gateway.session_context import clear_session_vars, set_session_vars
+                        from tools.approval import (
+                            register_gateway_notify,
+                            reset_current_session_key,
+                            set_current_session_key,
+                            unregister_gateway_notify,
+                        )
+
+                        approval_token = set_current_session_key(approval_session_key)
+                        session_tokens = set_session_vars(
+                            platform="api_server",
+                            session_key=approval_session_key,
+                        )
+                        if approval_notify_callback is not None:
+                            register_gateway_notify(approval_session_key, approval_notify_callback)
+                    except Exception:
+                        logger.debug("Failed to bind API server approval context", exc_info=True)
+
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                if approval_session_key:
+                    try:
+                        from gateway.session_context import clear_session_vars
+                        from tools.approval import reset_current_session_key, unregister_gateway_notify
+
+                        unregister_gateway_notify(approval_session_key)
+                        if approval_token is not None:
+                            reset_current_session_key(approval_token)
+                        if session_tokens:
+                            clear_session_vars(session_tokens)
+                    except Exception:
+                        pass
 
         return await loop.run_in_executor(None, _run)
 
@@ -3139,6 +3233,20 @@ class APIServerAdapter(BasePlatformAdapter):
         current.update(fields)
         self._run_statuses[run_id] = current
         return current
+
+    def _resolve_active_approval_session_key(self, run_id: str) -> Optional[str]:
+        """Find the approval session key for a run/completion/session identifier."""
+        direct = self._run_approval_sessions.get(run_id)
+        if direct:
+            return direct
+
+        for active_id, session_key in list(self._run_approval_sessions.items()):
+            if run_id == session_key:
+                return session_key
+            status = self._run_statuses.get(active_id) or {}
+            if run_id == status.get("session_id") or run_id == status.get("gateway_session_key"):
+                return session_key
+        return None
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -3490,11 +3598,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
-        if status is None:
+        approval_session_key = self._resolve_active_approval_session_key(run_id)
+        if status is None and not approval_session_key:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        if status is None:
+            status = {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "waiting_for_approval",
+                "updated_at": time.time(),
+            }
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
@@ -3579,7 +3695,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        approval_session_key = self._run_approval_sessions.get(run_id)
+        approval_session_key = self._resolve_active_approval_session_key(run_id)
         if not approval_session_key:
             return web.json_response(
                 _openai_error(
@@ -3614,7 +3730,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        if status is not None:
+            self._set_run_status(run_id, "running", last_event="approval.responded")
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
