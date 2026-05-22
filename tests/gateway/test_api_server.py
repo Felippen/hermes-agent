@@ -380,6 +380,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/v1/commands", adapter._handle_commands)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -3311,3 +3312,140 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+
+
+# ---------------------------------------------------------------------------
+# Server-side slash commands (/help, /status, /new, …)
+# ---------------------------------------------------------------------------
+
+
+class TestServerSideSlashCommands:
+    """Recognised gateway slash commands are intercepted and answered by
+    the API server itself — they must never reach the agent loop.
+    """
+
+    def test_is_api_slash_command_recognises_known_commands(self, adapter):
+        assert adapter._is_api_slash_command("/help") is True
+        assert adapter._is_api_slash_command("  /status  ") is True
+        assert adapter._is_api_slash_command("/new please") is True
+
+    def test_is_api_slash_command_rejects_non_commands(self, adapter):
+        assert adapter._is_api_slash_command("hello there") is False
+        assert adapter._is_api_slash_command("") is False
+        assert adapter._is_api_slash_command("/definitelynotacommand") is False
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_help_returns_command_list(self, adapter):
+        """Non-streaming '/help' returns the gateway command listing and
+        never invokes the agent."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/help"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "chat.completion"
+                assert data["choices"][0]["finish_reason"] == "stop"
+                content = data["choices"][0]["message"]["content"]
+                assert "Available commands" in content
+                # gateway_help_lines() renders entries as `/<name> ...`.
+                assert "`/" in content
+                # The agent must not be invoked for an intercepted command.
+                mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_emits_delta_chunks(self, auth_adapter):
+        """Streaming '/status' streams the markdown back as SSE delta chunks."""
+        mock_db = MagicMock()
+        mock_db.get_session_title.return_value = "My Chat"
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "sess-status-1",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/status"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                assert "text/event-stream" in resp.headers.get("Content-Type", "")
+                body = await resp.text()
+                assert "chat.completion.chunk" in body
+                assert "Session status" in body
+                assert "sess-status-1" in body
+                assert "My Chat" in body
+                assert "[DONE]" in body
+                mock_run.assert_not_called()
+            mock_db.get_session_title.assert_called_once_with("sess-status-1")
+
+    @pytest.mark.asyncio
+    async def test_new_command_clears_session_db_messages(self, auth_adapter):
+        """'/new' clears the session's stored messages via the session DB."""
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "sess-to-clear",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/new"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                assert "cleared" in content.lower()
+                mock_run.assert_not_called()
+            mock_db.clear_messages.assert_called_once_with("sess-to-clear")
+
+
+    @pytest.mark.asyncio
+    async def test_commands_endpoint_returns_json_list(self, adapter):
+        """GET /v1/commands should return the dyn list of server commands."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "list"
+            names = [item["name"] for item in data["data"]]
+            assert "/help" in names
+            assert "/status" in names
+
+    @pytest.mark.asyncio
+    async def test_responses_endpoint_intercepts_help(self, adapter):
+        """The Responses API path intercepts slash commands too."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "/help", "store": False},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "response"
+                assert data["status"] == "completed"
+                text = data["output"][0]["content"][0]["text"]
+                assert "Available commands" in text
+                mock_run.assert_not_called()

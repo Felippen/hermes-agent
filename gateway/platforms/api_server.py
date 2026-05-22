@@ -962,6 +962,55 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+
+    async def _handle_commands(self, request: "web.Request") -> "web.Response":
+        """GET /v1/commands — Return a dynamic list of active API-callable slash commands."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.commands import COMMAND_REGISTRY, resolve_command
+        
+        # Emitted command collection mapping
+        data = []
+        emoji_map = {
+            "help": "✨", "commands": "✨",
+            "status": "ℹ️",
+            "profile": "👤",
+            "yolo": "🚀",
+            "clear": "🗑️", "new": "🗑️", "reset": "🗑️",
+            "usage": "📊",
+            "agents": "🤖", "tasks": "🤖",
+            "undo": "⏮️",
+            "fast": "⚡️",
+            "compress": "🗜️",
+            "reload-mcp": "🔌", "reload_mcp": "🔌",
+            "reload-skills": "🎓", "reload_skills": "🎓",
+            "voice": "🎙️",
+            "restart": "🔄",
+            "stop": "🛑",
+            "undo": "⏮️"
+        }
+
+        for cmd in COMMAND_REGISTRY:
+            # Filter out commands that are exclusive to the CLI loop
+            if cmd.cli_only:
+                continue
+            
+            emoji = emoji_map.get(cmd.name, "⚙️")
+            data.append({
+                "name": f"/{cmd.name}",
+                "description": cmd.description,
+                "emoji": emoji,
+                "argsHint": cmd.args_hint
+            })
+            
+        return web.json_response({
+            "object": "list",
+            "data": data
+        })
+
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -1020,6 +1069,206 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
+
+    # ------------------------------------------------------------------
+    # Server-side slash commands
+    # ------------------------------------------------------------------
+
+    def _is_api_slash_command(self, text: Any) -> bool:
+        """Return True when ``text`` is a recognised gateway slash command.
+
+        The chat-completions / responses handlers use this to intercept
+        commands such as ``/help`` or ``/new`` and answer them
+        server-side instead of forwarding them to the agent loop.
+        """
+        raw_text = ""
+        if isinstance(text, str):
+            raw_text = text
+        elif isinstance(text, list):
+            for part in text:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    raw_text = part.get("text", "")
+                    break
+        
+        raw_text = raw_text.strip()
+        if not raw_text or not raw_text.startswith("/"):
+            return False
+            
+        parts = raw_text.split(maxsplit=1)
+        cmd_name = parts[0][1:].lower()
+        from hermes_cli.commands import resolve_command
+        return resolve_command(cmd_name) is not None
+
+    def _execute_api_slash_command(
+        self, command_text: str, session_id: str, gateway_session_key: str = None
+    ) -> str:
+        """Execute a recognised gateway slash command server-side.
+
+        Returns a markdown string suitable for handing straight back to an
+        OpenAI-compatible client as assistant message content.  Commands
+        handled here never reach the agent loop.  ``command_text`` is
+        assumed to have already passed :meth:`_is_api_slash_command`.
+        """
+        parts = command_text.strip().split(maxsplit=1)
+        cmd_name = parts[0][1:].lower()
+        from hermes_cli.commands import resolve_command
+        cmd = resolve_command(cmd_name)
+        # Resolve aliases (e.g. /commands) to their canonical name.
+        canonical = cmd.name if cmd is not None else cmd_name
+
+        if canonical in ("help", "commands"):
+            from hermes_cli.commands import gateway_help_lines
+            lines = gateway_help_lines()
+            body = "\n".join(f"- {ln}" for ln in lines) or "_(no commands available)_"
+            return "**Available commands**\n\n" + body
+
+        if canonical == "status":
+            title = None
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    title = db.get_session_title(session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("status command: could not load session title: %s", exc)
+            return "**Session status**\n\n" + "\n".join([
+                f"- **Session ID:** `{session_id}`",
+                f"- **Title:** {title or '(untitled)'}",
+                "- **Platform:** API Server",
+            ])
+
+        if canonical == "profile":
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile_name = get_active_profile_name()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("profile command: could not resolve profile: %s", exc)
+                profile_name = "unknown"
+            try:
+                from hermes_constants import get_hermes_home
+                home = str(get_hermes_home())
+            except Exception:  # noqa: BLE001
+                home = os.path.expanduser("~/.hermes")
+            return (
+                "**Active profile**\n\n"
+                f"- **Profile:** `{profile_name}`\n"
+                f"- **Home:** `{home}`"
+            )
+
+        if canonical == "yolo":
+            key = gateway_session_key or session_id
+            try:
+                from tools import approval
+                if approval.is_session_yolo_enabled(key):
+                    approval.disable_session_yolo(key)
+                    return "YOLO mode **disabled** for this session."
+                approval.enable_session_yolo(key)
+                return (
+                    "YOLO mode **enabled** for this session — tool "
+                    "approvals will be auto-accepted."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("yolo command failed: %s", exc)
+                return f"Could not toggle YOLO mode: {exc}"
+
+        if canonical == "restart":
+            try:
+                import weakref
+                from gateway.run import _gateway_runner_ref
+                runner = _gateway_runner_ref()
+                if runner is not None:
+                    runner.request_restart(detached=True)
+                    return "✓ Restart requested! Reloading the Hermes Gateway proxy..."
+                else:
+                    import subprocess
+                    subprocess.Popen(
+                        "HOME=/Users/felipelamartine hermes gateway restart",
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True
+                    )
+                    return "✓ Restart requested! Relaunching gateway via CLI helper..."
+            except Exception as exc:
+                logger.warning("api_server restart slash command failed: %s", exc)
+                return f"Could not request restart: {exc}"
+
+        if canonical in ("new", "reset", "clear"):
+            try:
+                db = self._ensure_session_db()
+                if db is None:
+                    return "Conversation cleared (no session database configured)."
+                # SessionDB exposes clear_messages(session_id); it deletes
+                # all rows for the session and resets its counters.
+                db.clear_messages(session_id)
+                return (
+                    f"Conversation cleared. Session `{session_id}` now has "
+                    "no messages."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clear command failed for %s: %s", session_id, exc)
+                return f"Could not clear the conversation: {exc}"
+
+        # Recognised by the registry but not serviceable over the API server.
+        return (
+            f"The command `/{cmd_name}` is recognised but is not available "
+            "over the API server. Send `/help` for the list of supported "
+            "commands."
+        )
+
+    async def _api_slash_command_chat_response(
+        self,
+        request: "web.Request",
+        command_feedback: str,
+        *,
+        stream: bool,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        gateway_session_key: str = None,
+    ) -> "web.Response":
+        """Pack a slash-command result into a Chat Completions response.
+
+        Non-streaming returns an immediate OpenAI ``chat.completion``
+        JSON body.  Streaming feeds the markdown through a one-shot queue
+        and an already-resolved ``agent_task`` future so the existing SSE
+        writer streams it without ever spawning the agent.
+        """
+        if stream:
+            import queue as _q
+            cmd_q: "_q.Queue" = _q.Queue()
+            cmd_q.put(command_feedback)
+            cmd_q.put(None)  # EOS sentinel
+            done_task: "asyncio.Future" = asyncio.get_running_loop().create_future()
+            # _write_sse_chat_completion does `result, usage = await agent_task`.
+            done_task.set_result((
+                {"final_response": command_feedback},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            ))
+            return await self._write_sse_chat_completion(
+                request, completion_id, model_name, created, cmd_q,
+                done_task, None, session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+
+        response_headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": command_feedback},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        return web.json_response(response_data, headers=response_headers)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -1138,6 +1387,20 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+
+        # ── Server-side slash command interception ──
+        # Recognised gateway commands (/help, /status, /new, …) are
+        # answered by the API server directly and never reach the agent.
+        if self._is_api_slash_command(user_message):
+            command_feedback = self._execute_api_slash_command(
+                user_message, session_id, gateway_session_key=gateway_session_key,
+            )
+            return await self._api_slash_command_chat_response(
+                request, command_feedback,
+                stream=stream, completion_id=completion_id,
+                model_name=model_name, created=created,
+                session_id=session_id, gateway_session_key=gateway_session_key,
+            )
 
         if stream:
             import queue as _q
@@ -2203,6 +2466,65 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        # ── Server-side slash command interception ──
+        # Mirrors _handle_chat_completions: recognised gateway commands are
+        # answered by the API server directly, packed into the Responses
+        # API payload shape, and never reach the agent.
+        if self._is_api_slash_command(user_message):
+            command_feedback = self._execute_api_slash_command(
+                user_message, session_id, gateway_session_key=gateway_session_key,
+            )
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            model_name = body.get("model", self._model_name)
+            if stream:
+                import queue as _q
+                cmd_q: "_q.Queue" = _q.Queue()
+                cmd_q.put(command_feedback)
+                cmd_q.put(None)  # EOS sentinel
+                done_task: "asyncio.Future" = asyncio.get_running_loop().create_future()
+                # _write_sse_responses does `result, usage = await agent_task`.
+                done_task.set_result((
+                    {"final_response": command_feedback},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                ))
+                return await self._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model=model_name,
+                    created_at=created_at,
+                    stream_q=cmd_q,
+                    agent_task=done_task,
+                    agent_ref=[None],
+                    conversation_history=conversation_history,
+                    user_message=user_message,
+                    instructions=instructions,
+                    conversation=conversation,
+                    store=store,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": model_name,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": command_feedback}],
+                    }
+                ],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }
+            response_headers = {"X-Hermes-Session-Id": session_id}
+            if gateway_session_key:
+                response_headers["X-Hermes-Session-Key"] = gateway_session_key
+            return web.json_response(response_data, headers=response_headers)
+
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -3407,6 +3729,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
