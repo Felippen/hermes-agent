@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,24 @@ _LANGFUSE_KEY_PREFIXES: Dict[str, str] = {
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _profile_metadata() -> dict[str, str]:
+    explicit = _env("HERMES_PROFILE") or _env("HERMES_PROFILE_NAME")
+    if explicit:
+        return {"profile": explicit}
+
+    hermes_home = _env("HERMES_HOME")
+    if hermes_home:
+        parts = Path(hermes_home).parts
+        if "profiles" in parts:
+            idx = parts.index("profiles")
+            if idx + 1 < len(parts) and parts[idx + 1]:
+                return {"profile": parts[idx + 1]}
+        if parts and parts[-1] == ".hermes":
+            return {"profile": "default"}
+
+    return {"profile": "unknown"}
 
 
 def _env_bool(*names: str) -> bool:
@@ -551,6 +570,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
     }
+    metadata.update(_profile_metadata())
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -788,6 +808,7 @@ def on_pre_llm_request(
             as_type="generation",
             input_value=_serialize_messages(input_messages),
             metadata={
+                **_profile_metadata(),
                 "provider": provider,
                 "platform": platform,
                 "api_mode": api_mode,
@@ -899,7 +920,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         usage_details, cost_details = {}, {}
 
     tool_count = len(output.get("tool_calls", [])) or assistant_tool_call_count
-    gen_metadata: Dict[str, Any] = {"tool_call_count": tool_count}
+    gen_metadata: Dict[str, Any] = {**_profile_metadata(), "tool_call_count": tool_count}
     if api_duration and api_duration > 0:
         gen_metadata["api_duration_s"] = round(api_duration, 3)
     if finish_reason:
@@ -936,7 +957,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             name=f"Tool: {tool_name}",
             as_type="tool",
             input_value=_safe_value(args),
-            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            metadata={**_profile_metadata(), "tool_name": tool_name, "tool_call_id": tool_call_id},
         )
         if tool_call_id:
             state.tools[tool_call_id] = observation
@@ -988,7 +1009,7 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata={**_profile_metadata(), "tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
     )
 
 

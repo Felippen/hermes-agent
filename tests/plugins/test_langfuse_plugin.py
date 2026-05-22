@@ -468,6 +468,37 @@ class TestRequestMessageCoercion:
         assert mod._coerce_request_messages(user_message="u") == [{"role": "user", "content": "u"}]
 
 
+class TestProfileMetadata:
+    def test_profile_metadata_prefers_explicit_env(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        monkeypatch.setenv("HERMES_PROFILE", "dev")
+        monkeypatch.setenv("HERMES_HOME", "/Users/felipe/.hermes/profiles/fin")
+
+        assert mod._profile_metadata()["profile"] == "dev"
+
+    def test_profile_metadata_derives_profile_from_hermes_home(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", "/Users/felipe/.hermes/profiles/sentinel")
+
+        assert mod._profile_metadata()["profile"] == "sentinel"
+
+    def test_profile_metadata_marks_root_home_as_default(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", "/Users/felipe/.hermes")
+
+        assert mod._profile_metadata()["profile"] == "default"
+
+
 class TestToolCallOutputBackfill:
     def test_post_tool_call_backfills_matching_turn_tool_call_output(self, monkeypatch):
         sys.modules.pop("plugins.observability.langfuse", None)
@@ -703,4 +734,3 @@ class TestToolObservationKeying:
         assert ended["obs"] is obs
         assert ended["output"] == {"status": "done"}
         assert not state.tools
-
