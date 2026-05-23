@@ -10,7 +10,6 @@ from typing import Any
 import yaml
 
 from tools import file_state
-from tools.file_tools import write_file_tool
 from tools.registry import registry, tool_error
 
 
@@ -169,6 +168,24 @@ def _append_operations_log(target: Path, content: str, task_id: str) -> str:
         return tool_error(str(exc))
 
 
+def _create_resource(target: Path, content: str, task_id: str) -> str:
+    if not target.parent.is_dir():
+        return tool_error("Published resource parent directory must already exist.")
+    try:
+        with file_state.lock_path(str(target)):
+            with target.open("x", encoding="utf-8") as handle:
+                handle.write(content)
+            file_state.note_write(task_id, str(target))
+        return json.dumps(
+            {"status": "ok", "path": str(target), "created": True},
+            ensure_ascii=False,
+        )
+    except FileExistsError:
+        return tool_error("Published resource already exists; updates require a separate reviewed operation.")
+    except Exception as exc:
+        return tool_error(str(exc))
+
+
 def publish_research_artifact(
     path: str,
     content: str,
@@ -189,9 +206,10 @@ def publish_research_artifact(
         resource_error = _validate_resource(content)
         if resource_error:
             return tool_error(resource_error)
+        return _create_resource(target, content, task_id)
     if artifact_type == "operations_log":
         return _append_operations_log(target, content, task_id)
-    return write_file_tool(str(target), content, task_id=task_id)
+    return tool_error("Unsupported publication artifact type.")
 
 
 PUBLISH_RESEARCH_ARTIFACT_SCHEMA = {
