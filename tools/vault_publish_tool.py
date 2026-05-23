@@ -2,6 +2,7 @@
 """Path-scoped publication tool for verified Scout research artifacts."""
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,7 @@ from tools.file_tools import write_file_tool
 from tools.registry import registry, tool_error
 
 
-VAULT_ROOT = Path(
-    "/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory"
-)
+VAULT_ROOT = Path.home() / "Documents/hermes-obsidian-long-term-memory"
 _PACKET_MODES = {
     "fact_check",
     "decision_brief",
@@ -25,6 +24,11 @@ _PACKET_MODES = {
 }
 _EVIDENCE_STATUSES = {"verified", "mixed", "provisional"}
 _URL_CITATION_RE = re.compile(r"\[[^\]\n]+\]\(https?://[^)\s]+\)")
+
+
+def _configured_vault_root() -> Path:
+    configured = os.environ.get("HERMES_VAULT_ROOT", "").strip()
+    return Path(configured).expanduser() if configured else VAULT_ROOT
 
 
 def _frontmatter(text: str, label: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -122,7 +126,7 @@ def _validate_target(path: str, artifact_type: str) -> tuple[Path | None, str | 
     if ".." in target.parts:
         return None, "Publication path traversal using '..' is not allowed."
 
-    root = VAULT_ROOT.expanduser()
+    root = _configured_vault_root().expanduser()
     try:
         target.relative_to(root)
     except ValueError:

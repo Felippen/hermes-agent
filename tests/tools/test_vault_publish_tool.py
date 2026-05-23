@@ -73,6 +73,14 @@ def _configure_vault(monkeypatch, tmp_path: Path):
     return module, vault_root
 
 
+def test_vault_root_can_be_configured_without_code_changes(monkeypatch, tmp_path):
+    module = _module()
+    configured = tmp_path / "custom-vault"
+    monkeypatch.setenv("HERMES_VAULT_ROOT", str(configured))
+
+    assert module._configured_vault_root() == configured
+
+
 def test_publishes_valid_resource_under_resources_allowlist(monkeypatch, tmp_path):
     module, vault_root = _configure_vault(monkeypatch, tmp_path)
     target = vault_root / "05 Resources" / "Verified Note.md"
