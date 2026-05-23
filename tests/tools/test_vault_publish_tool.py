@@ -3,7 +3,6 @@
 import importlib
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 
 VALID_PACKET = """\
@@ -84,59 +83,72 @@ def test_vault_root_can_be_configured_without_code_changes(monkeypatch, tmp_path
 def test_publishes_valid_resource_under_resources_allowlist(monkeypatch, tmp_path):
     module, vault_root = _configure_vault(monkeypatch, tmp_path)
     target = vault_root / "05 Resources" / "Verified Note.md"
+    target.parent.mkdir(parents=True)
 
-    with patch.object(
-        module,
-        "write_file_tool",
-        return_value=json.dumps({"status": "ok", "path": str(target)}),
-    ) as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=VALID_RESOURCE,
-                evidence_packet=VALID_PACKET,
-                artifact_type="resource",
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet=VALID_PACKET,
+            artifact_type="resource",
         )
+    )
 
     assert result["status"] == "ok"
-    write_tool.assert_called_once_with(str(target), VALID_RESOURCE, task_id="default")
+    assert result["created"] is True
+    assert target.read_text(encoding="utf-8") == VALID_RESOURCE
+
+
+def test_rejects_overwrite_of_existing_resource(monkeypatch, tmp_path):
+    module, vault_root = _configure_vault(monkeypatch, tmp_path)
+    target = vault_root / "05 Resources" / "Existing Note.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Existing durable note\n", encoding="utf-8")
+
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet=VALID_PACKET,
+            artifact_type="resource",
+        )
+    )
+
+    assert "error" in result
+    assert "already exists" in result["error"].lower()
+    assert target.read_text(encoding="utf-8") == "# Existing durable note\n"
 
 
 def test_rejects_path_outside_vault_allowlist(monkeypatch, tmp_path):
     module, _ = _configure_vault(monkeypatch, tmp_path)
     target = tmp_path / "profiles" / "scout" / "config.yaml"
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=VALID_RESOURCE,
-                evidence_packet=VALID_PACKET,
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet=VALID_PACKET,
         )
+    )
 
     assert "error" in result
     assert "approved vault path" in result["error"]
-    write_tool.assert_not_called()
 
 
 def test_rejects_parent_traversal_even_when_destination_resolves_inside(monkeypatch, tmp_path):
     module, vault_root = _configure_vault(monkeypatch, tmp_path)
     target = vault_root / "05 Resources" / ".." / "05 Resources" / "Note.md"
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=VALID_RESOURCE,
-                evidence_packet=VALID_PACKET,
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet=VALID_PACKET,
         )
+    )
 
     assert "error" in result
     assert "traversal" in result["error"].lower()
-    write_tool.assert_not_called()
 
 
 def test_rejects_symlink_escape_from_resources(monkeypatch, tmp_path):
@@ -148,36 +160,32 @@ def test_rejects_symlink_escape_from_resources(monkeypatch, tmp_path):
     (resources / "escape").symlink_to(outside, target_is_directory=True)
     target = resources / "escape" / "note.md"
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=VALID_RESOURCE,
-                evidence_packet=VALID_PACKET,
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet=VALID_PACKET,
         )
+    )
 
     assert "error" in result
     assert "symlink" in result["error"].lower()
-    write_tool.assert_not_called()
 
 
 def test_rejects_resource_without_evidence_packet_metadata(monkeypatch, tmp_path):
     module, vault_root = _configure_vault(monkeypatch, tmp_path)
     target = vault_root / "05 Resources" / "Missing Packet.md"
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=VALID_RESOURCE,
-                evidence_packet="## Claim Ledger\n",
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=VALID_RESOURCE,
+            evidence_packet="## Claim Ledger\n",
         )
+    )
 
     assert "error" in result
     assert "evidence packet" in result["error"].lower()
-    write_tool.assert_not_called()
 
 
 def test_rejects_resource_without_inline_source_citation(monkeypatch, tmp_path):
@@ -191,18 +199,16 @@ def test_rejects_resource_without_inline_source_citation(monkeypatch, tmp_path):
         "- Primary Record, retrieved 2026-05-23.",
     )
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=uncited,
-                evidence_packet=VALID_PACKET,
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=uncited,
+            evidence_packet=VALID_PACKET,
         )
+    )
 
     assert "error" in result
     assert "citation" in result["error"].lower()
-    write_tool.assert_not_called()
 
 
 def test_rejects_resource_when_only_sources_section_is_cited(monkeypatch, tmp_path):
@@ -214,19 +220,17 @@ def test_rejects_resource_when_only_sources_section_is_cited(monkeypatch, tmp_pa
         "The change is recorded by the primary source.",
     )
 
-    with patch.object(module, "write_file_tool") as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=uncited_findings,
-                evidence_packet=VALID_PACKET,
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=uncited_findings,
+            evidence_packet=VALID_PACKET,
         )
+    )
 
     assert "error" in result
     assert "findings" in result["error"].lower()
     assert "citation" in result["error"].lower()
-    write_tool.assert_not_called()
 
 
 def test_appends_operations_log_without_overwriting_existing_entries(monkeypatch, tmp_path):
@@ -236,23 +240,17 @@ def test_appends_operations_log_without_overwriting_existing_entries(monkeypatch
     target.write_text("# Operations Log\n\n- Existing entry.\n", encoding="utf-8")
     entry = "- 2026-05-23: Published [[05 Resources/Verified Note]] from verified packet.\n"
 
-    def _replacement_writer(path, content, task_id="default"):
-        Path(path).write_text(content, encoding="utf-8")
-        return json.dumps({"status": "ok", "path": path})
-
-    with patch.object(module, "write_file_tool", side_effect=_replacement_writer) as write_tool:
-        result = json.loads(
-            module.publish_research_artifact(
-                path=str(target),
-                content=entry,
-                evidence_packet=VALID_PACKET,
-                artifact_type="operations_log",
-            )
+    result = json.loads(
+        module.publish_research_artifact(
+            path=str(target),
+            content=entry,
+            evidence_packet=VALID_PACKET,
+            artifact_type="operations_log",
         )
+    )
 
     assert result["status"] == "ok"
     assert target.read_text(encoding="utf-8") == "# Operations Log\n\n- Existing entry.\n" + entry
-    write_tool.assert_not_called()
 
 
 def test_tool_is_registered_under_vault_publish_toolset():
