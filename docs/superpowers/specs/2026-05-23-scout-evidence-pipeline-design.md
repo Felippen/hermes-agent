@@ -234,13 +234,18 @@ toolsets:
 ```
 
 `vault-publish` must be implemented as a new restricted capability, not as an
-alias for unrestricted `write_file` or `patch`. Its tools may write only:
+alias for unrestricted `write_file` or `patch`. The initial implementation
+grants two publication operations only:
 
-- `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/05 Resources/`
-- `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/02 Projects/Research/scout_active_run.md`
-- `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/09 System/Operations Log.md`
-- `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/09 System/MOC - Research & Resources.md`
-- `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/05 Resources/README.md`
+- validate and write a cited research resource under
+  `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/05 Resources/`
+- append a linked publication record to
+  `/Users/felipelamartine/Documents/hermes-obsidian-long-term-memory/09 System/Operations Log.md`
+
+The plan file and index/README surfaces originally considered for publication
+are intentionally withheld in the initial rollout. They require dedicated
+append or structured-link-update operations before they can be granted without
+creating an overwrite path for existing vault metadata.
 
 The tool must reject:
 
