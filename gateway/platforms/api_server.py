@@ -1416,13 +1416,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 messages = []
                 for msg in raw_messages:
                     role = msg.get("role")
-                    if role not in ("user", "assistant"):
+                    if role not in ("user", "assistant", "tool"):
                         continue
-                    messages.append({
+                    item = {
                         "role": role,
                         "content": self._serialize_message_content(msg.get("content")),
                         "timestamp": msg.get("timestamp"),
-                    })
+                    }
+                    if role == "assistant":
+                        reasoning = msg.get("reasoning")
+                        if reasoning:
+                            item["reasoning"] = reasoning
+                        reasoning_content = msg.get("reasoning_content")
+                        if reasoning_content:
+                            item["reasoning_content"] = reasoning_content
+                        tool_calls = msg.get("tool_calls")
+                        if tool_calls:
+                            item["tool_calls"] = tool_calls
+                    elif role == "tool":
+                        tool_call_id = msg.get("tool_call_id")
+                        if tool_call_id:
+                            item["tool_call_id"] = tool_call_id
+                        tool_name = msg.get("tool_name")
+                        if tool_name:
+                            item["tool_name"] = tool_name
+                    messages.append(item)
                 return web.json_response({
                     "object": "hermes.session.messages",
                     "session_id": resolved,
