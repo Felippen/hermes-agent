@@ -7,7 +7,10 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
-- GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET/POST /v1/capabilities        — machine-readable API capabilities for external UIs
+- GET  /v1/sessions                — list client-visible Hermes sessions
+- GET  /v1/sessions/{session_id}   — read a session summary
+- GET  /v1/sessions/{session_id}/messages — read session message history
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -1290,6 +1293,146 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Session model switch failed for %s: %s", session_id, exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    @staticmethod
+    def _serialize_message_content(content) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(content)
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions — paginated session list for remote clients."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            limit = int(request.rel_url.query.get("limit", "50"))
+            offset = int(request.rel_url.query.get("offset", "0"))
+        except (TypeError, ValueError):
+            return web.json_response(_openai_error("Invalid limit or offset"), status=400)
+
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            try:
+                sessions = db.list_sessions_rich(
+                    limit=limit,
+                    offset=offset,
+                    order_by_last_active=True,
+                )
+                total = db.session_count()
+                payload = []
+                for session in sessions:
+                    payload.append({
+                        "id": session.get("id"),
+                        "title": session.get("title"),
+                        "model": session.get("model"),
+                        "preview": session.get("preview"),
+                        "started_at": session.get("started_at"),
+                        "last_active": session.get("last_active"),
+                        "message_count": session.get("message_count"),
+                        "source": session.get("source"),
+                    })
+                return web.json_response({
+                    "object": "list",
+                    "data": payload,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("GET /v1/sessions failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — session metadata."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            try:
+                resolved = db.resolve_session_id(session_id)
+                if not resolved:
+                    return web.json_response(_openai_error("Session not found"), status=404)
+                sessions = db.list_sessions_rich(limit=10000, offset=0, include_children=True)
+                match = next((s for s in sessions if s.get("id") == resolved), None)
+                if not match:
+                    return web.json_response(_openai_error("Session not found"), status=404)
+                return web.json_response({
+                    "object": "hermes.session",
+                    "session_id": resolved,
+                    "title": match.get("title"),
+                    "model": match.get("model"),
+                    "preview": match.get("preview"),
+                    "started_at": match.get("started_at"),
+                    "last_active": match.get("last_active"),
+                    "message_count": match.get("message_count"),
+                    "source": match.get("source"),
+                })
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("GET /v1/sessions/{id} failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/messages — message history for resume/display."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            try:
+                resolved = db.resolve_session_id(session_id)
+                if not resolved:
+                    return web.json_response(_openai_error("Session not found"), status=404)
+                raw_messages = db.get_messages(resolved)
+                messages = []
+                for msg in raw_messages:
+                    role = msg.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+                    messages.append({
+                        "role": role,
+                        "content": self._serialize_message_content(msg.get("content")),
+                        "timestamp": msg.get("timestamp"),
+                    })
+                return web.json_response({
+                    "object": "hermes.session.messages",
+                    "session_id": resolved,
+                    "messages": messages,
+                })
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("GET /v1/sessions/{id}/messages failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
 
     async def _handle_commands(self, request: "web.Request") -> "web.Response":
         """GET /v1/commands — Return a dynamic list of active API-callable slash commands."""
@@ -1441,7 +1584,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
-        """GET /v1/capabilities — advertise the stable API surface.
+        """GET/POST /v1/capabilities — advertise the stable API surface.
 
         External UIs and orchestrators use this endpoint to discover the API
         server's plugin-safe contract without scraping docs or assuming that
@@ -1497,6 +1640,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "slash_commands": True,
                 "slash_completion": True,
                 "skill_completion": True,
+                "slash_dispatch": True,
+                "slash_command_catalog": True,
+                "slash_chat_interception": True,
                 "slash_execution": "full",
                 "cors": bool(self._cors_origins),
             },
@@ -5153,7 +5299,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/model/current", self._handle_current_model)
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
+            self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_get_session_messages)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
