@@ -485,6 +485,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/commands", adapter._handle_commands)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/v1/complete/slash", adapter._handle_complete_slash)
+    app.router.add_post("/v1/complete/skills", adapter._handle_complete_skills)
+    app.router.add_post("/v1/slash", adapter._handle_slash)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -3755,3 +3758,158 @@ class TestServerSideSlashCommands:
                 text = data["output"][0]["content"][0]["text"]
                 assert "Available commands" in text
                 mock_run.assert_not_called()
+
+
+class TestSlashCompletionAndDispatch:
+    @pytest.mark.asyncio
+    async def test_complete_slash_returns_help_items(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/complete/slash",
+                json={"text": "/hel"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.slash.completion"
+            texts = [item["text"] for item in data.get("items", [])]
+            assert len(texts) > 0
+            assert any("help" in t.lower() for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_complete_slash_empty_for_non_slash(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/complete/slash",
+                json={"text": "hello"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data.get("items") == []
+
+    @pytest.mark.asyncio
+    async def test_complete_skills_returns_items_for_double_slash(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.get_skill_commands",
+            lambda: {
+                "/gif-search": {
+                    "name": "gif-search",
+                    "description": "Search GIFs via Tenor",
+                },
+                "/github-auth": {
+                    "name": "github-auth",
+                    "description": "GitHub auth setup",
+                },
+            },
+            raising=False,
+        )
+
+        def _fake_get_skill_commands():
+            return {
+                "/gif-search": {
+                    "name": "gif-search",
+                    "description": "Search GIFs via Tenor",
+                },
+                "/github-auth": {
+                    "name": "github-auth",
+                    "description": "GitHub auth setup",
+                },
+            }
+
+        import gateway.platforms.api_server as api_server_module
+
+        monkeypatch.setattr(api_server_module, "build_skill_completion_payload", lambda text: {
+            "items": [
+                {
+                    "text": "/gif-search",
+                    "display": "/gif-search",
+                    "meta": "Search GIFs via Tenor",
+                }
+            ],
+            "replace_from": text.rfind("//"),
+        } if "//" in text else {"items": [], "replace_from": 0})
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/complete/skills",
+                json={"text": "Please use //gif"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.skill.completion"
+            assert data["replace_from"] >= 0
+            assert any(item["display"] == "/gif-search" for item in data.get("items", []))
+
+    @pytest.mark.asyncio
+    async def test_slash_help_returns_text_type(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/slash",
+                headers={"X-Hermes-Session-Id": "sess-slash-1"},
+                json={"command": "/help", "session_id": "sess-slash-1"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.slash.result"
+            assert data["type"] == "text"
+            assert "Available commands" in data["content"]
+
+    @pytest.mark.asyncio
+    async def test_slash_unknown_returns_error_type(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/slash",
+                headers={"X-Hermes-Session-Id": "sess-slash-2"},
+                json={"command": "/definitelynotacommand", "session_id": "sess-slash-2"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["type"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_slash_clear_clears_session_db(self, auth_adapter):
+        mock_db = MagicMock()
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/slash",
+                headers={
+                    "X-Hermes-Session-Id": "sess-clear-slash",
+                    "Authorization": "Bearer sk-secret",
+                },
+                json={"command": "/clear", "session_id": "sess-clear-slash"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["type"] == "text"
+            assert "cleared" in data["content"].lower()
+            mock_db.clear_messages.assert_called_once_with("sess-clear-slash")
+
+    @pytest.mark.asyncio
+    async def test_commands_include_api_executable_metadata(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/commands")
+            assert resp.status == 200
+            data = await resp.json()
+            help_item = next(item for item in data["data"] if item["name"] == "/help")
+            assert help_item["apiExecutable"] is True
+            assert help_item["executionSurface"] == "api_server"
+            model_item = next(item for item in data["data"] if item["name"] == "/model")
+            assert model_item["executionSurface"] == "native_app"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_slash_features(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["slash_commands"] is True
+            assert data["features"]["slash_completion"] is True
+            assert data["endpoints"]["slash"]["path"] == "/v1/slash"

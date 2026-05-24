@@ -652,6 +652,100 @@ def _derive_chat_session_id(
     return f"api-{digest}"
 
 
+# Slash commands serviceable via POST /v1/slash on the API server.
+API_SERVER_SLASH_COMMANDS = frozenset({
+    "help", "commands", "status", "profile", "yolo", "restart",
+    "new", "reset", "clear", "stop", "steer", "queue",
+})
+
+# Commands the Oryn Workspace app may handle natively (still listed in catalog).
+NATIVE_APP_SLASH_COMMANDS = frozenset({"model"})
+
+
+def _slash_execution_surface(canonical: str) -> tuple[bool, str]:
+    """Return (api_executable, execution_surface) for a canonical command name."""
+    if canonical in NATIVE_APP_SLASH_COMMANDS:
+        return True, "native_app"
+    if canonical in API_SERVER_SLASH_COMMANDS:
+        return True, "api_server"
+    return False, "unavailable"
+
+
+def build_slash_completion_payload(text: str) -> dict:
+    """Build slash completion items for POST /v1/complete/slash."""
+    if not text or not str(text).startswith("/"):
+        return {"items": [], "replace_from": 0}
+
+    text = str(text)
+    try:
+        from hermes_cli.commands import SlashCommandCompleter
+        from prompt_toolkit.document import Document
+        from prompt_toolkit.formatted_text import to_plain_text
+
+        from agent.skill_commands import get_skill_commands
+        from agent.skill_bundles import get_skill_bundles
+
+        completer = SlashCommandCompleter(
+            skill_commands_provider=lambda: get_skill_commands(),
+            skill_bundles_provider=lambda: get_skill_bundles(),
+        )
+        doc = Document(text, len(text))
+        items = [
+            {
+                "text": c.text,
+                "display": c.display or c.text,
+                "meta": to_plain_text(c.display_meta) if c.display_meta else "",
+            }
+            for c in completer.get_completions(doc, None)
+        ][:30]
+        replace_from = text.rfind(" ") + 1 if " " in text else 1
+        return {"items": items, "replace_from": replace_from}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("slash completion failed: %s", exc)
+        return {"items": [], "replace_from": 1}
+
+
+def build_skill_completion_payload(text: str) -> dict:
+    """Build inline skill picker items for POST /v1/complete/skills."""
+    text = str(text or "")
+    marker = "//"
+    idx = text.rfind(marker)
+    if idx < 0:
+        return {"items": [], "replace_from": 0}
+
+    query = text[idx + len(marker):]
+    if any(ch.isspace() for ch in query):
+        return {"items": [], "replace_from": 0}
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        query_lower = query.lower()
+        items = []
+        for cmd, info in sorted(get_skill_commands().items()):
+            cmd_name = cmd.lstrip("/")
+            if query_lower and not (
+                cmd_name.lower().startswith(query_lower)
+                or cmd.lower().startswith(f"/{query_lower}")
+            ):
+                continue
+            description = str(info.get("description") or f"Invoke the {info.get('name', cmd_name)} skill")
+            items.append(
+                {
+                    "text": cmd,
+                    "display": cmd,
+                    "meta": description,
+                }
+            )
+            if len(items) >= 30:
+                break
+
+        return {"items": items, "replace_from": idx}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("skill completion failed: %s", exc)
+        return {"items": [], "replace_from": idx}
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
@@ -1229,18 +1323,119 @@ class APIServerAdapter(BasePlatformAdapter):
             # Filter out commands that are exclusive to the CLI loop
             if cmd.cli_only:
                 continue
-            
+
             emoji = emoji_map.get(cmd.name, "⚙️")
+            api_executable, execution_surface = _slash_execution_surface(cmd.name)
             data.append({
                 "name": f"/{cmd.name}",
                 "description": cmd.description,
                 "emoji": emoji,
-                "argsHint": cmd.args_hint
+                "argsHint": cmd.args_hint,
+                "category": cmd.category,
+                "apiExecutable": api_executable,
+                "executionSurface": execution_surface,
             })
-            
+
         return web.json_response({
             "object": "list",
             "data": data
+        })
+
+    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills — Return installed skill slash commands for inline pickers."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from agent.skill_commands import get_skill_commands
+
+            data = []
+            for cmd, info in sorted(get_skill_commands().items()):
+                cmd_name = cmd.lstrip("/")
+                data.append({
+                    "name": cmd,
+                    "description": str(info.get("description") or f"Invoke the {info.get('name', cmd_name)} skill"),
+                    "displayName": str(info.get("name") or cmd_name),
+                })
+            return web.json_response({
+                "object": "list",
+                "data": data,
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("skills catalog failed: %s", exc)
+            return web.json_response({"object": "list", "data": []})
+
+    async def _handle_complete_slash(self, request: "web.Request") -> "web.Response":
+        """POST /v1/complete/slash — live slash-command completion."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        text = str(body.get("text") or "")
+        payload = build_slash_completion_payload(text)
+        return web.json_response({
+            "object": "hermes.slash.completion",
+            **payload,
+        })
+
+    async def _handle_complete_skills(self, request: "web.Request") -> "web.Response":
+        """POST /v1/complete/skills — inline skill picker completion for // triggers."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        text = str(body.get("text") or "")
+        payload = build_skill_completion_payload(text)
+        return web.json_response({
+            "object": "hermes.skill.completion",
+            **payload,
+        })
+
+    async def _handle_slash(self, request: "web.Request") -> "web.Response":
+        """POST /v1/slash — structured slash-command dispatch."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        command = str(body.get("command") or "").strip()
+        if not command:
+            return web.json_response(_openai_error("'command' is required"), status=400)
+
+        session_id = str(body.get("session_id") or "").strip()
+        if not session_id:
+            session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_id or len(session_id) > self._MAX_SESSION_HEADER_LEN or re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                _openai_error("Valid session_id is required"),
+                status=400,
+            )
+
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err:
+            return key_err
+
+        result = self._dispatch_slash_command(
+            command, session_id, gateway_session_key=gateway_session_key,
+        )
+        return web.json_response({
+            "object": "hermes.slash.result",
+            **result,
         })
 
 
@@ -1298,6 +1493,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "slash_commands": True,
+                "slash_completion": True,
+                "skill_completion": True,
+                "slash_execution": "full",
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -1306,6 +1505,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "current_model": {"method": "GET", "path": "/v1/model/current"},
                 "session_model": {"method": "POST", "path": "/v1/sessions/{session_id}/model"},
+                "commands": {"method": "GET", "path": "/v1/commands"},
+                "skills": {"method": "GET", "path": "/v1/skills"},
+                "complete_slash": {"method": "POST", "path": "/v1/complete/slash"},
+                "complete_skills": {"method": "POST", "path": "/v1/complete/skills"},
+                "slash": {"method": "POST", "path": "/v1/slash"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -1876,28 +2080,232 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.commands import resolve_command
         return resolve_command(cmd_name) is not None
 
-    def _execute_api_slash_command(
-        self, command_text: str, session_id: str, gateway_session_key: str = None
-    ) -> str:
-        """Execute a recognised gateway slash command server-side.
+    def _find_active_run_id_for_session(self, session_id: str) -> Optional[str]:
+        """Return the run/completion id for an in-flight agent turn on a session."""
+        if not session_id:
+            return None
+        for run_id, status in self._run_statuses.items():
+            if status.get("session_id") != session_id:
+                continue
+            if status.get("status") in {"running", "waiting_for_approval", "stopping"}:
+                return run_id
+        return None
 
-        Returns a markdown string suitable for handing straight back to an
-        OpenAI-compatible client as assistant message content.  Commands
-        handled here never reach the agent loop.  ``command_text`` is
-        assumed to have already passed :meth:`_is_api_slash_command`.
-        """
-        parts = command_text.strip().split(maxsplit=1)
+    def _interrupt_run(self, run_id: str) -> str:
+        """Stop an active run by id; returns user-facing markdown."""
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+
+        if agent is None and task is None:
+            return f"No active run found for `{run_id}`."
+
+        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+
+        if agent is not None:
+            try:
+                agent.interrupt("Stop requested via slash command")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if task is not None and not task.done():
+            task.cancel()
+
+        return f"Stop requested for run `{run_id}`."
+
+    def _apply_session_model_from_slash(
+        self, session_id: str, model_arg: str,
+    ) -> tuple[bool, str]:
+        """Apply a /model slash argument to a session override."""
+        model_arg = (model_arg or "").strip()
+        if not model_arg:
+            return False, "usage: /model <provider/model> or /model <model-name>"
+
+        try:
+            from gateway.run import _resolve_gateway_model
+            from hermes_cli.config import get_compatible_custom_providers, load_config
+            from hermes_cli.model_switch import switch_model
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=None)
+            current_api_key = runtime.get("api_key", "")
+            if not callable(current_api_key):
+                current_api_key = str(current_api_key or "")
+
+            cfg = load_config()
+            explicit_provider = ""
+            model_input = model_arg
+            if "/" in model_arg and not model_arg.startswith("/"):
+                explicit_provider, _, model_input = model_arg.partition("/")
+                explicit_provider = explicit_provider.strip()
+                model_input = model_input.strip()
+
+            result = switch_model(
+                raw_input=model_input,
+                current_provider=str(runtime.get("provider", "") or ""),
+                current_model=_resolve_gateway_model(),
+                current_base_url=str(runtime.get("base_url", "") or ""),
+                current_api_key=current_api_key,
+                is_global=False,
+                explicit_provider=explicit_provider,
+                user_providers=cfg.get("providers") if isinstance(cfg.get("providers"), dict) else None,
+                custom_providers=get_compatible_custom_providers(cfg),
+            )
+            if not result.success:
+                return False, result.error_message or "model switch failed"
+
+            self._session_model_overrides[session_id] = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            return True, (
+                f"Session model set to **{result.target_provider}/{result.new_model}** "
+                f"for session `{session_id}`."
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("slash /model failed for %s: %s", session_id, exc)
+            return False, f"Could not switch model: {exc}"
+
+    def _dispatch_slash_command(
+        self,
+        command_text: str,
+        session_id: str,
+        gateway_session_key: str = None,
+    ) -> dict:
+        """Dispatch a slash command and return a structured result dict."""
+        command_text = (command_text or "").strip()
+        if not command_text.startswith("/"):
+            return {"type": "error", "message": "Not a slash command."}
+
+        parts = command_text.split(maxsplit=1)
         cmd_name = parts[0][1:].lower()
+        cmd_arg = parts[1] if len(parts) > 1 else ""
+
+        # quick_commands
+        try:
+            from hermes_cli.config import load_config
+
+            qcmds = load_config().get("quick_commands", {}) or {}
+            if isinstance(qcmds, dict) and cmd_name in qcmds:
+                qc = qcmds[cmd_name]
+                if isinstance(qc, dict) and qc.get("type") == "alias":
+                    return {"type": "alias", "target": str(qc.get("target", ""))}
+                if isinstance(qc, dict) and qc.get("type") == "exec":
+                    import subprocess
+
+                    proc = subprocess.run(
+                        str(qc.get("command", "")),
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    output = (
+                        (proc.stdout or "")
+                        + ("\n" if proc.stdout and proc.stderr else "")
+                        + (proc.stderr or "")
+                    ).strip()[:4000]
+                    if proc.returncode != 0:
+                        return {
+                            "type": "error",
+                            "message": output or f"quick command failed with exit code {proc.returncode}",
+                        }
+                    return {"type": "text", "content": output or "(no output)"}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("quick_commands dispatch failed: %s", exc)
+
+        # plugin commands
+        try:
+            from hermes_cli.plugins import (
+                get_plugin_command_handler,
+                resolve_plugin_command_result,
+            )
+
+            handler = get_plugin_command_handler(cmd_name)
+            if handler:
+                result = resolve_plugin_command_result(handler(cmd_arg))
+                return {"type": "text", "content": str(result or "(no output)")}
+        except Exception:  # noqa: BLE001
+            pass
+
+        # skill commands
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                scan_skill_commands,
+            )
+
+            skill_key = f"/{cmd_name}"
+            skill_cmds = scan_skill_commands()
+            if skill_key in skill_cmds:
+                msg = build_skill_invocation_message(
+                    skill_key, cmd_arg, task_id=session_id or "",
+                )
+                if msg:
+                    return {
+                        "type": "skill",
+                        "message": msg,
+                        "name": skill_cmds[skill_key].get("name", cmd_name),
+                    }
+        except Exception:  # noqa: BLE001
+            pass
+
         from hermes_cli.commands import resolve_command
+
         cmd = resolve_command(cmd_name)
-        # Resolve aliases (e.g. /commands) to their canonical name.
         canonical = cmd.name if cmd is not None else cmd_name
+
+        if cmd is None and cmd_name not in NATIVE_APP_SLASH_COMMANDS:
+            return {
+                "type": "error",
+                "message": f"Unknown command `/{cmd_name}`. Send `/help` for available commands.",
+            }
+
+        if canonical == "queue" or cmd_name in {"queue", "q"}:
+            if not cmd_arg:
+                return {"type": "error", "message": "usage: /queue <prompt>"}
+            return {"type": "send", "message": cmd_arg}
+
+        if canonical == "steer":
+            if not cmd_arg:
+                return {"type": "error", "message": "usage: /steer <prompt>"}
+            run_id = self._find_active_run_id_for_session(session_id)
+            agent = self._active_run_agents.get(run_id) if run_id else None
+            if agent is not None and hasattr(agent, "steer"):
+                try:
+                    if agent.steer(cmd_arg):
+                        preview = cmd_arg[:80] + ("..." if len(cmd_arg) > 80 else "")
+                        return {
+                            "type": "text",
+                            "content": (
+                                f"Steer queued — arrives after the next tool call: {preview}"
+                            ),
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("steer failed: %s", exc)
+            return {"type": "send", "message": cmd_arg}
+
+        if canonical == "stop":
+            run_id = self._find_active_run_id_for_session(session_id)
+            if not run_id:
+                return {"type": "error", "message": "No active agent run to stop for this session."}
+            content = self._interrupt_run(run_id)
+            return {"type": "text", "content": content}
+
+        if canonical == "model":
+            ok, message = self._apply_session_model_from_slash(session_id, cmd_arg)
+            if ok:
+                return {"type": "text", "content": message}
+            return {"type": "error", "message": message}
 
         if canonical in ("help", "commands"):
             from hermes_cli.commands import gateway_help_lines
+
             lines = gateway_help_lines()
             body = "\n".join(f"- {ln}" for ln in lines) or "_(no commands available)_"
-            return "**Available commands**\n\n" + body
+            return {"type": "text", "content": "**Available commands**\n\n" + body}
 
         if canonical == "status":
             title = None
@@ -1907,90 +2315,144 @@ class APIServerAdapter(BasePlatformAdapter):
                     title = db.get_session_title(session_id)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("status command: could not load session title: %s", exc)
-            return "**Session status**\n\n" + "\n".join([
+            content = "**Session status**\n\n" + "\n".join([
                 f"- **Session ID:** `{session_id}`",
                 f"- **Title:** {title or '(untitled)'}",
                 "- **Platform:** API Server",
             ])
+            return {"type": "text", "content": content}
 
         if canonical == "profile":
             try:
                 from hermes_cli.profiles import get_active_profile_name
+
                 profile_name = get_active_profile_name()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("profile command: could not resolve profile: %s", exc)
                 profile_name = "unknown"
             try:
                 from hermes_constants import get_hermes_home
+
                 home = str(get_hermes_home())
             except Exception:  # noqa: BLE001
                 home = os.path.expanduser("~/.hermes")
-            return (
-                "**Active profile**\n\n"
-                f"- **Profile:** `{profile_name}`\n"
-                f"- **Home:** `{home}`"
-            )
+            return {
+                "type": "text",
+                "content": (
+                    "**Active profile**\n\n"
+                    f"- **Profile:** `{profile_name}`\n"
+                    f"- **Home:** `{home}`"
+                ),
+            }
 
         if canonical == "yolo":
             key = gateway_session_key or session_id
             try:
                 from tools import approval
+
                 if approval.is_session_yolo_enabled(key):
                     approval.disable_session_yolo(key)
-                    return "YOLO mode **disabled** for this session."
+                    return {"type": "text", "content": "YOLO mode **disabled** for this session."}
                 approval.enable_session_yolo(key)
-                return (
-                    "YOLO mode **enabled** for this session — tool "
-                    "approvals will be auto-accepted."
-                )
+                return {
+                    "type": "text",
+                    "content": (
+                        "YOLO mode **enabled** for this session — tool "
+                        "approvals will be auto-accepted."
+                    ),
+                }
             except Exception as exc:  # noqa: BLE001
                 logger.warning("yolo command failed: %s", exc)
-                return f"Could not toggle YOLO mode: {exc}"
+                return {"type": "error", "message": f"Could not toggle YOLO mode: {exc}"}
 
         if canonical == "restart":
             try:
                 import weakref
+
                 from gateway.run import _gateway_runner_ref
+
                 runner = _gateway_runner_ref()
                 if runner is not None:
                     runner.request_restart(detached=True)
-                    return "✓ Restart requested! Reloading the Hermes Gateway proxy..."
-                else:
-                    import subprocess
-                    subprocess.Popen(
-                        "HOME=/Users/felipelamartine hermes gateway restart",
-                        shell=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True
-                    )
-                    return "✓ Restart requested! Relaunching gateway via CLI helper..."
-            except Exception as exc:
+                    return {
+                        "type": "text",
+                        "content": "Restart requested! Reloading the Hermes Gateway proxy...",
+                    }
+                import subprocess
+
+                subprocess.Popen(
+                    "hermes gateway restart",
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return {
+                    "type": "text",
+                    "content": "Restart requested! Relaunching gateway via CLI helper...",
+                }
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("api_server restart slash command failed: %s", exc)
-                return f"Could not request restart: {exc}"
+                return {"type": "error", "message": f"Could not request restart: {exc}"}
 
         if canonical in ("new", "reset", "clear"):
             try:
                 db = self._ensure_session_db()
                 if db is None:
-                    return "Conversation cleared (no session database configured)."
-                # SessionDB exposes clear_messages(session_id); it deletes
-                # all rows for the session and resets its counters.
+                    return {
+                        "type": "text",
+                        "content": "Conversation cleared (no session database configured).",
+                    }
                 db.clear_messages(session_id)
-                return (
-                    f"Conversation cleared. Session `{session_id}` now has "
-                    "no messages."
-                )
+                return {
+                    "type": "text",
+                    "content": (
+                        f"Conversation cleared. Session `{session_id}` now has "
+                        "no messages."
+                    ),
+                }
             except Exception as exc:  # noqa: BLE001
                 logger.warning("clear command failed for %s: %s", session_id, exc)
-                return f"Could not clear the conversation: {exc}"
+                return {"type": "error", "message": f"Could not clear the conversation: {exc}"}
 
-        # Recognised by the registry but not serviceable over the API server.
-        return (
-            f"The command `/{cmd_name}` is recognised but is not available "
-            "over the API server. Send `/help` for the list of supported "
-            "commands."
+        return {
+            "type": "error",
+            "message": (
+                f"The command `/{cmd_name}` is recognised but is not available "
+                "over the API server. Send `/help` for the list of supported "
+                "commands."
+            ),
+        }
+
+    def _execute_api_slash_command(
+        self, command_text: str, session_id: str, gateway_session_key: str = None
+    ) -> str:
+        """Execute a recognised gateway slash command server-side.
+
+        Returns a markdown string suitable for handing straight back to an
+        OpenAI-compatible client as assistant message content.
+        """
+        result = self._dispatch_slash_command(
+            command_text, session_id, gateway_session_key=gateway_session_key,
         )
+        result_type = result.get("type")
+        if result_type == "text":
+            return str(result.get("content") or "")
+        if result_type == "error":
+            return str(result.get("message") or "Command failed.")
+        if result_type == "send":
+            return f"Queued message for next turn: {result.get('message', '')}"
+        if result_type == "skill":
+            return str(result.get("message") or "")
+        if result_type == "alias":
+            target = str(result.get("target") or "").strip()
+            if target:
+                return self._execute_api_slash_command(
+                    target if target.startswith("/") else f"/{target}",
+                    session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+        return str(result.get("message") or result.get("content") or "Command failed.")
 
     async def _api_slash_command_chat_response(
         self,
@@ -2330,10 +2792,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 model_override=model_name,
                 approval_notify_callback=_on_approval_request,
+                run_id=completion_id,
             ))
-            # Ensure SSE drain loops can terminate without relying on polling
-            # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            self._active_run_tasks[completion_id] = agent_task
+
+            def _cleanup_chat_run(_fut):
+                _stream_q.put(None)
+                self._active_run_tasks.pop(completion_id, None)
+                self._active_run_agents.pop(completion_id, None)
+                self._set_run_status(completion_id, "completed", last_event="run.completed")
+
+            agent_task.add_done_callback(_cleanup_chat_run)
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -3956,6 +4425,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
         approval_notify_callback=None,
+        run_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3987,6 +4457,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
+            if run_id:
+                self._active_run_agents[run_id] = agent
             effective_task_id = session_id or str(uuid.uuid4())
             try:
                 if approval_session_key:
@@ -4027,6 +4499,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                if run_id:
+                    self._active_run_agents.pop(run_id, None)
                 if approval_session_key:
                     try:
                         from gateway.session_context import clear_session_vars
@@ -4682,6 +5156,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_post("/v1/complete/slash", self._handle_complete_slash)
+            self._app.router.add_post("/v1/complete/skills", self._handle_complete_skills)
+            self._app.router.add_post("/v1/slash", self._handle_slash)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
