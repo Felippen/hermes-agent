@@ -2899,6 +2899,17 @@ def launchd_plist_is_current() -> bool:
     return _normalize_launchd_plist_for_comparison(installed) == _normalize_launchd_plist_for_comparison(expected)
 
 
+def _mark_running_gateway_planned_stop(pid: int | None = None) -> None:
+    try:
+        from gateway.status import get_running_pid, write_planned_stop_marker
+        if pid is None:
+            pid = get_running_pid(cleanup_stale=False)
+        if pid is not None:
+            write_planned_stop_marker(pid)
+    except Exception:
+        pass
+
+
 def refresh_launchd_plist_if_needed() -> bool:
     """Rewrite the installed launchd plist when the generated definition has changed.
 
@@ -2913,6 +2924,7 @@ def refresh_launchd_plist_if_needed() -> bool:
     plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
     label = get_launchd_label()
     # Bootout/bootstrap so launchd picks up the new definition
+    _mark_running_gateway_planned_stop()
     subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
     subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
     print("↻ Updated gateway launchd service definition to match the current Hermes install")
@@ -2985,13 +2997,7 @@ def launchd_start():
 def launchd_stop():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
-    try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
-        pid = get_running_pid(cleanup_stale=False)
-        if pid is not None:
-            write_planned_stop_marker(pid)
-    except Exception:
-        pass
+    _mark_running_gateway_planned_stop()
     # bootout unloads the service definition so KeepAlive doesn't respawn
     # the process.  A plain `kill SIGTERM` only signals the process — launchd
     # immediately restarts it because KeepAlive.SuccessfulExit = false.
@@ -3060,6 +3066,7 @@ def launchd_restart():
             print("✓ Service restart requested")
             return
         if pid is not None:
+            _mark_running_gateway_planned_stop(pid)
             try:
                 terminate_pid(pid, force=False)
             except (ProcessLookupError, PermissionError, OSError):
