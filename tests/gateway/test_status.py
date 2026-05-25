@@ -676,6 +676,18 @@ class TestTakeoverMarker:
         # Marker must be unlinked after consumption
         assert not (tmp_path / ".gateway-takeover.json").exists()
 
+    def test_consume_returns_true_when_start_time_unavailable_for_self(self, tmp_path, monkeypatch):
+        """macOS has no /proc start time; same-PID fresh markers still count."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+        ok = status.write_takeover_marker(target_pid=os.getpid())
+        assert ok is True
+
+        result = status.consume_takeover_marker_for_self()
+
+        assert result is True
+        assert not (tmp_path / ".gateway-takeover.json").exists()
+
     def test_consume_returns_false_for_different_pid(self, tmp_path, monkeypatch):
         """A marker naming a DIFFERENT process must not be consumed as ours."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -836,6 +848,17 @@ class TestPlannedStopMarker:
     def test_consume_returns_true_when_marker_names_self(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 100)
+        ok = status.write_planned_stop_marker(target_pid=os.getpid())
+        assert ok is True
+
+        result = status.consume_planned_stop_marker_for_self()
+
+        assert result is True
+        assert not (tmp_path / ".gateway-planned-stop.json").exists()
+
+    def test_consume_returns_true_when_start_time_unavailable_for_self(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
         ok = status.write_planned_stop_marker(target_pid=os.getpid())
         assert ok is True
 

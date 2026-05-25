@@ -499,6 +499,36 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "bootstrap", domain, str(plist_path)],
         ]
 
+    def test_launchd_plist_refresh_marks_gateway_stop_as_planned(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(status, "get_running_pid", lambda cleanup_stale=True: 321)
+
+        events = []
+        monkeypatch.setattr(
+            status,
+            "write_planned_stop_marker",
+            lambda pid: events.append(("marker", pid)) or True,
+        )
+
+        def fake_run(cmd, check=False, **kwargs):
+            events.append(tuple(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli.refresh_launchd_plist_if_needed() is True
+
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        assert events[:3] == [
+            ("marker", 321),
+            ("launchctl", "bootout", f"{domain}/{label}"),
+            ("launchctl", "bootstrap", domain, str(plist_path)),
+        ]
+
     def test_launchd_start_reloads_unloaded_job_and_retries(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
@@ -566,6 +596,11 @@ class TestLaunchdServiceRecovery:
             "gateway.status.get_running_pid",
             lambda: 321,
         )
+        monkeypatch.setattr(
+            status,
+            "write_planned_stop_marker",
+            lambda pid: calls.append(("marker", pid)) or True,
+        )
 
         def fake_run(cmd, check=False, **kwargs):
             calls.append(cmd)
@@ -576,6 +611,7 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_restart()
 
         assert calls == [
+            ("marker", 321),
             ("term", 321, False),
             ["launchctl", "kickstart", "-k", target],
         ]
