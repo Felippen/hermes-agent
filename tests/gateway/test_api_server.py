@@ -542,6 +542,45 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_cleans_up_temporary_agent(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        mock_agent._session_messages = [{"role": "user", "content": "hello"}]
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch("agent.auxiliary_client.cleanup_stale_async_clients") as mock_cleanup_stale,
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_called_once()
+        mock_cleanup_stale.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_cleans_up_after_agent_error(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = RuntimeError("boom")
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            with pytest.raises(RuntimeError, match="boom"):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="session-123",
+                )
+
+        mock_agent.shutdown_memory_provider.assert_called_once()
+        mock_agent.close.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint
@@ -791,9 +830,9 @@ class TestDeleteSessionEndpoint:
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.delete("/v1/sessions/20260315_092437_c9a6")
+            data = await resp.json()
 
         assert resp.status == 200
-        data = await resp.json()
         assert data["object"] == "hermes.session.deleted"
         assert data["session_id"] == "20260315_092437_c9a6ff"
         assert data["deleted"] is True

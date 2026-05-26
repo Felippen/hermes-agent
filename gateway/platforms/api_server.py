@@ -1117,6 +1117,31 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return agent
 
+    @staticmethod
+    def _cleanup_agent_resources(agent: Any) -> None:
+        """Best-effort teardown for one-shot API-server agents."""
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, "shutdown_memory_provider"):
+                session_messages = getattr(agent, "_session_messages", None)
+                if isinstance(session_messages, list):
+                    agent.shutdown_memory_provider(session_messages)
+                else:
+                    agent.shutdown_memory_provider()
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+        try:
+            from agent.auxiliary_client import cleanup_stale_async_clients
+            cleanup_stale_async_clients()
+        except Exception:
+            pass
+
     def _request_model_override(self, requested_model: Optional[str]) -> Optional[str]:
         """Treat the advertised profile model as an alias for the configured LLM."""
         if not requested_model:
@@ -4679,6 +4704,7 @@ class APIServerAdapter(BasePlatformAdapter):
             approval_session_key = gateway_session_key or session_id or ""
             approval_token = None
             session_tokens = []
+            agent = None
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
@@ -4748,6 +4774,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             clear_session_vars(session_tokens)
                     except Exception:
                         pass
+                self._cleanup_agent_resources(agent)
 
         return await loop.run_in_executor(None, _run)
 
@@ -4948,6 +4975,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            agent = None
             try:
                 self._set_run_status(run_id, "running")
                 agent = self._create_agent(
@@ -5004,6 +5032,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             conversation_history=conversation_history,
                             task_id=effective_task_id,
                         )
+                        u = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        return r, u
                     finally:
                         try:
                             unregister_gateway_notify(approval_session_key)
@@ -5018,12 +5052,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     clear_session_vars(session_tokens)
                                 except Exception:
                                     pass
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+                        self._cleanup_agent_resources(agent)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
