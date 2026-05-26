@@ -51,6 +51,8 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    app.router.add_post("/v1/ao/sessions/{session_id}/stop", adapter._handle_ao_session_stop)
+    app.router.add_post("/v1/ao/sessions/{session_id}/open", adapter._handle_ao_session_open)
     return app
 
 
@@ -307,6 +309,70 @@ class TestRunStatus:
 
 class TestRunEvents:
     @pytest.mark.asyncio
+    async def test_run_event_callback_forwards_subagent_events(self, adapter):
+        run_id = "run_subagents"
+        q = asyncio.Queue()
+        adapter._run_streams[run_id] = q
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+        for event_type in (
+            "subagent.start",
+            "subagent.tool",
+            "subagent.progress",
+            "subagent.thinking",
+            "subagent.complete",
+        ):
+            callback(
+                event_type,
+                tool_name="terminal" if event_type == "subagent.tool" else None,
+                preview="latest activity",
+                subagent_id="child-1",
+                parent_id="parent-1",
+                depth=1,
+                goal="Inspect the workspace",
+                status="completed" if event_type == "subagent.complete" else "running",
+                summary="Found the relevant files" if event_type == "subagent.complete" else None,
+            )
+
+            event = await asyncio.wait_for(q.get(), timeout=1.0)
+            assert event["event"] == event_type
+            assert event["run_id"] == run_id
+            assert event["subagent_id"] == "child-1"
+            assert event["parent_id"] == "parent-1"
+            assert event["depth"] == 1
+            assert event["goal"] == "Inspect the workspace"
+            assert event["status"] in {"running", "completed"}
+
+        assert event["summary"] == "Found the relevant files"
+
+    @pytest.mark.asyncio
+    async def test_run_events_stream_emits_named_sse_for_subagent_events(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_subagent_stream"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        await adapter._run_streams[run_id].put({
+            "event": "subagent.start",
+            "run_id": run_id,
+            "subagent_id": "child-1",
+            "parent_id": None,
+            "depth": 0,
+            "goal": "Read files",
+            "status": "running",
+        })
+        await adapter._run_streams[run_id].put(None)
+
+        async with TestClient(TestServer(app)) as cli:
+            events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+            assert events_resp.status == 200
+            body = await events_resp.text()
+
+        assert "event: subagent.start" in body
+        assert '"subagent_id": "child-1"' in body
+        assert '"run_id": "run_subagent_stream"' in body
+
+    @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
         app = _create_runs_app(adapter)
@@ -557,3 +623,46 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+class TestAOSessionControls:
+    @pytest.mark.asyncio
+    async def test_stop_ao_session_calls_bridge(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.ao_bridge.AOBridge") as mock_bridge_cls:
+                mock_bridge = MagicMock()
+                mock_bridge_cls.return_value = mock_bridge
+
+                resp = await cli.post("/v1/ao/sessions/oryn-workspace-1/stop")
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "killed"
+                mock_bridge.kill.assert_called_once_with("oryn-workspace-1")
+
+    @pytest.mark.asyncio
+    async def test_open_ao_session_returns_attach_info(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.ao_bridge.AOBridge") as mock_bridge_cls:
+                mock_bridge = MagicMock()
+                mock_bridge.open_session.return_value = {
+                    "ok": True,
+                    "opened": True,
+                    "session": {
+                        "runtime": "ao",
+                        "ao_session_id": "oryn-workspace-1",
+                        "workspace_path": "/tmp/worktree",
+                        "open_command": "tmux attach -t abc-oryn-workspace-1",
+                    },
+                }
+                mock_bridge_cls.return_value = mock_bridge
+
+                resp = await cli.post("/v1/ao/sessions/oryn-workspace-1/open")
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["session"]["runtime"] == "ao"
+                assert data["session"]["ao_session_id"] == "oryn-workspace-1"
+                mock_bridge.open_session.assert_called_once_with("oryn-workspace-1")

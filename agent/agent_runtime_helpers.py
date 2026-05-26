@@ -1692,6 +1692,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
+    elif function_name == "ao_delegate_task":
+        from tools.ao_delegate_tool import ao_delegate_task as _ao_delegate_task
+        return _ao_delegate_task(
+            prompt=function_args.get("prompt") or function_args.get("goal") or "",
+            goal=function_args.get("goal"),
+            project_id=function_args.get("project_id") or "OrynWorkspace",
+            issue_id=function_args.get("issue_id"),
+            branch=function_args.get("branch"),
+            max_wait_seconds=function_args.get("max_wait_seconds") or 1800,
+            parent_agent=agent,
+        )
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,

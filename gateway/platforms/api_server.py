@@ -1752,6 +1752,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "ao_session_controls": True,
                 "session_model_selection": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -1803,8 +1804,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
-            },
-        })
+                "ao_session_stop": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/stop"},
+                "ao_session_open": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/open"},
+             },
+         })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -2961,6 +2964,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 Prefer this path for display labels, then suppress the later
                 structured duplicate for the same tool name.
                 """
+                if str(event_type).startswith("subagent."):
+                    event = self._subagent_event_payload(
+                        event_type,
+                        completion_id,
+                        tool_name=tool_name,
+                        preview=preview,
+                        args=args,
+                        extra=kwargs,
+                    )
+                    _stream_q.put(("__subagent_event__", event))
+                    return
                 if event_type == "reasoning.available" and preview:
                     _stream_q.put(("__reasoning_delta__", {"text": preview}))
                     return
@@ -3274,6 +3288,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.context.usage\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__subagent_event__":
+                    event_name = item[1].get("event", "subagent.progress")
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: {event_name}\ndata: {event_data}\n\n".encode()
                     )
                 else:
                     content_chunk = {
@@ -4891,6 +4911,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 return session_key
         return None
 
+    def _subagent_event_payload(
+        self,
+        event_type: str,
+        run_id: str,
+        tool_name: str = None,
+        preview: str = None,
+        args=None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Normalize a Hermes-native subagent progress callback for SSE."""
+        payload: Dict[str, Any] = {
+            "event": event_type,
+            "run_id": run_id,
+            "timestamp": time.time(),
+        }
+        for key, value in (extra or {}).items():
+            if value is not None:
+                payload[key] = value
+        if tool_name is not None:
+            payload.setdefault("tool", tool_name)
+            payload.setdefault("tool_name", tool_name)
+        if preview is not None:
+            payload.setdefault("preview", preview)
+            if event_type == "subagent.thinking":
+                payload.setdefault("text", preview)
+            elif event_type == "subagent.tool":
+                payload.setdefault("tool_preview", preview)
+            elif event_type == "subagent.progress":
+                payload.setdefault("message", preview)
+        if args is not None:
+            payload.setdefault("args", args)
+        return payload
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -4909,7 +4962,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
-            if event_type == "tool.started":
+            if str(event_type).startswith("subagent."):
+                _push(self._subagent_event_payload(
+                    event_type,
+                    run_id,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    extra=kwargs,
+                ))
+            elif event_type == "tool.started":
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -4933,7 +4995,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
-            # _thinking and subagent_progress are intentionally not forwarded
+            # _thinking and legacy subagent_progress remain internal-only.
 
         return _callback
 
@@ -5297,7 +5359,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
+                event_name = event.get("event") if isinstance(event, dict) else None
+                if isinstance(event_name, str) and event_name.startswith("subagent."):
+                    payload = f"event: {event_name}\ndata: {json.dumps(event)}\n\n"
+                else:
+                    payload = f"data: {json.dumps(event)}\n\n"
                 await response.write(payload.encode())
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
@@ -5437,6 +5503,36 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_ao_session_stop(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/stop — stop an AO worker session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            AOBridge().kill(session_id)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        return web.json_response({"ok": True, "session_id": session_id, "status": "killed"})
+
+    async def _handle_ao_session_open(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/open — open AO worktree and return attach info."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            result = AOBridge().open_session(session_id)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        return web.json_response(result)
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -5542,7 +5638,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # native routes first lets those shims no-op instead of shadowing the
             # upstream session-control handlers.
             self._app["api_server_adapter"] = self
-
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/stop", self._handle_ao_session_stop)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/open", self._handle_ao_session_open)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
