@@ -1036,6 +1036,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        context_usage_callback=None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
     ) -> Any:
@@ -1087,6 +1088,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            context_usage_callback=context_usage_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -1721,6 +1723,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                "context_usage_events": True,
                 "approval_events": True,
                 "session_model_selection": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2461,6 +2464,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            def _on_context_usage(payload: Dict[str, Any]) -> None:
+                if payload:
+                    _stream_q.put(("__context_usage__", payload))
+
             def _on_approval_request(approval_data: Dict[str, Any]) -> None:
                 event = dict(approval_data or {})
                 event.update({
@@ -2496,6 +2503,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                context_usage_callback=_on_context_usage,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 model_override=model_name,
@@ -2698,6 +2706,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: approval.request\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__context_usage__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.context.usage\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2799,6 +2812,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     ],
                 }
                 await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    from agent.context_usage import build_context_usage_payload
+
+                    final_context_payload = build_context_usage_payload(agent)
+                    await response.write(
+                        f"event: hermes.context.usage\ndata: {json.dumps(final_context_payload)}\n\n".encode()
+                    )
+                except Exception:
+                    logger.debug("Failed to emit final context usage event", exc_info=True)
 
             # Finish chunk
             finish_chunk = {
@@ -4166,6 +4191,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        context_usage_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
@@ -4198,6 +4224,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                context_usage_callback=context_usage_callback,
                 gateway_session_key=gateway_session_key,
                 model_override=model_override,
             )

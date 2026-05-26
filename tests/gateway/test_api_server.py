@@ -950,6 +950,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["context_usage_events"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
 
@@ -1341,6 +1342,60 @@ class TestChatCompletionsEndpoint:
                 # the test robust against preview-formatter tweaks.
                 assert '"label":' in body
                 assert '"toolCallId": "call_search_1"' in body
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_context_usage_event(self, adapter):
+        """Context fill updates are exposed as hermes.context.usage SSE events."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("context_usage_callback")
+                if cb:
+                    cb(
+                        {
+                            "context_used": 111_400,
+                            "context_max": 200_000,
+                            "context_percent": 56,
+                            "compressions": 1,
+                            "model": "test-model",
+                            "session": {
+                                "input_tokens": 100,
+                                "output_tokens": 50,
+                                "cache_read_tokens": 10,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 5,
+                                "prompt_tokens": 100,
+                                "completion_tokens": 50,
+                                "total_tokens": 150,
+                            },
+                        }
+                    )
+                stream_cb = kwargs.get("stream_delta_callback")
+                if stream_cb:
+                    await asyncio.sleep(0.05)
+                    stream_cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.context.usage" in body
+                assert '"context_percent": 56' in body
+                assert '"context_used": 111400' in body
+                assert '"input_tokens": 100' in body
 
     @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):
