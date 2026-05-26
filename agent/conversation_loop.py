@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.anthropic_adapter import _is_oauth_token
 from agent.auxiliary_client import set_runtime_main
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.context_usage import emit_context_usage
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -563,6 +564,7 @@ def run_conversation(
                 )
                 if _preflight_tokens < agent.context_compressor.threshold_tokens:
                     break  # Under threshold
+            emit_context_usage(agent)
 
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
@@ -1720,6 +1722,7 @@ def run_conversation(
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+                    emit_context_usage(agent)
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
@@ -2515,6 +2518,7 @@ def run_conversation(
                                 f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
                                 f"(was {old_ctx:,}), retrying..."
                             )
+                            emit_context_usage(agent)
                             time.sleep(2)
                             restart_with_compressed_messages = True
                             break
@@ -3663,6 +3667,7 @@ def run_conversation(
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
                     conversation_history = None
+                    emit_context_usage(agent)
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
