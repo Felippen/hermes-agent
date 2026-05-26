@@ -1220,6 +1220,51 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to resolve current API-server model: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    async def _handle_openrouter_models(self, request: "web.Request") -> "web.Response":
+        """GET /v1/providers/openrouter/models — browse tool-capable OpenRouter models."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = str(request.rel_url.query.get("q", "")).strip()
+        limit_raw = request.rel_url.query.get("limit")
+        offset_raw = request.rel_url.query.get("offset", "0")
+        force_refresh = str(request.rel_url.query.get("force_refresh", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        try:
+            limit = int(limit_raw) if limit_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            limit = None
+
+        try:
+            offset = int(offset_raw)
+        except (TypeError, ValueError):
+            offset = 0
+
+        try:
+            from hermes_cli.models import list_openrouter_picker_models
+
+            models = list_openrouter_picker_models(
+                query=query,
+                limit=limit,
+                offset=offset,
+                force_refresh=force_refresh,
+            )
+            return web.json_response(
+                {
+                    "object": "hermes.provider.models",
+                    "provider": "openrouter",
+                    "data": models,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed to list OpenRouter picker models: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
     async def _handle_set_session_model(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/model — switch one API session."""
         auth_err = self._check_auth(request)
@@ -1694,6 +1739,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "current_model": {"method": "GET", "path": "/v1/model/current"},
+                "openrouter_models": {
+                    "method": "GET",
+                    "path": "/v1/providers/openrouter/models",
+                },
                 "session_model": {"method": "POST", "path": "/v1/sessions/{session_id}/model"},
                 "commands": {"method": "GET", "path": "/v1/commands"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
@@ -4851,6 +4900,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/model/current", self._handle_current_model)
+            self._app.router.add_get(
+                "/v1/providers/openrouter/models",
+                self._handle_openrouter_models,
+            )
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
             self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)

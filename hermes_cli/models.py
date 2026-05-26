@@ -67,6 +67,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+_openrouter_picker_cache: list[dict[str, Any]] | None = None
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -1194,6 +1195,122 @@ def fetch_openrouter_models(
     curated[0] = (first_id, "recommended")
     _openrouter_catalog_cache = curated
     return list(curated)
+
+
+def _fetch_openrouter_live_model_items(timeout: float = 8.0) -> list[dict[str, Any]] | None:
+    """Fetch raw OpenRouter model dicts from the public catalog API."""
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    live_items = payload.get("data", [])
+    if not isinstance(live_items, list):
+        return None
+    return [item for item in live_items if isinstance(item, dict)]
+
+
+def _openrouter_picker_entry(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize one OpenRouter catalog item for external picker UIs."""
+    mid = str(item.get("id") or "").strip()
+    if not mid:
+        return None
+    if not _openrouter_model_supports_tools(item):
+        return None
+
+    name = str(item.get("name") or "").strip()
+    if not name:
+        name = mid.rsplit("/", 1)[-1]
+
+    context_length = item.get("context_length")
+    if context_length is not None:
+        try:
+            context_length = int(context_length)
+        except (TypeError, ValueError):
+            context_length = None
+
+    return {
+        "id": mid,
+        "name": name,
+        "context_length": context_length,
+        "is_free": _openrouter_model_is_free(item.get("pricing")),
+        "pricing": _openrouter_picker_pricing(item.get("pricing")),
+    }
+
+
+def _openrouter_picker_pricing(pricing: Any) -> dict[str, str]:
+    """Normalize OpenRouter pricing fields for external picker UIs."""
+    if not isinstance(pricing, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key in ("prompt", "completion", "input_cache_read", "input_cache_write"):
+        value = pricing.get(key)
+        if value is not None and str(value).strip():
+            normalized[key] = str(value)
+    return normalized
+
+
+def list_openrouter_picker_models(
+    timeout: float = 8.0,
+    *,
+    force_refresh: bool = False,
+    query: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Return the full tool-capable OpenRouter catalog for browse/search UIs."""
+    global _openrouter_picker_cache
+
+    if _openrouter_picker_cache is None or force_refresh:
+        live_items = _fetch_openrouter_live_model_items(timeout=timeout)
+        if live_items is None:
+            if _openrouter_picker_cache is not None:
+                refreshed = list(_openrouter_picker_cache)
+            else:
+                refreshed = []
+                for mid, _ in fetch_openrouter_models(timeout=timeout, force_refresh=force_refresh):
+                    refreshed.append(
+                        {
+                            "id": mid,
+                            "name": mid.rsplit("/", 1)[-1],
+                            "context_length": None,
+                            "is_free": False,
+                        }
+                    )
+        else:
+            refreshed = []
+            for item in live_items:
+                entry = _openrouter_picker_entry(item)
+                if entry is not None:
+                    refreshed.append(entry)
+            refreshed.sort(key=lambda model: str(model.get("name", "")).lower())
+        _openrouter_picker_cache = refreshed
+
+    models = list(_openrouter_picker_cache or [])
+
+    q = (query or "").strip().lower()
+    if q:
+        models = [
+            model
+            for model in models
+            if q in str(model.get("id", "")).lower()
+            or q in str(model.get("name", "")).lower()
+        ]
+
+    if offset > 0:
+        models = models[offset:]
+
+    if limit is not None:
+        models = models[: max(0, limit)]
+    elif len(models) > 500:
+        models = models[:500]
+
+    return models
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:
