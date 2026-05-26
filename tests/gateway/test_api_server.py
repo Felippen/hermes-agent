@@ -481,6 +481,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/model/current", adapter._handle_current_model)
+    app.router.add_get("/v1/providers/openrouter/models", adapter._handle_openrouter_models)
     app.router.add_post("/v1/sessions/{session_id}/model", adapter._handle_set_session_model)
     app.router.add_delete("/v1/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
@@ -744,6 +745,59 @@ class TestModelsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get(
                 "/v1/models",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /v1/providers/openrouter/models endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterModelsEndpoint:
+    @pytest.mark.asyncio
+    async def test_openrouter_models_returns_catalog(self, adapter, monkeypatch):
+        sample = [
+            {
+                "id": "qwen/qwen3.7-max",
+                "name": "Qwen 3.7 Max",
+                "context_length": 1_000_000,
+                "is_free": False,
+            }
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.models.list_openrouter_picker_models",
+            lambda **kwargs: sample,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/providers/openrouter/models")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.provider.models"
+            assert data["provider"] == "openrouter"
+            assert data["data"] == sample
+
+    @pytest.mark.asyncio
+    async def test_openrouter_models_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/providers/openrouter/models")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_openrouter_models_with_valid_auth(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.models.list_openrouter_picker_models",
+            lambda **kwargs: [],
+        )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/providers/openrouter/models",
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200

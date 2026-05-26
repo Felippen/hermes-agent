@@ -215,6 +215,43 @@ class TestOpenRouterToolSupportHelper:
         ) is False
 
 
+class TestOpenRouterPickerCatalog:
+    def test_list_openrouter_picker_models_filters_tools_and_query(self, monkeypatch):
+        from hermes_cli import models as models_mod
+
+        monkeypatch.setattr(
+            models_mod,
+            "_fetch_openrouter_live_model_items",
+            lambda timeout=8.0: [
+                {
+                    "id": "qwen/qwen3.7-max",
+                    "name": "Qwen 3.7 Max",
+                    "context_length": 1_000_000,
+                    "pricing": {"prompt": "1", "completion": "1"},
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "vendor/image-only",
+                    "name": "Image Only",
+                    "supported_parameters": ["temperature"],
+                },
+            ],
+        )
+        models_mod._openrouter_picker_cache = None
+
+        models = models_mod.list_openrouter_picker_models(force_refresh=True)
+        assert len(models) == 1
+        assert models[0]["id"] == "qwen/qwen3.7-max"
+        assert models[0]["is_free"] is False
+        assert models[0]["pricing"] == {"prompt": "1", "completion": "1"}
+
+        filtered = models_mod.list_openrouter_picker_models(query="qwen")
+        assert len(filtered) == 1
+
+        empty = models_mod.list_openrouter_picker_models(query="missing")
+        assert empty == []
+
+
 class TestFindOpenrouterSlug:
     def test_exact_match(self):
         from hermes_cli.models import _find_openrouter_slug
