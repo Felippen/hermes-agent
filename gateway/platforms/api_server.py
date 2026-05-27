@@ -55,6 +55,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.subagent_events import SubagentEventStore, events_response
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -814,6 +815,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._subagent_event_store: Optional[SubagentEventStore] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -1045,6 +1047,15 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    def _ensure_subagent_event_store(self) -> Optional[SubagentEventStore]:
+        """Lazily initialise persistent subagent event history."""
+        if self._subagent_event_store is None:
+            try:
+                self._subagent_event_store = SubagentEventStore()
+            except Exception as exc:
+                logger.warning("Subagent event store unavailable: %s", exc)
+        return self._subagent_event_store
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -1791,9 +1802,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+                "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
-                "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -1804,8 +1815,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "ao_sessions": {"method": "GET", "path": "/v1/ao/sessions"},
+                "ao_session_detail": {"method": "GET", "path": "/v1/ao/sessions/{session_id}"},
                 "ao_session_stop": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/stop"},
                 "ao_session_open": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/open"},
+                "ao_session_follow_up": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/follow-up"},
+                "ao_session_retry": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/retry"},
+                "ao_session_reassign": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/reassign"},
              },
          })
 
@@ -1894,6 +1910,16 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "platform": "api_server",
             "data": data,
+=======
+                "ao_sessions": {"method": "GET", "path": "/v1/ao/sessions"},
+                "ao_session_detail": {"method": "GET", "path": "/v1/ao/sessions/{session_id}"},
+                "ao_session_follow_up": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/follow-up"},
+                "ao_session_retry": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/retry"},
+                "ao_session_reassign": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/reassign"},
+                "session_subagent_events": {"method": "GET", "path": "/v1/sessions/{session_id}/subagents/events"},
+                "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
+            },
+>>>>>>> 69c75216f (feat: persist AO-visible subagent history)
         })
 
     # ------------------------------------------------------------------
@@ -2973,6 +2999,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         args=args,
                         extra=kwargs,
                     )
+                    event = self._persist_subagent_event(event, session_id=session_id)
                     _stream_q.put(("__subagent_event__", event))
                     return
                 if event_type == "reasoning.available" and preview:
@@ -4944,7 +4971,36 @@ class APIServerAdapter(BasePlatformAdapter):
             payload.setdefault("args", args)
         return payload
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _persist_subagent_event(self, payload: Dict[str, Any], *, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Append a subagent event to state.db and return the public payload."""
+        event = dict(payload)
+        prompt_meta = event.pop("_ao_prompt_metadata", None)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return event
+        try:
+            if prompt_meta and event.get("ao_session_id"):
+                store.upsert_ao_prompt(
+                    ao_session_id=str(event.get("ao_session_id")),
+                    project_id=prompt_meta.get("project_id") or event.get("ao_project_id"),
+                    prompt=prompt_meta.get("prompt") or "",
+                    goal=prompt_meta.get("goal") or event.get("goal"),
+                    issue_id=prompt_meta.get("issue_id") or event.get("issue_id"),
+                    branch=prompt_meta.get("branch") or event.get("branch"),
+                    agent=prompt_meta.get("agent"),
+                    model=prompt_meta.get("model") or event.get("model"),
+                )
+            return store.append_event(event, session_id=session_id)
+        except Exception as exc:
+            logger.debug("Failed to persist subagent event: %s", exc)
+            return event
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        session_id: Optional[str] = None,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
@@ -4963,14 +5019,15 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if str(event_type).startswith("subagent."):
-                _push(self._subagent_event_payload(
+                event = self._subagent_event_payload(
                     event_type,
                     run_id,
                     tool_name=tool_name,
                     preview=preview,
                     args=args,
                     extra=kwargs,
-                ))
+                )
+                _push(self._persist_subagent_event(event, session_id=session_id))
             elif event_type == "tool.started":
                 _push({
                     "event": "tool.started",
@@ -5088,7 +5145,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(run_id, loop, session_id=session_id)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -5373,6 +5430,261 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _handle_session_subagent_events(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/subagents/events — replay subagent events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+        limit = self._bounded_query_limit(request, default=500)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+        return web.json_response(events_response(
+            store.list_events(session_id=session_id, limit=limit),
+            session_id=session_id,
+        ))
+
+    async def _handle_run_subagent_events(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/{run_id}/subagents/events — replay subagent events for a run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = str(request.match_info.get("run_id", "")).strip()
+        if not run_id:
+            return web.json_response(_openai_error("Run ID required"), status=400)
+        limit = self._bounded_query_limit(request, default=500)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+        return web.json_response(events_response(
+            store.list_events(run_id=run_id, limit=limit),
+            run_id=run_id,
+        ))
+
+    def _bounded_query_limit(self, request: "web.Request", *, default: int = 100) -> int:
+        try:
+            return max(1, min(int(request.rel_url.query.get("limit", str(default))), 2000))
+        except Exception:
+            return default
+
+    def _ao_session_payload(self, session: Any, *, include_events: bool = False) -> Dict[str, Any]:
+        payload = session.event_fields()
+        payload.update({
+            "id": session.id,
+            "status": session.display_status,
+            "activity": session.activity,
+            "agent": session.agent,
+            "pr": session.pr,
+            "summary": session.summary,
+        })
+        store = self._ensure_subagent_event_store()
+        prompt_meta = store.get_ao_prompt(session.id) if store else None
+        payload["can_retry"] = bool(prompt_meta)
+        payload["can_reassign"] = bool(prompt_meta)
+        if prompt_meta:
+            payload["goal"] = prompt_meta.get("goal")
+            payload["prompt_available"] = True
+        else:
+            payload["prompt_available"] = False
+        if include_events and store:
+            payload["events"] = store.list_events(ao_session_id=session.id)
+        return payload
+
+    async def _handle_ao_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/ao/sessions — list AO sessions known to AO/Hermes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        project_id = request.rel_url.query.get("project_id")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            sessions = AOBridge().list(project_id=project_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response({
+            "object": "list",
+            "data": [self._ao_session_payload(session) for session in sessions],
+            "total": len(sessions),
+        })
+
+    async def _handle_ao_session_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/ao/sessions/{session_id} — AO session detail with Hermes event history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            session = AOBridge().status(session_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        if not session:
+            return web.json_response(_openai_error("AO session not found"), status=404)
+        return web.json_response({
+            "object": "hermes.ao_session",
+            "session": self._ao_session_payload(session, include_events=True),
+        })
+
+    async def _handle_ao_session_follow_up(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/follow-up — send a message to a running AO worker."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        message = str(body.get("message") or "").strip()
+        if not message:
+            return web.json_response(_openai_error("Follow-up message required"), status=400)
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            session = bridge.send(session_id, message) or bridge.status(session_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        if session:
+            self._persist_subagent_event({
+                "event": "subagent.progress",
+                "subagent_id": f"ao:{session.id}",
+                "runtime": "ao",
+                "ao_session_id": session.id,
+                "ao_project_id": session.project_id,
+                "workspace_path": session.workspace_path,
+                "branch": session.branch,
+                "tmux_name": session.tmux_name,
+                "open_command": session.open_command,
+                "status": session.display_status,
+                "message": "Follow-up sent",
+                "preview": "Follow-up sent",
+                "timestamp": time.time(),
+            })
+        return web.json_response({"ok": True, "session": self._ao_session_payload(session) if session else None})
+
+    async def _handle_ao_session_retry(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/retry — spawn a replacement AO worker."""
+        return await self._spawn_related_ao_session(request, mode="retry")
+
+    async def _handle_ao_session_reassign(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/reassign — spawn a replacement AO worker with optional overrides."""
+        return await self._spawn_related_ao_session(request, mode="reassign")
+
+    async def _spawn_related_ao_session(self, request: "web.Request", *, mode: str) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        source_session_id = request.match_info.get("session_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        store = self._ensure_subagent_event_store()
+        prompt_meta = store.get_ao_prompt(source_session_id) if store else None
+        if not prompt_meta:
+            return web.json_response(
+                _openai_error("Original AO prompt metadata is unavailable for this session"),
+                status=409,
+            )
+        latest = store.latest_event_for_ao_session(source_session_id) if store else None
+        prior_summary = (latest or {}).get("summary") or (latest or {}).get("message") or (latest or {}).get("preview")
+        instruction = str(body.get("instruction") or "").strip()
+        project_id = str(body.get("project_id") or prompt_meta.get("project_id") or "OrynWorkspace")
+        agent = body.get("agent") or prompt_meta.get("agent")
+        model = body.get("model") or prompt_meta.get("model")
+        goal = prompt_meta.get("goal") or f"{mode.title()} AO worker"
+        prompt = self._related_ao_prompt(
+            mode=mode,
+            original_prompt=prompt_meta.get("prompt") or "",
+            prior_summary=prior_summary,
+            instruction=instruction,
+            model=model,
+        )
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            session = bridge.spawn(
+                project_id=project_id,
+                prompt=prompt,
+                issue_id=prompt_meta.get("issue_id"),
+                agent=agent,
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if store:
+            store.upsert_ao_prompt(
+                ao_session_id=session.id,
+                project_id=project_id,
+                prompt=prompt,
+                goal=f"{mode.title()}: {goal}",
+                issue_id=prompt_meta.get("issue_id"),
+                branch=session.branch,
+                agent=agent,
+                model=model,
+            )
+        start_event = self._persist_subagent_event({
+            "event": "subagent.start",
+            "subagent_id": f"ao:{session.id}",
+            "parent_id": (latest or {}).get("subagent_id"),
+            "depth": int((latest or {}).get("depth") or 0),
+            "goal": f"{mode.title()}: {goal}",
+            "runtime": "ao",
+            "ao_session_id": session.id,
+            "ao_project_id": session.project_id,
+            "workspace_path": session.workspace_path,
+            "branch": session.branch,
+            "issue_id": session.issue_id,
+            "tmux_name": session.tmux_name,
+            "open_command": session.open_command,
+            "model": session.model,
+            "status": session.display_status,
+            "message": f"AO {mode} session spawned from {source_session_id}",
+            "timestamp": time.time(),
+        })
+        return web.json_response({
+            "ok": True,
+            "mode": mode,
+            "source_session_id": source_session_id,
+            "session": self._ao_session_payload(session),
+            "event": start_event,
+        })
+
+    @staticmethod
+    def _related_ao_prompt(
+        *,
+        mode: str,
+        original_prompt: str,
+        prior_summary: Optional[str],
+        instruction: str,
+        model: Optional[str],
+    ) -> str:
+        parts = [
+            f"You are a {mode} AO worker for a previous Agent Orchestrator session.",
+            "",
+            "Original task:",
+            original_prompt.strip(),
+        ]
+        if prior_summary:
+            parts.extend(["", "Previous session summary/status:", prior_summary.strip()])
+        if model:
+            parts.extend(["", f"Requested model/agent preference: {model}"])
+        if instruction:
+            parts.extend(["", "Additional instruction:", instruction])
+        return "\n".join(part for part in parts if part is not None)
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
@@ -5513,10 +5825,45 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from tools.ao_bridge import AOBridge
 
-            AOBridge().kill(session_id)
+            bridge = AOBridge()
+            before_session = bridge.status(session_id)
+            bridge.kill(session_id)
+            try:
+                session = bridge.status(session_id) or before_session
+            except Exception:
+                session = before_session
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=404)
-        return web.json_response({"ok": True, "session_id": session_id, "status": "killed"})
+
+        latest = None
+        store = self._ensure_subagent_event_store()
+        if store:
+            latest = store.latest_event_for_ao_session(session_id)
+        event_payload: Dict[str, Any] = dict(latest or {})
+        if session is not None:
+            event_payload.update(session.event_fields())
+        event_payload.update({
+            "event": "subagent.complete",
+            "subagent_id": event_payload.get("subagent_id") or f"ao:{session_id}",
+            "runtime": "ao",
+            "ao_session_id": session_id,
+            "status": "killed",
+            "summary": "AO worker stopped by user.",
+            "message": "AO worker stopped by user.",
+            "preview": "AO worker stopped by user.",
+            "timestamp": time.time(),
+        })
+        event_payload.pop("event_id", None)
+        event_payload.pop("created_at", None)
+        event = self._persist_subagent_event(event_payload)
+        return web.json_response({
+            "ok": True,
+            "mode": "stop",
+            "session_id": session_id,
+            "status": "killed",
+            "session": self._ao_session_payload(session) if session else None,
+            "event": event,
+        })
 
     async def _handle_ao_session_open(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/open — open AO worktree and return attach info."""
@@ -5595,6 +5942,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/v1/sessions/{session_id}/subagents/events", self._handle_session_subagent_events)
             self._app.router.add_delete("/v1/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/capabilities", self._handle_capabilities)
@@ -5631,8 +5979,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_get("/v1/runs/{run_id}/subagents/events", self._handle_run_subagent_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_get("/v1/ao/sessions", self._handle_ao_sessions)
+            self._app.router.add_get("/v1/ao/sessions/{session_id}", self._handle_ao_session_detail)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
@@ -5640,6 +5991,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             self._app.router.add_post("/v1/ao/sessions/{session_id}/stop", self._handle_ao_session_stop)
             self._app.router.add_post("/v1/ao/sessions/{session_id}/open", self._handle_ao_session_open)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/follow-up", self._handle_ao_session_follow_up)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/retry", self._handle_ao_session_retry)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/reassign", self._handle_ao_session_reassign)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
