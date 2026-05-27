@@ -145,7 +145,22 @@ def ao_delegate_task(
     except Exception as exc:
         return tool_error(f"AO spawn failed: {exc}")
 
-    _emit(cb, "subagent.start", session, goal, preview=f"AO session {session.id} spawned")
+    _emit(
+        cb,
+        "subagent.start",
+        session,
+        goal,
+        preview=f"AO session {session.id} spawned",
+        _ao_prompt_metadata={
+            "prompt": prompt,
+            "goal": goal,
+            "project_id": project_id,
+            "issue_id": issue_id,
+            "branch": branch,
+            "agent": session.agent,
+            "model": session.model,
+        },
+    )
 
     started = time.monotonic()
     last_signature = None

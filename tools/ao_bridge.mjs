@@ -80,6 +80,13 @@ async function main() {
     return;
   }
 
+  if (command === "send") {
+    await sm.send(input.session_id, input.message || "");
+    const session = await sm.get(input.session_id);
+    console.log(JSON.stringify({ ok: true, session: normalizeSession(session) }));
+    return;
+  }
+
   if (command === "list") {
     const sessions = await sm.list(input.project_id || undefined);
     console.log(JSON.stringify({ ok: true, sessions: sessions.map(normalizeSession) }));

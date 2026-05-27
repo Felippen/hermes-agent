@@ -130,6 +130,21 @@ class AOBridge:
         session = payload.get("session")
         return AOSession.from_payload(session) if session else None
 
+    def list(self, project_id: Optional[str] = None) -> list[AOSession]:
+        payload = self._call("list", {"project_id": project_id}, timeout=60)
+        sessions = [AOSession.from_payload(item) for item in payload.get("sessions") or []]
+        seen = {session.id for session in sessions}
+        for session in self._archived_sessions(project_id=project_id):
+            if session.id not in seen:
+                sessions.append(session)
+                seen.add(session.id)
+        return sessions
+
+    def send(self, session_id: str, message: str) -> Optional[AOSession]:
+        payload = self._call("send", {"session_id": session_id, "message": message}, timeout=60)
+        session = payload.get("session")
+        return AOSession.from_payload(session) if session else None
+
     def kill(self, session_id: str) -> None:
         self._call("kill", {"session_id": session_id}, timeout=60)
 
@@ -164,7 +179,15 @@ class AOBridge:
         return {
             "ok": True,
             "opened": opened,
-            "session": session.event_fields(),
+            "session": {
+                **session.event_fields(),
+                "id": session.id,
+                "status": session.display_status,
+                "activity": session.activity,
+                "agent": session.agent,
+                "pr": session.pr,
+                "summary": session.summary,
+            },
         }
 
     def _call(self, command: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
@@ -246,6 +269,58 @@ class AOBridge:
             target.symlink_to(self.codex_shim_path)
         except Exception:
             pass
+
+    def _archived_sessions(self, project_id: Optional[str] = None) -> list[AOSession]:
+        root = Path(self.home) / ".agent-orchestrator"
+        if not root.exists():
+            return []
+        candidates = sorted(
+            root.glob("*/sessions/archive/*"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        sessions: list[AOSession] = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                data = self._read_flat_session_file(path)
+            except Exception:
+                continue
+            if project_id and data.get("project") != project_id:
+                continue
+            session_id = path.name.split("_", 1)[0]
+            runtime_handle = data.get("runtimeHandle")
+            if isinstance(runtime_handle, str):
+                try:
+                    runtime_handle = json.loads(runtime_handle)
+                except json.JSONDecodeError:
+                    runtime_handle = {}
+            runtime_data = runtime_handle.get("data") if isinstance(runtime_handle, dict) else {}
+            tmux_name = data.get("tmuxName") or (runtime_handle or {}).get("id")
+            status = data.get("status") or "terminated"
+            if status in {"spawning", "working", "running"}:
+                status = "terminated"
+            sessions.append(AOSession(
+                id=session_id,
+                project_id=data.get("project"),
+                status=status,
+                branch=data.get("branch"),
+                workspace_path=data.get("worktree") or (runtime_data or {}).get("workspacePath"),
+                tmux_name=tmux_name,
+                open_command=f"tmux attach -t {tmux_name}" if tmux_name else None,
+            ))
+        return sessions
+
+    @staticmethod
+    def _read_flat_session_file(path: Path) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip()
+        return data
 
     @staticmethod
     def _last_json_line(output: str) -> str:
