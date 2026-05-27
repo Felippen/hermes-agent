@@ -14,8 +14,11 @@ Tests cover:
 
 import asyncio
 import json
+import os
+import stat
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -128,6 +131,37 @@ class TestResponseStore:
         assert store.get_conversation("chat-a") is None
         # resp_2 mapping should still be intact
         assert store.get_conversation("chat-b") == "resp_2"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
+    def test_file_store_created_owner_only_under_permissive_umask(self, tmp_path):
+        """response_store.db must be 0o600 on creation even under umask 022."""
+        db_path = tmp_path / "response_store.db"
+        store = None
+        old_umask = os.umask(0o022)
+        try:
+            store = ResponseStore(max_size=10, db_path=str(db_path))
+            store.put(
+                "resp_secret",
+                {
+                    "response": {"id": "resp_secret"},
+                    "conversation_history": [{"role": "tool", "content": "dummy-marker"}],
+                },
+            )
+        finally:
+            os.umask(old_umask)
+            if store is not None:
+                store.close()
+
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+        # WAL/SHM sidecars are owner-only too when present. WAL mode may be
+        # unavailable on some filesystems (NFS/SMB) — only assert when the
+        # sidecar files actually exist.
+        for sidecar in (
+            db_path.with_name(db_path.name + "-wal"),
+            db_path.with_name(db_path.name + "-shm"),
+        ):
+            if sidecar.exists():
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +481,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/model/current", adapter._handle_current_model)
+    app.router.add_get("/v1/providers/openrouter/models", adapter._handle_openrouter_models)
     app.router.add_post("/v1/sessions/{session_id}/model", adapter._handle_set_session_model)
+    app.router.add_delete("/v1/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/commands", adapter._handle_commands)
@@ -505,6 +541,45 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_cleans_up_temporary_agent(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        mock_agent._session_messages = [{"role": "user", "content": "hello"}]
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch("agent.auxiliary_client.cleanup_stale_async_clients") as mock_cleanup_stale,
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+        mock_agent.close.assert_called_once()
+        mock_cleanup_stale.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_cleans_up_after_agent_error(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = RuntimeError("boom")
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            with pytest.raises(RuntimeError, match="boom"):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="session-123",
+                )
+
+        mock_agent.shutdown_memory_provider.assert_called_once()
+        mock_agent.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +750,59 @@ class TestModelsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# /v1/providers/openrouter/models endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterModelsEndpoint:
+    @pytest.mark.asyncio
+    async def test_openrouter_models_returns_catalog(self, adapter, monkeypatch):
+        sample = [
+            {
+                "id": "qwen/qwen3.7-max",
+                "name": "Qwen 3.7 Max",
+                "context_length": 1_000_000,
+                "is_free": False,
+            }
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.models.list_openrouter_picker_models",
+            lambda **kwargs: sample,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/providers/openrouter/models")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.provider.models"
+            assert data["provider"] == "openrouter"
+            assert data["data"] == sample
+
+    @pytest.mark.asyncio
+    async def test_openrouter_models_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/providers/openrouter/models")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_openrouter_models_with_valid_auth(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.models.list_openrouter_picker_models",
+            lambda **kwargs: [],
+        )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/providers/openrouter/models",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
 # /v1/sessions/{session_id}/model endpoint
 # ---------------------------------------------------------------------------
 
@@ -726,6 +854,78 @@ class TestSessionModelEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# DELETE /v1/sessions/{session_id}
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteSessionEndpoint:
+    @pytest.mark.asyncio
+    async def test_delete_session_removes_resolved_session(self, adapter, monkeypatch):
+        captured = {}
+
+        class FakeDB:
+            def resolve_session_id(self, session_id):
+                captured["resolved_from"] = session_id
+                return "20260315_092437_c9a6ff"
+
+            def delete_session(self, session_id, sessions_dir=None):
+                captured["deleted"] = session_id
+                captured["sessions_dir"] = sessions_dir
+                return True
+
+            def close(self):
+                captured["closed"] = True
+
+        fake_home = Path("/tmp/fake-hermes-home")
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: FakeDB())
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: fake_home)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete("/v1/sessions/20260315_092437_c9a6")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["object"] == "hermes.session.deleted"
+        assert data["session_id"] == "20260315_092437_c9a6ff"
+        assert data["deleted"] is True
+        assert captured == {
+            "resolved_from": "20260315_092437_c9a6",
+            "deleted": "20260315_092437_c9a6ff",
+            "sessions_dir": fake_home / "sessions",
+            "closed": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_delete_session_returns_404_when_unknown(self, adapter, monkeypatch):
+        class FakeDB:
+            def resolve_session_id(self, session_id):
+                return None
+
+            def delete_session(self, session_id, sessions_dir=None):
+                raise AssertionError("delete_session should not run for unknown session")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: FakeDB())
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: Path("/tmp/fake-hermes-home"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete("/v1/sessions/missing-session")
+
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_session_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete("/v1/sessions/some-session")
+            assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
 
@@ -750,6 +950,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["context_usage_events"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
 
@@ -836,6 +1037,40 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_failed_agent_result_emits_error_finish(self, adapter):
+        """A failed agent task must not look like a normal stop to SSE clients."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {
+                        "final_response": None,
+                        "messages": [],
+                        "api_calls": 2,
+                        "completed": False,
+                        "failed": True,
+                        "error": "messages.8.content: Invalid input",
+                    },
+                    {"input_tokens": 12, "output_tokens": 0, "total_tokens": 12},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "messages.8.content: Invalid input" in body
+                assert '"finish_reason": "error"' in body
+                assert '"finish_reason": "stop"' not in body
+                assert "[DONE]" in body
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_completion(self, adapter):
@@ -1107,6 +1342,60 @@ class TestChatCompletionsEndpoint:
                 # the test robust against preview-formatter tweaks.
                 assert '"label":' in body
                 assert '"toolCallId": "call_search_1"' in body
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_context_usage_event(self, adapter):
+        """Context fill updates are exposed as hermes.context.usage SSE events."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("context_usage_callback")
+                if cb:
+                    cb(
+                        {
+                            "context_used": 111_400,
+                            "context_max": 200_000,
+                            "context_percent": 56,
+                            "compressions": 1,
+                            "model": "test-model",
+                            "session": {
+                                "input_tokens": 100,
+                                "output_tokens": 50,
+                                "cache_read_tokens": 10,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 5,
+                                "prompt_tokens": 100,
+                                "completion_tokens": 50,
+                                "total_tokens": 150,
+                            },
+                        }
+                    )
+                stream_cb = kwargs.get("stream_delta_callback")
+                if stream_cb:
+                    await asyncio.sleep(0.05)
+                    stream_cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.context.usage" in body
+                assert '"context_percent": 56' in body
+                assert '"context_used": 111400' in body
+                assert '"input_tokens": 100' in body
 
     @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):

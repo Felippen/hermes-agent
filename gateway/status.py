@@ -816,11 +816,19 @@ def _consume_pid_marker_for_self(
 
     our_pid = os.getpid()
     our_start_time = _get_process_start_time(our_pid)
-    matches = (
-        target_pid == our_pid
-        and target_start_time is not None
-        and our_start_time is not None
-        and target_start_time == our_start_time
+    matches = target_pid == our_pid and (
+        (
+            target_start_time is not None
+            and our_start_time is not None
+            and target_start_time == our_start_time
+        )
+        or (
+            # macOS and other non-/proc platforms cannot always read process
+            # start time. Keep the PID match useful there, bounded by the
+            # short marker TTL to reduce PID-reuse risk.
+            target_start_time is None
+            and our_start_time is None
+        )
     )
 
     try:

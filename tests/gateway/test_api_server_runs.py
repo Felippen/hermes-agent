@@ -24,6 +24,8 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.subagent_events import SubagentEventStore
+from tools.ao_bridge import AOSession
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +51,16 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_get("/v1/runs/{run_id}/subagents/events", adapter._handle_run_subagent_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    app.router.add_get("/v1/ao/sessions", adapter._handle_ao_sessions)
+    app.router.add_get("/v1/ao/sessions/{session_id}", adapter._handle_ao_session_detail)
+    app.router.add_post("/v1/ao/sessions/{session_id}/stop", adapter._handle_ao_session_stop)
+    app.router.add_post("/v1/ao/sessions/{session_id}/open", adapter._handle_ao_session_open)
+    app.router.add_post("/v1/ao/sessions/{session_id}/follow-up", adapter._handle_ao_session_follow_up)
+    app.router.add_post("/v1/ao/sessions/{session_id}/retry", adapter._handle_ao_session_retry)
+    app.router.add_post("/v1/ao/sessions/{session_id}/reassign", adapter._handle_ao_session_reassign)
     return app
 
 
@@ -83,6 +93,38 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_total_tokens = 0
 
     return mock_agent, ready, interrupted
+
+
+class _FakeAOBridge:
+    def __init__(self):
+        self.sent_messages = []
+        self.spawn_kwargs = None
+        self.killed_sessions = []
+        self.session = AOSession(
+            id="oryn-workspace-9",
+            project_id="OrynWorkspace",
+            status="working",
+            activity="active",
+            branch="feat/retry",
+            workspace_path="/tmp/oryn-workspace-9",
+            tmux_name="tmux-oryn-workspace-9",
+            open_command="tmux attach -t tmux-oryn-workspace-9",
+        )
+
+    def send(self, session_id, message):
+        self.sent_messages.append((session_id, message))
+        return self.session
+
+    def status(self, session_id):
+        return self.session
+
+    def spawn(self, **kwargs):
+        self.spawn_kwargs = kwargs
+        return self.session
+
+    def kill(self, session_id):
+        self.killed_sessions.append(session_id)
+        self.session.status = "killed"
 
 
 @pytest.fixture
@@ -191,6 +233,34 @@ class TestStartRun:
                 )
                 assert resp.status == 202
 
+    @pytest.mark.asyncio
+    async def test_run_cleans_up_temporary_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 10
+                mock_agent.session_completion_tokens = 5
+                mock_agent.session_total_tokens = 15
+                mock_agent._session_messages = [{"role": "user", "content": "hello"}]
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "completed"
+                mock_agent.shutdown_memory_provider.assert_called_once_with(mock_agent._session_messages)
+                mock_agent.close.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
@@ -278,6 +348,194 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_run_event_callback_forwards_subagent_events(self, adapter, tmp_path):
+        run_id = "run_subagents"
+        q = asyncio.Queue()
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        adapter._run_streams[run_id] = q
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop(), session_id="session-1")
+        for event_type in (
+            "subagent.start",
+            "subagent.tool",
+            "subagent.progress",
+            "subagent.thinking",
+            "subagent.complete",
+        ):
+            callback(
+                event_type,
+                tool_name="terminal" if event_type == "subagent.tool" else None,
+                preview="latest activity",
+                subagent_id="child-1",
+                parent_id="parent-1",
+                depth=1,
+                goal="Inspect the workspace",
+                status="completed" if event_type == "subagent.complete" else "running",
+                summary="Found the relevant files" if event_type == "subagent.complete" else None,
+            )
+
+            event = await asyncio.wait_for(q.get(), timeout=1.0)
+            assert event["event"] == event_type
+            assert event["event_id"] > 0
+            assert event["session_id"] == "session-1"
+            assert event["run_id"] == run_id
+            assert event["subagent_id"] == "child-1"
+            assert event["parent_id"] == "parent-1"
+            assert event["depth"] == 1
+            assert event["goal"] == "Inspect the workspace"
+            assert event["status"] in {"running", "completed"}
+
+        assert event["summary"] == "Found the relevant files"
+        stored = adapter._subagent_event_store.list_events(session_id="session-1")
+        assert [item["event"] for item in stored] == [
+            "subagent.start",
+            "subagent.tool",
+            "subagent.progress",
+            "subagent.thinking",
+            "subagent.complete",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_events_replay_endpoint(self, adapter, tmp_path):
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        adapter._subagent_event_store.append_event({
+            "event": "subagent.start",
+            "run_id": "run_replay",
+            "session_id": "session-replay",
+            "subagent_id": "child-1",
+            "depth": 0,
+            "goal": "Replay me",
+            "status": "running",
+        })
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_replay/subagents/events")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["total"] == 1
+        assert data["data"][0]["event"] == "subagent.start"
+        assert data["data"][0]["subagent_id"] == "child-1"
+
+    @pytest.mark.asyncio
+    async def test_ao_follow_up_endpoint_sends_message_and_records_event(self, adapter, tmp_path):
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        bridge = _FakeAOBridge()
+        app = _create_runs_app(adapter)
+
+        with patch("tools.ao_bridge.AOBridge", return_value=bridge):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/ao/sessions/oryn-workspace-9/follow-up",
+                    json={"message": "Please inspect the failing test"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["ok"] is True
+        assert bridge.sent_messages == [("oryn-workspace-9", "Please inspect the failing test")]
+        events = adapter._subagent_event_store.list_events(ao_session_id="oryn-workspace-9")
+        assert events[-1]["event"] == "subagent.progress"
+        assert events[-1]["message"] == "Follow-up sent"
+
+    @pytest.mark.asyncio
+    async def test_ao_stop_endpoint_kills_session_and_records_terminal_event(self, adapter, tmp_path):
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        adapter._subagent_event_store.append_event({
+            "event": "subagent.progress",
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "subagent_id": "ao:oryn-workspace-9",
+            "ao_session_id": "oryn-workspace-9",
+            "runtime": "ao",
+            "goal": "Stop smoke test",
+            "status": "running",
+        })
+        bridge = _FakeAOBridge()
+        app = _create_runs_app(adapter)
+
+        with patch("tools.ao_bridge.AOBridge", return_value=bridge):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/ao/sessions/oryn-workspace-9/stop")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["event"]["event"] == "subagent.complete"
+        assert data["event"]["status"] == "killed"
+        assert data["event"]["session_id"] == "session-1"
+        assert bridge.killed_sessions == ["oryn-workspace-9"]
+        events = adapter._subagent_event_store.list_events(ao_session_id="oryn-workspace-9")
+        assert events[-1]["event"] == "subagent.complete"
+        assert events[-1]["status"] == "killed"
+
+    @pytest.mark.asyncio
+    async def test_ao_retry_endpoint_spawns_from_stored_prompt(self, adapter, tmp_path):
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        adapter._subagent_event_store.upsert_ao_prompt(
+            ao_session_id="oryn-workspace-1",
+            project_id="OrynWorkspace",
+            prompt="Original task prompt",
+            goal="Original goal",
+            issue_id="DEV-1",
+            branch="feat/original",
+        )
+        adapter._subagent_event_store.append_event({
+            "event": "subagent.complete",
+            "subagent_id": "ao:oryn-workspace-1",
+            "ao_session_id": "oryn-workspace-1",
+            "runtime": "ao",
+            "summary": "Previous worker failed on tests",
+            "status": "failed",
+        })
+        bridge = _FakeAOBridge()
+        app = _create_runs_app(adapter)
+
+        with patch("tools.ao_bridge.AOBridge", return_value=bridge):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/ao/sessions/oryn-workspace-1/retry",
+                    json={"instruction": "Try a smaller patch"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["mode"] == "retry"
+        assert "Original task prompt" in bridge.spawn_kwargs["prompt"]
+        assert "Previous worker failed on tests" in bridge.spawn_kwargs["prompt"]
+        assert "Try a smaller patch" in bridge.spawn_kwargs["prompt"]
+        assert data["event"]["parent_id"] == "ao:oryn-workspace-1"
+
+    @pytest.mark.asyncio
+    async def test_run_events_stream_emits_named_sse_for_subagent_events(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_subagent_stream"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        await adapter._run_streams[run_id].put({
+            "event": "subagent.start",
+            "run_id": run_id,
+            "subagent_id": "child-1",
+            "parent_id": None,
+            "depth": 0,
+            "goal": "Read files",
+            "status": "running",
+        })
+        await adapter._run_streams[run_id].put(None)
+
+        async with TestClient(TestServer(app)) as cli:
+            events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+            assert events_resp.status == 200
+            body = await events_resp.text()
+
+        assert "event: subagent.start" in body
+        assert '"subagent_id": "child-1"' in body
+        assert '"run_id": "run_subagent_stream"' in body
+
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
@@ -529,3 +787,46 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+class TestAOSessionControls:
+    @pytest.mark.asyncio
+    async def test_stop_ao_session_calls_bridge(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.ao_bridge.AOBridge") as mock_bridge_cls:
+                mock_bridge = MagicMock()
+                mock_bridge_cls.return_value = mock_bridge
+
+                resp = await cli.post("/v1/ao/sessions/oryn-workspace-1/stop")
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "killed"
+                mock_bridge.kill.assert_called_once_with("oryn-workspace-1")
+
+    @pytest.mark.asyncio
+    async def test_open_ao_session_returns_attach_info(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.ao_bridge.AOBridge") as mock_bridge_cls:
+                mock_bridge = MagicMock()
+                mock_bridge.open_session.return_value = {
+                    "ok": True,
+                    "opened": True,
+                    "session": {
+                        "runtime": "ao",
+                        "ao_session_id": "oryn-workspace-1",
+                        "workspace_path": "/tmp/worktree",
+                        "open_command": "tmux attach -t abc-oryn-workspace-1",
+                    },
+                }
+                mock_bridge_cls.return_value = mock_bridge
+
+                resp = await cli.post("/v1/ao/sessions/oryn-workspace-1/open")
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["session"]["runtime"] == "ao"
+                assert data["session"]["ao_session_id"] == "oryn-workspace-1"
+                mock_bridge.open_session.assert_called_once_with("oryn-workspace-1")

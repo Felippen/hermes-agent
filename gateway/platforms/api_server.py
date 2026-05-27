@@ -35,6 +35,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -45,6 +46,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.subagent_events import SubagentEventStore, events_response
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -337,10 +339,12 @@ class ResponseStore:
                 db_path = str(get_hermes_home() / "response_store.db")
             except Exception:
                 db_path = ":memory:"
+        self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._db_path = None
         # Use shared WAL-fallback helper so response_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
         # issue addressed for state.db/kanban.db — see
@@ -361,6 +365,31 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
+        # response_store.db contains conversation history (tool payloads,
+        # prompts, results). Tighten to owner-only after creation so other
+        # local users on a shared box can't read it. Run once at __init__
+        # rather than after every commit — chmod-on-every-write is wasted
+        # syscalls on a hot path.
+        self._tighten_file_permissions()
+
+    def _tighten_file_permissions(self) -> None:
+        """Force owner-only permissions on the DB and SQLite sidecars."""
+        if not self._db_path:
+            return
+        for candidate in (
+            Path(self._db_path),
+            Path(f"{self._db_path}-wal"),
+            Path(f"{self._db_path}-shm"),
+        ):
+            try:
+                if candidate.exists():
+                    candidate.chmod(0o600)
+            except OSError:
+                logger.debug(
+                    "Failed to restrict response store permissions for %s",
+                    candidate,
+                    exc_info=True,
+                )
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
@@ -763,6 +792,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._subagent_event_store: Optional[SubagentEventStore] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -830,6 +860,58 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return "*" in self._cors_origins or origin in self._cors_origins
 
+    @staticmethod
+    def _clean_log_value(value: Any, *, max_len: int = 200) -> str:
+        """Sanitize request metadata before it reaches security logs."""
+        if value is None:
+            return ""
+        text = str(value).replace("\r", " ").replace("\n", " ").strip()
+        return text[:max_len]
+
+    def _request_audit_context(self, request: "web.Request") -> Dict[str, str]:
+        """Return non-secret source metadata for security/audit warnings."""
+        peer_ip = ""
+        try:
+            peer = request.transport.get_extra_info("peername") if request.transport else None
+            if isinstance(peer, (tuple, list)) and peer:
+                peer_ip = str(peer[0])
+        except Exception:
+            peer_ip = ""
+
+        return {
+            "remote": self._clean_log_value(getattr(request, "remote", "") or peer_ip),
+            "peer_ip": self._clean_log_value(peer_ip),
+            "forwarded_for": self._clean_log_value(request.headers.get("X-Forwarded-For", "")),
+            "real_ip": self._clean_log_value(request.headers.get("X-Real-IP", "")),
+            "method": self._clean_log_value(request.method, max_len=16),
+            "path": self._clean_log_value(request.path_qs, max_len=500),
+            "user_agent": self._clean_log_value(request.headers.get("User-Agent", ""), max_len=300),
+        }
+
+    def _request_audit_log_suffix(self, request: "web.Request") -> str:
+        ctx = self._request_audit_context(request)
+        fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
+        return " ".join(fields) if fields else "source='unknown'"
+
+    def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
+        """Persist safe API source metadata on cron jobs created over HTTP."""
+        ctx = self._request_audit_context(request)
+        origin = {
+            "platform": "api_server",
+            "chat_id": "api",
+        }
+        if ctx.get("remote"):
+            origin["source_ip"] = ctx["remote"]
+        if ctx.get("peer_ip"):
+            origin["peer_ip"] = ctx["peer_ip"]
+        if ctx.get("forwarded_for"):
+            origin["forwarded_for"] = ctx["forwarded_for"]
+        if ctx.get("real_ip"):
+            origin["real_ip"] = ctx["real_ip"]
+        if ctx.get("user_agent"):
+            origin["user_agent"] = ctx["user_agent"]
+        return origin
+
     # ------------------------------------------------------------------
     # Auth helper
     # ------------------------------------------------------------------
@@ -851,6 +933,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
+        logger.warning(
+            "API server rejected invalid API key: %s",
+            self._request_audit_log_suffix(request),
+        )
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
@@ -939,6 +1025,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    def _ensure_subagent_event_store(self) -> Optional[SubagentEventStore]:
+        """Lazily initialise persistent subagent event history."""
+        if self._subagent_event_store is None:
+            try:
+                self._subagent_event_store = SubagentEventStore()
+            except Exception as exc:
+                logger.warning("Subagent event store unavailable: %s", exc)
+        return self._subagent_event_store
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -952,6 +1047,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        context_usage_callback=None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
     ) -> Any:
@@ -1003,12 +1099,38 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            context_usage_callback=context_usage_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
         return agent
+
+    @staticmethod
+    def _cleanup_agent_resources(agent: Any) -> None:
+        """Best-effort teardown for one-shot API-server agents."""
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, "shutdown_memory_provider"):
+                session_messages = getattr(agent, "_session_messages", None)
+                if isinstance(session_messages, list):
+                    agent.shutdown_memory_provider(session_messages)
+                else:
+                    agent.shutdown_memory_provider()
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+        try:
+            from agent.auxiliary_client import cleanup_stale_async_clients
+            cleanup_stale_async_clients()
+        except Exception:
+            pass
 
     def _request_model_override(self, requested_model: Optional[str]) -> Optional[str]:
         """Treat the advertised profile model as an alias for the configured LLM."""
@@ -1109,6 +1231,51 @@ class APIServerAdapter(BasePlatformAdapter):
             })
         except Exception as exc:
             logger.warning("Failed to resolve current API-server model: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_openrouter_models(self, request: "web.Request") -> "web.Response":
+        """GET /v1/providers/openrouter/models — browse tool-capable OpenRouter models."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = str(request.rel_url.query.get("q", "")).strip()
+        limit_raw = request.rel_url.query.get("limit")
+        offset_raw = request.rel_url.query.get("offset", "0")
+        force_refresh = str(request.rel_url.query.get("force_refresh", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        try:
+            limit = int(limit_raw) if limit_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            limit = None
+
+        try:
+            offset = int(offset_raw)
+        except (TypeError, ValueError):
+            offset = 0
+
+        try:
+            from hermes_cli.models import list_openrouter_picker_models
+
+            models = list_openrouter_picker_models(
+                query=query,
+                limit=limit,
+                offset=offset,
+                force_refresh=force_refresh,
+            )
+            return web.json_response(
+                {
+                    "object": "hermes.provider.models",
+                    "provider": "openrouter",
+                    "data": models,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed to list OpenRouter picker models: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
     async def _handle_set_session_model(self, request: "web.Request") -> "web.Response":
@@ -1345,6 +1512,39 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("GET /v1/sessions/{id}/messages failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/sessions/{session_id} — remove a stored session and its messages."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+
+        try:
+            from hermes_constants import get_hermes_home
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            try:
+                resolved = db.resolve_session_id(session_id)
+                if not resolved:
+                    return web.json_response(_openai_error("Session not found"), status=404)
+                sessions_dir = get_hermes_home() / "sessions"
+                if not db.delete_session(resolved, sessions_dir=sessions_dir):
+                    return web.json_response(_openai_error("Session not found"), status=404)
+                return web.json_response({
+                    "object": "hermes.session.deleted",
+                    "session_id": resolved,
+                    "deleted": True,
+                })
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("DELETE /v1/sessions/{id} failed: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
     async def _handle_commands(self, request: "web.Request") -> "web.Response":
         """GET /v1/commands — Return a dynamic list of active API-callable slash commands."""
         auth_err = self._check_auth(request)
@@ -1534,7 +1734,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                "context_usage_events": True,
                 "approval_events": True,
+                "ao_session_controls": True,
                 "session_model_selection": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1552,6 +1754,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "current_model": {"method": "GET", "path": "/v1/model/current"},
+                "openrouter_models": {
+                    "method": "GET",
+                    "path": "/v1/providers/openrouter/models",
+                },
                 "session_model": {"method": "POST", "path": "/v1/sessions/{session_id}/model"},
                 "commands": {"method": "GET", "path": "/v1/commands"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
@@ -1565,6 +1771,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "ao_session_stop": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/stop"},
+                "ao_session_open": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/open"},
+                "ao_sessions": {"method": "GET", "path": "/v1/ao/sessions"},
+                "ao_session_detail": {"method": "GET", "path": "/v1/ao/sessions/{session_id}"},
+                "ao_session_follow_up": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/follow-up"},
+                "ao_session_retry": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/retry"},
+                "ao_session_reassign": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/reassign"},
+                "session_subagent_events": {"method": "GET", "path": "/v1/sessions/{session_id}/subagents/events"},
+                "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
             },
         })
 
@@ -2203,6 +2418,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 Prefer this path for display labels, then suppress the later
                 structured duplicate for the same tool name.
                 """
+                if str(event_type).startswith("subagent."):
+                    event = self._subagent_event_payload(
+                        event_type,
+                        completion_id,
+                        tool_name=tool_name,
+                        preview=preview,
+                        args=args,
+                        extra=kwargs,
+                    )
+                    event = self._persist_subagent_event(event, session_id=session_id)
+                    _stream_q.put(("__subagent_event__", event))
+                    return
                 if event_type == "reasoning.available" and preview:
                     _stream_q.put(("__reasoning_delta__", {"text": preview}))
                     return
@@ -2270,6 +2497,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            def _on_context_usage(payload: Dict[str, Any]) -> None:
+                if payload:
+                    _stream_q.put(("__context_usage__", payload))
+
             def _on_approval_request(approval_data: Dict[str, Any]) -> None:
                 event = dict(approval_data or {})
                 event.update({
@@ -2305,6 +2536,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                context_usage_callback=_on_context_usage,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 model_override=model_name,
@@ -2507,6 +2739,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: approval.request\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__context_usage__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.context.usage\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__subagent_event__":
+                    event_name = item[1].get("event", "subagent.progress")
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: {event_name}\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2545,16 +2788,35 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            finish_reason = "stop"
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
                 if isinstance(result, dict) and result.get("failed"):
+                    finish_reason = "error"
+                    err_msg = result.get("error") or "agent run failed"
                     self._set_run_status(
                         completion_id,
                         "failed",
-                        error=result.get("error") or "agent run failed",
+                        error=err_msg,
                         last_event="run.failed",
                     )
+                    error_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": f"\n\nHermes run failed: {err_msg}"
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
                 else:
                     self._set_run_status(
                         completion_id,
@@ -2565,18 +2827,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                finish_reason = "error"
+                err_msg = str(exc)
                 self._set_run_status(
                     completion_id,
                     "failed",
-                    error=str(exc),
+                    error=err_msg,
                     last_event="run.failed",
                 )
+                error_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"\n\nHermes run failed: {err_msg}"
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    from agent.context_usage import build_context_usage_payload
+
+                    final_context_payload = build_context_usage_payload(agent)
+                    await response.write(
+                        f"event: hermes.context.usage\ndata: {json.dumps(final_context_payload)}\n\n".encode()
+                    )
+                except Exception:
+                    logger.debug("Failed to emit final context usage event", exc_info=True)
 
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
@@ -3616,6 +3908,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """Validate and extract job_id. Returns (job_id, error_response)."""
         job_id = request.match_info["job_id"]
         if not self._JOB_ID_RE.fullmatch(job_id):
+            logger.warning(
+                "Cron jobs API rejected invalid job_id %r: %s",
+                job_id,
+                self._request_audit_log_suffix(request),
+            )
             return job_id, web.json_response(
                 {"error": "Invalid job ID format"}, status=400,
             )
@@ -3673,6 +3970,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "schedule": schedule,
                 "name": name,
                 "deliver": deliver,
+                "origin": self._cron_origin_from_request(request),
             }
             if skills:
                 kwargs["skills"] = skills
@@ -3932,6 +4230,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        context_usage_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
@@ -3955,6 +4254,7 @@ class APIServerAdapter(BasePlatformAdapter):
             approval_session_key = gateway_session_key or session_id or ""
             approval_token = None
             session_tokens = []
+            agent = None
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
@@ -3963,6 +4263,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                context_usage_callback=context_usage_callback,
                 gateway_session_key=gateway_session_key,
                 model_override=model_override,
             )
@@ -4024,6 +4325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             clear_session_vars(session_tokens)
                     except Exception:
                         pass
+                self._cleanup_agent_resources(agent)
 
         return await loop.run_in_executor(None, _run)
 
@@ -4064,7 +4366,69 @@ class APIServerAdapter(BasePlatformAdapter):
                 return session_key
         return None
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _subagent_event_payload(
+        self,
+        event_type: str,
+        run_id: str,
+        tool_name: str = None,
+        preview: str = None,
+        args=None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Normalize a Hermes-native subagent progress callback for SSE."""
+        payload: Dict[str, Any] = {
+            "event": event_type,
+            "run_id": run_id,
+            "timestamp": time.time(),
+        }
+        for key, value in (extra or {}).items():
+            if value is not None:
+                payload[key] = value
+        if tool_name is not None:
+            payload.setdefault("tool", tool_name)
+            payload.setdefault("tool_name", tool_name)
+        if preview is not None:
+            payload.setdefault("preview", preview)
+            if event_type == "subagent.thinking":
+                payload.setdefault("text", preview)
+            elif event_type == "subagent.tool":
+                payload.setdefault("tool_preview", preview)
+            elif event_type == "subagent.progress":
+                payload.setdefault("message", preview)
+        if args is not None:
+            payload.setdefault("args", args)
+        return payload
+
+    def _persist_subagent_event(self, payload: Dict[str, Any], *, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Append a subagent event to state.db and return the public payload."""
+        event = dict(payload)
+        prompt_meta = event.pop("_ao_prompt_metadata", None)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return event
+        try:
+            if prompt_meta and event.get("ao_session_id"):
+                store.upsert_ao_prompt(
+                    ao_session_id=str(event.get("ao_session_id")),
+                    project_id=prompt_meta.get("project_id") or event.get("ao_project_id"),
+                    prompt=prompt_meta.get("prompt") or "",
+                    goal=prompt_meta.get("goal") or event.get("goal"),
+                    issue_id=prompt_meta.get("issue_id") or event.get("issue_id"),
+                    branch=prompt_meta.get("branch") or event.get("branch"),
+                    agent=prompt_meta.get("agent"),
+                    model=prompt_meta.get("model") or event.get("model"),
+                )
+            return store.append_event(event, session_id=session_id)
+        except Exception as exc:
+            logger.debug("Failed to persist subagent event: %s", exc)
+            return event
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        session_id: Optional[str] = None,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
@@ -4082,7 +4446,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
-            if event_type == "tool.started":
+            if str(event_type).startswith("subagent."):
+                event = self._subagent_event_payload(
+                    event_type,
+                    run_id,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    extra=kwargs,
+                )
+                _push(self._persist_subagent_event(event, session_id=session_id))
+            elif event_type == "tool.started":
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -4106,7 +4480,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
-            # _thinking and subagent_progress are intentionally not forwarded
+            # _thinking and legacy subagent_progress remain internal-only.
 
         return _callback
 
@@ -4199,7 +4573,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(run_id, loop, session_id=session_id)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -4224,6 +4598,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            agent = None
             try:
                 self._set_run_status(run_id, "running")
                 agent = self._create_agent(
@@ -4280,6 +4655,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             conversation_history=conversation_history,
                             task_id=effective_task_id,
                         )
+                        u = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        return r, u
                     finally:
                         try:
                             unregister_gateway_notify(approval_session_key)
@@ -4294,12 +4675,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     clear_session_vars(session_tokens)
                                 except Exception:
                                     pass
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+                        self._cleanup_agent_resources(agent)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
@@ -4468,7 +4844,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
+                event_name = event.get("event") if isinstance(event, dict) else None
+                if isinstance(event_name, str) and event_name.startswith("subagent."):
+                    payload = f"event: {event_name}\ndata: {json.dumps(event)}\n\n"
+                else:
+                    payload = f"data: {json.dumps(event)}\n\n"
                 await response.write(payload.encode())
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
@@ -4478,6 +4858,261 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _handle_session_subagent_events(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/subagents/events — replay subagent events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+        limit = self._bounded_query_limit(request, default=500)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+        return web.json_response(events_response(
+            store.list_events(session_id=session_id, limit=limit),
+            session_id=session_id,
+        ))
+
+    async def _handle_run_subagent_events(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/{run_id}/subagents/events — replay subagent events for a run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = str(request.match_info.get("run_id", "")).strip()
+        if not run_id:
+            return web.json_response(_openai_error("Run ID required"), status=400)
+        limit = self._bounded_query_limit(request, default=500)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+        return web.json_response(events_response(
+            store.list_events(run_id=run_id, limit=limit),
+            run_id=run_id,
+        ))
+
+    def _bounded_query_limit(self, request: "web.Request", *, default: int = 100) -> int:
+        try:
+            return max(1, min(int(request.rel_url.query.get("limit", str(default))), 2000))
+        except Exception:
+            return default
+
+    def _ao_session_payload(self, session: Any, *, include_events: bool = False) -> Dict[str, Any]:
+        payload = session.event_fields()
+        payload.update({
+            "id": session.id,
+            "status": session.display_status,
+            "activity": session.activity,
+            "agent": session.agent,
+            "pr": session.pr,
+            "summary": session.summary,
+        })
+        store = self._ensure_subagent_event_store()
+        prompt_meta = store.get_ao_prompt(session.id) if store else None
+        payload["can_retry"] = bool(prompt_meta)
+        payload["can_reassign"] = bool(prompt_meta)
+        if prompt_meta:
+            payload["goal"] = prompt_meta.get("goal")
+            payload["prompt_available"] = True
+        else:
+            payload["prompt_available"] = False
+        if include_events and store:
+            payload["events"] = store.list_events(ao_session_id=session.id)
+        return payload
+
+    async def _handle_ao_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/ao/sessions — list AO sessions known to AO/Hermes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        project_id = request.rel_url.query.get("project_id")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            sessions = AOBridge().list(project_id=project_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response({
+            "object": "list",
+            "data": [self._ao_session_payload(session) for session in sessions],
+            "total": len(sessions),
+        })
+
+    async def _handle_ao_session_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/ao/sessions/{session_id} — AO session detail with Hermes event history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            session = AOBridge().status(session_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        if not session:
+            return web.json_response(_openai_error("AO session not found"), status=404)
+        return web.json_response({
+            "object": "hermes.ao_session",
+            "session": self._ao_session_payload(session, include_events=True),
+        })
+
+    async def _handle_ao_session_follow_up(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/follow-up — send a message to a running AO worker."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        message = str(body.get("message") or "").strip()
+        if not message:
+            return web.json_response(_openai_error("Follow-up message required"), status=400)
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            session = bridge.send(session_id, message) or bridge.status(session_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        if session:
+            self._persist_subagent_event({
+                "event": "subagent.progress",
+                "subagent_id": f"ao:{session.id}",
+                "runtime": "ao",
+                "ao_session_id": session.id,
+                "ao_project_id": session.project_id,
+                "workspace_path": session.workspace_path,
+                "branch": session.branch,
+                "tmux_name": session.tmux_name,
+                "open_command": session.open_command,
+                "status": session.display_status,
+                "message": "Follow-up sent",
+                "preview": "Follow-up sent",
+                "timestamp": time.time(),
+            })
+        return web.json_response({"ok": True, "session": self._ao_session_payload(session) if session else None})
+
+    async def _handle_ao_session_retry(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/retry — spawn a replacement AO worker."""
+        return await self._spawn_related_ao_session(request, mode="retry")
+
+    async def _handle_ao_session_reassign(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/reassign — spawn a replacement AO worker with optional overrides."""
+        return await self._spawn_related_ao_session(request, mode="reassign")
+
+    async def _spawn_related_ao_session(self, request: "web.Request", *, mode: str) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        source_session_id = request.match_info.get("session_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        store = self._ensure_subagent_event_store()
+        prompt_meta = store.get_ao_prompt(source_session_id) if store else None
+        if not prompt_meta:
+            return web.json_response(
+                _openai_error("Original AO prompt metadata is unavailable for this session"),
+                status=409,
+            )
+        latest = store.latest_event_for_ao_session(source_session_id) if store else None
+        prior_summary = (latest or {}).get("summary") or (latest or {}).get("message") or (latest or {}).get("preview")
+        instruction = str(body.get("instruction") or "").strip()
+        project_id = str(body.get("project_id") or prompt_meta.get("project_id") or "OrynWorkspace")
+        agent = body.get("agent") or prompt_meta.get("agent")
+        model = body.get("model") or prompt_meta.get("model")
+        goal = prompt_meta.get("goal") or f"{mode.title()} AO worker"
+        prompt = self._related_ao_prompt(
+            mode=mode,
+            original_prompt=prompt_meta.get("prompt") or "",
+            prior_summary=prior_summary,
+            instruction=instruction,
+            model=model,
+        )
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            session = bridge.spawn(
+                project_id=project_id,
+                prompt=prompt,
+                issue_id=prompt_meta.get("issue_id"),
+                agent=agent,
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if store:
+            store.upsert_ao_prompt(
+                ao_session_id=session.id,
+                project_id=project_id,
+                prompt=prompt,
+                goal=f"{mode.title()}: {goal}",
+                issue_id=prompt_meta.get("issue_id"),
+                branch=session.branch,
+                agent=agent,
+                model=model,
+            )
+        start_event = self._persist_subagent_event({
+            "event": "subagent.start",
+            "subagent_id": f"ao:{session.id}",
+            "parent_id": (latest or {}).get("subagent_id"),
+            "depth": int((latest or {}).get("depth") or 0),
+            "goal": f"{mode.title()}: {goal}",
+            "runtime": "ao",
+            "ao_session_id": session.id,
+            "ao_project_id": session.project_id,
+            "workspace_path": session.workspace_path,
+            "branch": session.branch,
+            "issue_id": session.issue_id,
+            "tmux_name": session.tmux_name,
+            "open_command": session.open_command,
+            "model": session.model,
+            "status": session.display_status,
+            "message": f"AO {mode} session spawned from {source_session_id}",
+            "timestamp": time.time(),
+        })
+        return web.json_response({
+            "ok": True,
+            "mode": mode,
+            "source_session_id": source_session_id,
+            "session": self._ao_session_payload(session),
+            "event": start_event,
+        })
+
+    @staticmethod
+    def _related_ao_prompt(
+        *,
+        mode: str,
+        original_prompt: str,
+        prior_summary: Optional[str],
+        instruction: str,
+        model: Optional[str],
+    ) -> str:
+        parts = [
+            f"You are a {mode} AO worker for a previous Agent Orchestrator session.",
+            "",
+            "Original task:",
+            original_prompt.strip(),
+        ]
+        if prior_summary:
+            parts.extend(["", "Previous session summary/status:", prior_summary.strip()])
+        if model:
+            parts.extend(["", f"Requested model/agent preference: {model}"])
+        if instruction:
+            parts.extend(["", "Additional instruction:", instruction])
+        return "\n".join(part for part in parts if part is not None)
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
@@ -4608,6 +5243,71 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_ao_session_stop(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/stop — stop an AO worker session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            before_session = bridge.status(session_id)
+            bridge.kill(session_id)
+            try:
+                session = bridge.status(session_id) or before_session
+            except Exception:
+                session = before_session
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+
+        latest = None
+        store = self._ensure_subagent_event_store()
+        if store:
+            latest = store.latest_event_for_ao_session(session_id)
+        event_payload: Dict[str, Any] = dict(latest or {})
+        if session is not None:
+            event_payload.update(session.event_fields())
+        event_payload.update({
+            "event": "subagent.complete",
+            "subagent_id": event_payload.get("subagent_id") or f"ao:{session_id}",
+            "runtime": "ao",
+            "ao_session_id": session_id,
+            "status": "killed",
+            "summary": "AO worker stopped by user.",
+            "message": "AO worker stopped by user.",
+            "preview": "AO worker stopped by user.",
+            "timestamp": time.time(),
+        })
+        event_payload.pop("event_id", None)
+        event_payload.pop("created_at", None)
+        event = self._persist_subagent_event(event_payload)
+        return web.json_response({
+            "ok": True,
+            "mode": "stop",
+            "session_id": session_id,
+            "status": "killed",
+            "session": self._ao_session_payload(session) if session else None,
+            "event": event,
+        })
+
+    async def _handle_ao_session_open(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/open — open AO worktree and return attach info."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            from tools.ao_bridge import AOBridge
+
+            result = AOBridge().open_session(session_id)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        return web.json_response(result)
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -4662,10 +5362,16 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/model/current", self._handle_current_model)
+            self._app.router.add_get(
+                "/v1/providers/openrouter/models",
+                self._handle_openrouter_models,
+            )
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
             self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/v1/sessions/{session_id}/subagents/events", self._handle_session_subagent_events)
+            self._app.router.add_delete("/v1/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/commands", self._handle_commands)
@@ -4690,8 +5396,16 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_get("/v1/runs/{run_id}/subagents/events", self._handle_run_subagent_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_get("/v1/ao/sessions", self._handle_ao_sessions)
+            self._app.router.add_get("/v1/ao/sessions/{session_id}", self._handle_ao_session_detail)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/stop", self._handle_ao_session_stop)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/open", self._handle_ao_session_open)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/follow-up", self._handle_ao_session_follow_up)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/retry", self._handle_ao_session_retry)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/reassign", self._handle_ao_session_reassign)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
