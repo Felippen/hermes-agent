@@ -176,6 +176,7 @@ class OpenHandsWorkerRuntime:
         )
 
     def spawn(self, **kwargs: Any) -> Any:
+        kwargs.pop("minimal_worker_prompt", None)
         return self.bridge.spawn(**kwargs)
 
     def status(self, session_id: str) -> Any:

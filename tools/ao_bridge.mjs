@@ -1,9 +1,12 @@
 #!/usr/bin/env node
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
 const AO_ROOT =
   process.env.AO_NODE_ROOT ||
   "/opt/homebrew/lib/node_modules/@composio/agent-orchestrator/node_modules";
+const execFileAsync = promisify(execFile);
 
 async function readStdinJSON() {
   let input = "";
@@ -69,21 +72,91 @@ function normalizeSession(session, config) {
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function captureTmuxOutput(sessionName) {
+  if (!sessionName) return "";
+  try {
+    const { stdout } = await execFileAsync("tmux", [
+      "capture-pane",
+      "-t",
+      sessionName,
+      "-p",
+      "-S",
+      "-120",
+    ], { timeout: 5000 });
+    return stdout || "";
+  } catch {
+    return "";
+  }
+}
+
+async function sendTmuxEnter(sessionName) {
+  if (!sessionName) return;
+  try {
+    await execFileAsync("tmux", ["send-keys", "-t", sessionName, "Enter"], { timeout: 5000 });
+  } catch {
+    // Best effort. The benchmark harness will classify delivery failure if
+    // Codex never produces a worker result.
+  }
+}
+
+function tmuxSessionName(session) {
+  return session?.metadata?.tmuxName || session?.runtimeHandle?.id || session?.id || null;
+}
+
+async function waitForAgentReady(session) {
+  const sessionName = tmuxSessionName(session);
+  if (!sessionName) return;
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const output = await captureTmuxOutput(sessionName);
+    if (
+      output.includes("OpenAI Codex") ||
+      /\n›\s/.test(output) ||
+      output.includes("model:")
+    ) {
+      return;
+    }
+    await sleep(500);
+  }
+}
+
 async function main() {
   const command = process.argv[2];
   const input = await readStdinJSON();
   const { loadConfig, getSessionManager } = await loadAO();
   const config = loadConfig(input.config_path || process.env.AO_CONFIG_PATH);
+  if (command === "spawn" && input.minimal_worker_prompt && input.project_id) {
+    const project = config.projects?.[input.project_id];
+    if (project) {
+      delete project.agentRules;
+      delete project.agentRulesFile;
+    }
+  }
   const sm = await getSessionManager(config);
 
   if (command === "spawn") {
+    const minimalWorkerPrompt = Boolean(input.minimal_worker_prompt);
+    const prompt = input.prompt || undefined;
     const session = await sm.spawn({
       projectId: input.project_id,
       issueId: input.issue_id || undefined,
-      prompt: input.prompt || undefined,
+      prompt: minimalWorkerPrompt ? undefined : prompt,
       branch: input.branch || undefined,
       agent: input.agent || undefined,
     });
+    if (minimalWorkerPrompt && prompt) {
+      await waitForAgentReady(session);
+      await sm.send(session.id, prompt);
+      await sleep(1000);
+      await sendTmuxEnter(tmuxSessionName(session));
+      const updated = await sm.get(session.id);
+      console.log(JSON.stringify({ ok: true, session: normalizeSession(updated || session, config) }));
+      return;
+    }
     console.log(JSON.stringify({ ok: true, session: normalizeSession(session, config) }));
     return;
   }

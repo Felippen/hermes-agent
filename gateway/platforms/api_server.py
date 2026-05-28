@@ -6167,6 +6167,7 @@ class APIServerAdapter(BasePlatformAdapter):
             runtime=body.get("runtime"),
             project_id=body.get("project_id"),
             permissions=body.get("permissions"),
+            db_path=self._ensure_dev_execution_store().db_path,
         )
         return web.json_response({
             "ok": True,

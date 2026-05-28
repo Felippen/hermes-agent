@@ -110,6 +110,71 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _persist_runtime_policy_benchmark(
+    db_path,
+    *,
+    benchmark_run_id: str = "devbench-policy",
+    ao: dict | None = None,
+    openhands: dict | None = None,
+) -> None:
+    from gateway.dev_control.harness_benchmarks import DevHarnessBenchmarkStore
+
+    now = _time.time()
+    defaults = {
+        "ao": {
+            "runtime": "ao",
+            "case_count": 6,
+            "iteration_count": 2,
+            "median_score": 0.887,
+            "median_task_quality_score": 0.75,
+            "median_contract_compliance_score": 1.0,
+            "marker_pass_rate": 1.0,
+            "required_evidence_pass_rate": 1.0,
+            "delivery_failure_rate": 0.0,
+            "average_duration_seconds": 35.0,
+            "token_sample_count": 6,
+            "cost_sample_count": 0,
+            "total_tokens": 1000,
+            "total_cost_usd": 0.0,
+        },
+        "openhands": {
+            "runtime": "openhands",
+            "case_count": 6,
+            "iteration_count": 2,
+            "median_score": 0.879,
+            "median_task_quality_score": 0.737,
+            "median_contract_compliance_score": 1.0,
+            "marker_pass_rate": 1.0,
+            "required_evidence_pass_rate": 1.0,
+            "delivery_failure_rate": 0.0,
+            "average_duration_seconds": 14.0,
+            "token_sample_count": 6,
+            "cost_sample_count": 6,
+            "total_tokens": 800,
+            "total_cost_usd": 0.01,
+        },
+    }
+    defaults["ao"].update(ao or {})
+    defaults["openhands"].update(openhands or {})
+    store = DevHarnessBenchmarkStore(db_path)
+    try:
+        store.persist_run({
+            "ok": True,
+            "object": "hermes.dev_harness_benchmark_run",
+            "benchmark_run_id": benchmark_run_id,
+            "mode": "live",
+            "live": True,
+            "created_at": now,
+            "completed_at": now,
+            "runtime_results": [defaults["ao"], defaults["openhands"]],
+            "case_results": [],
+            "cases": [],
+            "summary": {},
+        })
+    finally:
+        store.close()
+
+
 def _make_slow_agent(**kwargs):
     """Create a mock agent that blocks in run_conversation until interrupted.
 
@@ -145,6 +210,7 @@ class _FakeAOBridge:
     def __init__(self):
         self.sent_messages = []
         self.spawn_kwargs = None
+        self.codex_exec_kwargs = None
         self.killed_sessions = []
         self.session = AOSession(
             id="oryn-workspace-9",
@@ -185,6 +251,32 @@ class _FakeAOBridge:
     def kill(self, session_id, **_kwargs):
         self.killed_sessions.append(session_id)
         self.session.status = "killed"
+
+    def run_codex_exec_benchmark(self, **kwargs):
+        self.codex_exec_kwargs = kwargs
+        return {
+            "session_id": "codex-exec-test",
+            "status": "completed",
+            "summary": (
+                "BENCHMARK_RESULT\n"
+                "marker: BENCH_AGENT_BOARD_METADATA_DONE\n"
+                "finding_1: WorkspaceAgentBoardView renders runtime metadata.\n"
+                "finding_2: WorkspaceSubagentActivity exposes agent and model metadata.\n"
+                "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE"
+            ),
+            "output_tail": (
+                "BENCHMARK_RESULT\n"
+                "finding_1: WorkspaceAgentBoardView renders runtime metadata.\n"
+                "finding_2: WorkspaceSubagentActivity exposes agent and model metadata.\n"
+                "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE"
+            ),
+            "duration_seconds": 1.2,
+            "workspace_path": "/tmp/oryn-workspace",
+            "agent": "codex",
+            "model": "gpt-5.5",
+            "reasoning_effort": "medium",
+            "token_total": 1234,
+        }
 
 
 class _FakeOpenHandsBridge:
@@ -703,6 +795,61 @@ class TestRunEvents:
         assert data["selection_mode"] == "auto"
         assert data["fallback_runtime"] == "ao"
         assert "can_capture_output" in data["required_capabilities"]
+        assert data["runtime_policy_status"] == "insufficient_evidence"
+        assert "No live AO/OpenHands benchmark evidence" in data["runtime_policy_evidence"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_dev_runtime_selection_uses_healthy_benchmark_evidence_for_auto_read_only(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        _persist_runtime_policy_benchmark(db_path, benchmark_run_id="devbench-healthy")
+        app = _create_runs_app(adapter)
+        openhands = _FakeOpenHandsBridge()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.openhands_bridge.OpenHandsBridge", return_value=openhands):
+                resp = await cli.post("/v1/dev/runtime-selection", json={
+                    "runtime": "auto",
+                    "goal": "Inspect Agent Board state",
+                    "prompt": "Inspect the files read-only and report one finding.",
+                    "permissions": "read_only",
+                })
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["selected_runtime"] == "openhands"
+        assert data["runtime_policy_status"] == "healthy"
+        assert data["runtime_policy_evidence"]["benchmark_run_id"] == "devbench-healthy"
+        assert data["runtime_policy_evidence"]["runtimes"]["openhands"]["sample_count"] == 6
+
+    @pytest.mark.asyncio
+    async def test_dev_runtime_selection_falls_back_when_openhands_benchmark_degraded(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        _persist_runtime_policy_benchmark(
+            db_path,
+            benchmark_run_id="devbench-degraded",
+            openhands={"marker_pass_rate": 0.5},
+        )
+        app = _create_runs_app(adapter)
+        openhands = _FakeOpenHandsBridge()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.openhands_bridge.OpenHandsBridge", return_value=openhands):
+                resp = await cli.post("/v1/dev/runtime-selection", json={
+                    "runtime": "auto",
+                    "goal": "Inspect Agent Board state",
+                    "prompt": "Inspect read-only.",
+                    "permissions": "read_only",
+                })
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["selected_runtime"] == "ao"
+        assert data["selection_mode"] == "fallback"
+        assert data["runtime_policy_status"] == "degraded"
+        assert "marker pass rate" in data["runtime_policy_reason"]
+        assert "benchmark evidence degraded" in data["runtime_fallback_reason"]
 
     @pytest.mark.asyncio
     async def test_dev_runtime_selection_falls_back_to_ao_when_openhands_unavailable(self, adapter, tmp_path):
@@ -724,6 +871,7 @@ class TestRunEvents:
         assert data["selected_runtime"] == "ao"
         assert data["selection_mode"] == "fallback"
         assert data["runtime_fallback_reason"] == "OpenHands is not installed or configured."
+        assert data["runtime_policy_status"] == "fallback"
 
     @pytest.mark.asyncio
     async def test_dev_runtime_selection_uses_ao_for_auto_implementation(self, adapter, tmp_path):
@@ -745,6 +893,7 @@ class TestRunEvents:
         assert data["selected_runtime"] == "ao"
         assert data["selection_mode"] == "auto"
         assert "Implementation" in data["reason"]
+        assert data["runtime_policy_status"] == "not_applicable"
 
     @pytest.mark.asyncio
     async def test_dev_harness_components_endpoint_returns_active_component_hashes(self, adapter, tmp_path):
@@ -1141,7 +1290,13 @@ class TestRunEvents:
         assert adapter._subagent_event_store.list_events() == []
 
     def test_dev_harness_benchmark_marker_scoring_requires_exact_final_marker_line(self):
-        from gateway.dev_control.harness_benchmarks import _score_result
+        from gateway.dev_control.harness_benchmarks import (
+            _cost_usd,
+            _detect_prompt_delivery_failure,
+            _openhands_usage_from_text,
+            _score_result,
+            _token_total,
+        )
 
         echoed_prompt = _score_result({
             "runtime": "ao",
@@ -1229,8 +1384,51 @@ class TestRunEvents:
         assert exact_line["marker_in_summary"] is True
         assert exact_line["marker_score"] == 1.0
 
+        echoed_contract_tail = (
+            "codex --approval-mode full-auto --model 'gpt-5.5'\n"
+            "Output contract:\n"
+            "Return only this shape:\n"
+            "BENCHMARK_RESULT\n"
+            "marker: BENCH_AGENT_BOARD_METADATA_DONE\n"
+            "finding_1: <one concrete finding>\n"
+            "finding_2: <one concrete finding>\n"
+            "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE\n"
+        )
+        assert "echoed prompt/placeholder contract" in _detect_prompt_delivery_failure(
+            runtime="ao",
+            output_tail=echoed_contract_tail,
+            marker="BENCH_AGENT_BOARD_METADATA_DONE",
+        )
+
+        failed_delivery = _score_result({
+            "runtime": "ao",
+            "marker": "BENCH_AGENT_BOARD_METADATA_DONE",
+            "status": "runtime_delivery_failed",
+            "runtime_delivery_failed": True,
+            "summary": echoed_contract_tail,
+            "output_tail": echoed_contract_tail,
+            "files_read_count": 0,
+        })
+        assert failed_delivery["marker_present"] is False
+        assert failed_delivery["structured_result_present"] is False
+        assert failed_delivery["delivery_score"] == 0.0
+
+        openhands_tail = (
+            "stats: {'usage_to_metrics': {'default': {'model_name': 'openrouter/openai/gpt-4o-mini', "
+            "'accumulated_cost': 0.00176895, 'accumulated_token_usage': {'prompt_tokens': 18601, "
+            "'completion_tokens': 474, 'cache_read_tokens': 17408, 'cache_write_tokens': 0}}}}"
+        )
+        usage = _openhands_usage_from_text(openhands_tail)
+        assert usage["cost_usd"] == 0.00176895
+        assert usage["token_total"] == 19075
+        assert usage["prompt_tokens"] == 18601
+        assert usage["completion_tokens"] == 474
+        assert usage["cache_read_tokens"] == 17408
+        assert _token_total({"output_tail": openhands_tail}) == 19075
+        assert _cost_usd({"output_tail": openhands_tail}) == 0.00176895
+
     @pytest.mark.asyncio
-    async def test_dev_harness_benchmark_live_launches_read_only_plan(self, adapter, tmp_path):
+    async def test_dev_harness_benchmark_live_ao_uses_codex_exec(self, adapter, tmp_path):
         adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
         adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
         bridge = _FakeAOBridge()
@@ -1249,36 +1447,53 @@ class TestRunEvents:
 
         assert data["mode"] == "live"
         assert data["live"] is True
-        assert len(adapter._dev_execution_store.list_plans()) == 1
+        assert adapter._dev_execution_store.list_plans() == []
         result = data["case_results"][0]
         assert result["runtime"] == "ao"
-        assert result["plan_id"].startswith("devplan-")
-        assert result["runtime_session_id"] == "oryn-workspace-9"
+        assert result["plan_id"] is None
+        assert result["runtime_session_id"] == "codex-exec-test"
+        assert result["benchmark_execution_mode"] == "codex_exec"
         assert result["output_tail_captured"] is True
-        assert "latest worker output" in result["output_tail"]
-        assert bridge.spawn_kwargs["project_id"] == "OrynWorkspace"
-        assert "Do not edit files" in bridge.spawn_kwargs["prompt"]
-        assert "## Hermes AO Delegation Contract" not in bridge.spawn_kwargs["prompt"]
-        assert "## Dev Launch Profile" not in bridge.spawn_kwargs["prompt"]
-        assert "Return only this shape:" in bridge.spawn_kwargs["prompt"]
-        assert "BENCHMARK_RESULT" in bridge.spawn_kwargs["prompt"]
-        assert "Required evidence terms:" in bridge.spawn_kwargs["prompt"]
-        assert "WorkspaceAgentBoardView" in bridge.spawn_kwargs["prompt"]
-        assert "The final line must be exactly:" in bridge.spawn_kwargs["prompt"]
-        assert "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE" in bridge.spawn_kwargs["prompt"]
-        assert adapter._subagent_event_store.list_events(ao_session_id="oryn-workspace-9")
+        assert "BENCHMARK_RESULT" in result["output_tail"]
+        assert result["marker_present"] is True
+        assert result["token_total"] == 1234
+        assert bridge.spawn_kwargs is None
+        assert bridge.codex_exec_kwargs["project_id"] == "OrynWorkspace"
+        assert "Do not edit files" in bridge.codex_exec_kwargs["prompt"]
+        assert "## Hermes AO Delegation Contract" not in bridge.codex_exec_kwargs["prompt"]
+        assert "## Dev Launch Profile" not in bridge.codex_exec_kwargs["prompt"]
+        assert "Return only this shape:" in bridge.codex_exec_kwargs["prompt"]
+        assert "BENCHMARK_RESULT" in bridge.codex_exec_kwargs["prompt"]
+        assert "Required evidence terms:" in bridge.codex_exec_kwargs["prompt"]
+        assert "WorkspaceAgentBoardView" in bridge.codex_exec_kwargs["prompt"]
+        assert "The final line must be exactly:" in bridge.codex_exec_kwargs["prompt"]
+        assert "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE" in bridge.codex_exec_kwargs["prompt"]
+        assert adapter._subagent_event_store.list_events() == []
 
     @pytest.mark.asyncio
     async def test_dev_harness_benchmark_detects_ao_prompt_delivery_failure(self, adapter, tmp_path):
         adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
         adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
         bridge = _FakeAOBridge()
-        bridge.capture_output = lambda session, lines=40: (
-            "Codex\n"
-            "› Summarize recent commits\n"
-            "  Explain this repository\n"
-            "  Fix failing tests\n"
-        )
+        bridge.run_codex_exec_benchmark = lambda **kwargs: {
+            "session_id": "codex-exec-failed",
+            "status": "completed",
+            "summary": (
+                "BENCHMARK_RESULT\n"
+                "marker: BENCH_AGENT_BOARD_METADATA_DONE\n"
+                "finding_1: <one concrete finding>\n"
+                "finding_2: <one concrete finding>\n"
+                "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE"
+            ),
+            "output_tail": (
+                "BENCHMARK_RESULT\n"
+                "marker: BENCH_AGENT_BOARD_METADATA_DONE\n"
+                "finding_1: <one concrete finding>\n"
+                "finding_2: <one concrete finding>\n"
+                "FINAL_MARKER: BENCH_AGENT_BOARD_METADATA_DONE"
+            ),
+            "duration_seconds": 1.0,
+        }
         app = _create_runs_app(adapter)
 
         async with TestClient(TestServer(app)) as cli:
@@ -1297,13 +1512,13 @@ class TestRunEvents:
         assert result["status"] == "runtime_delivery_failed"
         assert result["runtime_delivery_failed"] is True
         assert result["delivery_status"] == "failed"
-        assert "prompt delivery failed" in result["delivery_failure_reason"]
-        assert result["delivery_cleanup"] == "killed"
+        assert "echoed prompt/placeholder contract" in result["delivery_failure_reason"]
+        assert result["delivery_cleanup"] is None
         assert result["delivery_score"] == 0.0
         assert result["task_quality_score"] < 1.0
         assert result["marker_present"] is False
         assert result["marker_in_output_tail"] is False
-        assert bridge.killed_sessions == ["oryn-workspace-9"]
+        assert bridge.killed_sessions == []
         assert runtime_result["runtime_delivery_failed"] == 1
         assert data["summary"]["runtime_delivery_failed_count"] == 1
 
@@ -1354,11 +1569,12 @@ class TestRunEvents:
 
         assert data["iterations"] == 3
         assert len(data["case_results"]) == 3
-        assert len(adapter._dev_execution_store.list_plans()) == 3
+        assert adapter._dev_execution_store.list_plans() == []
         assert data["summary"]["iteration_count"] == 3
         runtime = data["runtime_results"][0]
         assert runtime["iteration_count"] == 3
         assert runtime["median_delivery_score"] == 1.0
+        assert all(result["benchmark_execution_mode"] == "codex_exec" for result in data["case_results"])
 
     @pytest.mark.asyncio
     async def test_dev_harness_recommendations_can_reference_benchmark_run(self, adapter, tmp_path):
@@ -1381,6 +1597,7 @@ class TestRunEvents:
             })
             rec = await rec_resp.json()
 
+        assert rec["benchmark_run_id"] == benchmark["benchmark_run_id"]
         assert rec["benchmark_snapshot"]["benchmark_run_id"] == benchmark["benchmark_run_id"]
         assert rec["summary"]["benchmark_run_id"] == benchmark["benchmark_run_id"]
         runtime_recs = [
@@ -1589,6 +1806,7 @@ class TestRunEvents:
         assert launch_data["launched"][0]["runtime"] == "openhands"
         assert launch_data["launched"][0]["runtime_session_id"] == "oh-conv-1"
         assert openhands.spawn_kwargs["project_id"] == "OrynWorkspace"
+        assert "minimal_worker_prompt" not in openhands.spawn_kwargs
         assert "Hermes AO Delegation Contract" not in openhands.spawn_kwargs["prompt"]
         task = status_data["tasks"][0]
         assert task["runtime"] == "openhands"
@@ -1635,13 +1853,16 @@ class TestRunEvents:
         assert launch_data["launched"][0]["runtime"] == "openhands"
         assert launch_data["launched"][0]["runtime_selection"]["selection_mode"] == "auto"
         assert launch_data["launched"][0]["runtime_selection_reason"] == "Read-only inspection can run on healthy OpenHands with output capture."
+        assert launch_data["launched"][0]["runtime_policy_status"] == "insufficient_evidence"
         task = status_data["tasks"][0]
         assert task["runtime"] == "openhands"
         assert task["selected_runtime"] == "openhands"
         assert task["runtime_selection"]["selection_mode"] == "auto"
+        assert task["runtime_policy_status"] == "insufficient_evidence"
         events = adapter._subagent_event_store.list_events()
         assert events[0]["runtime"] == "openhands"
         assert events[0]["selected_runtime"] == "openhands"
+        assert events[0]["runtime_policy_status"] == "insufficient_evidence"
 
     @pytest.mark.asyncio
     async def test_dev_execution_plan_launch_auto_openhands_spawn_failure_falls_back_to_ao(self, adapter, tmp_path):
@@ -1676,6 +1897,7 @@ class TestRunEvents:
         assert launch_data["launched"][0]["runtime"] == "ao"
         assert launch_data["launched"][0]["runtime_selection"]["selection_mode"] == "fallback"
         assert "server rejected session" in launch_data["launched"][0]["runtime_fallback_reason"]
+        assert launch_data["launched"][0]["runtime_policy_status"] == "fallback"
         assert bridge.spawn_kwargs["project_id"] == "OrynWorkspace"
         assert "Hermes AO Delegation Contract" in bridge.spawn_kwargs["prompt"]
         task = status_data["tasks"][0]

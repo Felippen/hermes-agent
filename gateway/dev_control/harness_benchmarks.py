@@ -352,6 +352,14 @@ def _run_case_for_runtime(
             "status": "validated",
             "status_reason": "Live benchmark launch was not explicitly enabled.",
         })
+    if runtime == "ao":
+        return _run_ao_codex_exec_case(
+            base=base,
+            bridge=bridge,
+            case=case,
+            project_id=project_id,
+            timeout_seconds=timeout_seconds,
+        )
 
     started_at = time.time()
     profile_id = "workspace.openhands.inspect" if runtime == "openhands" else "workspace.inspect"
@@ -431,6 +439,7 @@ def _run_case_for_runtime(
             session_id=runtime_session_id,
             bridge=bridge,
         )
+    usage = _usage_from_task_status({**task_status, "output_tail": output_tail})
     return _score_result({
         **base,
         "plan_id": plan["plan_id"],
@@ -452,12 +461,89 @@ def _run_case_for_runtime(
         "delivery_status": "failed" if delivery_failure_reason else "delivered_or_terminal",
         "delivery_failure_reason": delivery_failure_reason,
         "delivery_cleanup": delivery_cleanup,
-        "token_total": _token_total(task_status),
-        "cost_usd": _cost_usd(task_status),
+        "token_total": usage.get("token_total"),
+        "cost_usd": usage.get("cost_usd"),
+        "usage": usage or None,
         "duration_seconds": time.time() - started_at,
         "files_read_count": len(task_status.get("files_read") or []),
         "verification_evidence_count": len(task_status.get("verification_evidence") or []),
         "summary_warning": task_status.get("summary_warning"),
+    })
+
+
+def _run_ao_codex_exec_case(
+    *,
+    base: Dict[str, Any],
+    bridge: Any,
+    case: Dict[str, Any],
+    project_id: str,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    started_at = time.time()
+    if bridge is None:
+        from tools.ao_bridge import AOBridge
+
+        bridge = AOBridge()
+    try:
+        execution = bridge.run_codex_exec_benchmark(
+            project_id=project_id,
+            prompt=case["prompt"],
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        return _score_result({
+            **base,
+            "status": "failed",
+            "status_reason": f"Codex exec benchmark failed: {exc}",
+            "duration_seconds": time.time() - started_at,
+            "runtime_delivery_failed": True,
+            "delivery_status": "failed",
+            "delivery_failure_reason": str(exc),
+        })
+    summary = execution.get("summary") or ""
+    output_tail = execution.get("output_tail") or summary
+    delivery_failure_reason = None
+    if _marker_line_present("\n".join([summary, output_tail]), case["marker"]) and not _has_worker_benchmark_result(
+        "\n".join([summary, output_tail]),
+        case["marker"],
+    ):
+        delivery_failure_reason = (
+            "AO benchmark output only contains the echoed prompt/placeholder contract; "
+            "no worker benchmark result was delivered."
+        )
+    marker_present = _marker_line_present(summary, case["marker"]) or _marker_line_present(output_tail, case["marker"])
+    raw_status = str(execution.get("status") or "").lower()
+    status = (
+        "runtime_delivery_failed"
+        if delivery_failure_reason
+        else "completed" if raw_status == "completed" and marker_present
+        else "needs_review" if raw_status == "completed" else raw_status or "failed"
+    )
+    summary_warning = None
+    if delivery_failure_reason:
+        summary_warning = delivery_failure_reason
+    elif raw_status == "completed" and not marker_present:
+        summary_warning = f"Completed worker summary is missing required completion marker: {case['marker']}."
+    return _score_result({
+        **base,
+        "runtime_session_id": execution.get("session_id"),
+        "status": status,
+        "status_reason": summary_warning or ("Codex exec benchmark completed." if status == "completed" else execution.get("status_reason")),
+        "summary": summary,
+        "output_tail": output_tail,
+        "output_tail_captured": bool(output_tail),
+        "runtime_delivery_failed": bool(delivery_failure_reason),
+        "delivery_status": "failed" if delivery_failure_reason else "delivered_or_terminal",
+        "delivery_failure_reason": delivery_failure_reason,
+        "token_total": execution.get("token_total"),
+        "cost_usd": None,
+        "duration_seconds": execution.get("duration_seconds") or (time.time() - started_at),
+        "summary_warning": summary_warning,
+        "workspace_path": execution.get("workspace_path"),
+        "agent": execution.get("agent") or "codex",
+        "model": execution.get("model"),
+        "reasoning_effort": execution.get("reasoning_effort"),
+        "benchmark_execution_mode": "codex_exec",
     })
 
 
@@ -518,15 +604,15 @@ def _score_result(result: Dict[str, Any]) -> Dict[str, Any]:
     combined_output = "\n".join(part for part in (summary, output_tail) if part)
     runtime_delivery_failed = bool(result.get("runtime_delivery_failed")) or status == "runtime_delivery_failed"
     status_score = 1.0 if status == "completed" else 0.5 if status == "needs_review" else 0.0
-    marker_in_summary = _marker_line_present(summary, marker)
-    marker_in_output_tail = _marker_line_present(output_tail, marker)
+    marker_in_summary = False if runtime_delivery_failed else _marker_line_present(summary, marker)
+    marker_in_output_tail = False if runtime_delivery_failed else _marker_line_present(output_tail, marker)
     marker_score = 1.0 if (marker_in_summary or marker_in_output_tail) else 0.0
     has_summary = bool(summary.strip())
     echo_like = "echo" in summary_warning or "contract" in summary_warning
     summary_score = 1.0 if has_summary and not echo_like and len(summary.strip()) >= 24 else 0.0
     evidence_count = int(result.get("files_read_count") or 0) + int(result.get("verification_evidence_count") or 0)
     evidence_score = 1.0 if evidence_count > 0 else 0.0
-    structured_result_present = _structured_result_present(combined_output)
+    structured_result_present = False if runtime_delivery_failed else _structured_result_present(combined_output)
     findings_count = _findings_count(combined_output)
     findings_score = 1.0 if findings_count >= 2 else 0.5 if findings_count == 1 else (0.5 if summary_score else 0.0)
     evidence_terms_matched = _matched_evidence_terms(combined_output, expected_terms)
@@ -596,6 +682,8 @@ def _aggregate_runtime_results(case_results: list[Dict[str, Any]]) -> list[Dict[
         contract_scored = [float(item["contract_compliance_score"]) for item in results if item.get("contract_compliance_score") is not None]
         marker_results = [item for item in results if item.get("overall_score") is not None]
         required_results = [item for item in results if item.get("overall_score") is not None and item.get("required_evidence_terms")]
+        cost_results = [item for item in results if item.get("cost_usd") is not None]
+        token_results = [item for item in results if item.get("token_total") is not None]
         runtime_results.append({
             "runtime": runtime,
             "case_count": len(results),
@@ -621,6 +709,8 @@ def _aggregate_runtime_results(case_results: list[Dict[str, Any]]) -> list[Dict[
                 len(required_results),
             ),
             "delivery_failure_rate": _rate(sum(1 for item in results if item.get("runtime_delivery_failed")), len(results)),
+            "cost_sample_count": len(cost_results),
+            "token_sample_count": len(token_results),
             "total_cost_usd": round(sum(float(item.get("cost_usd") or 0) for item in results), 6),
             "total_tokens": sum(int(item.get("token_total") or 0) for item in results),
             "total_duration_seconds": round(sum(float(item.get("duration_seconds") or 0) for item in results), 3),
@@ -918,6 +1008,11 @@ def _detect_prompt_delivery_failure(*, runtime: str, output_tail: str, marker: s
     if not tail.strip():
         return "AO benchmark output tail was empty, so prompt delivery could not be verified."
     if _marker_line_present(tail, marker) or "BENCHMARK_RESULT" in tail:
+        if not _has_worker_benchmark_result(tail, marker):
+            return (
+                "AO benchmark output only contains the echoed prompt/placeholder contract; "
+                "no worker benchmark result was delivered."
+            )
         return None
     lowered = tail.lower()
     idle_menu_patterns = (
@@ -938,6 +1033,24 @@ def _detect_prompt_delivery_failure(*, runtime: str, output_tail: str, marker: s
     return None
 
 
+def _has_worker_benchmark_result(text: str, marker: str) -> bool:
+    """Return true only when benchmark output has concrete findings, not just the prompt template."""
+
+    value = str(text or "")
+    if not _marker_line_present(value, marker) or "BENCHMARK_RESULT" not in value:
+        return False
+    finding_values: list[str] = []
+    for line in value.splitlines():
+        match = re.match(r"\s*finding_[12]\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if not match:
+            continue
+        finding = match.group(1).strip()
+        if not finding or finding == "<one concrete finding>" or finding.startswith("<"):
+            continue
+        finding_values.append(finding)
+    return len(finding_values) >= 2
+
+
 def _cleanup_delivery_failed_session(*, runtime: str, session_id: Optional[str], bridge: Any) -> Optional[str]:
     if str(runtime or "").lower() != "ao" or not session_id:
         return None
@@ -954,15 +1067,85 @@ def _cleanup_delivery_failed_session(*, runtime: str, session_id: Optional[str],
 
 def _token_total(task_status: Dict[str, Any]) -> Optional[int]:
     value = task_status.get("token_total") or task_status.get("total_tokens")
+    if value is None:
+        usage = _openhands_usage_from_text(
+            "\n".join(
+                str(task_status.get(key) or "")
+                for key in ("summary", "output_tail", "status_reason")
+            )
+        )
+        value = usage.get("token_total")
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
 
 
+def _usage_from_task_status(task_status: Dict[str, Any]) -> Dict[str, Any]:
+    usage = _openhands_usage_from_text(
+        "\n".join(
+            str(task_status.get(key) or "")
+            for key in ("summary", "output_tail", "status_reason")
+        )
+    )
+    token_total = task_status.get("token_total") or task_status.get("total_tokens") or usage.get("token_total")
+    cost_usd = task_status.get("cost_usd") or task_status.get("costUSD") or usage.get("cost_usd")
+    payload = dict(usage)
+    try:
+        if token_total is not None:
+            payload["token_total"] = int(token_total)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if cost_usd is not None:
+            payload["cost_usd"] = float(cost_usd)
+    except (TypeError, ValueError):
+        pass
+    return payload
+
+
 def _cost_usd(task_status: Dict[str, Any]) -> Optional[float]:
     value = task_status.get("cost_usd") or task_status.get("costUSD")
+    if value is None:
+        usage = _openhands_usage_from_text(
+            "\n".join(
+                str(task_status.get(key) or "")
+                for key in ("summary", "output_tail", "status_reason")
+            )
+        )
+        value = usage.get("cost_usd")
     try:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _openhands_usage_from_text(text: str) -> Dict[str, Any]:
+    """Extract cumulative OpenHands usage/cost from transcript stats blocks."""
+
+    value = str(text or "")
+    if "usage_to_metrics" not in value and "accumulated_token_usage" not in value:
+        return {}
+    costs = [float(match) for match in re.findall(r"'accumulated_cost':\s*([0-9]+(?:\.[0-9]+)?)", value)]
+    prompt_tokens = [int(match) for match in re.findall(r"'prompt_tokens':\s*([0-9]+)", value)]
+    completion_tokens = [int(match) for match in re.findall(r"'completion_tokens':\s*([0-9]+)", value)]
+    cache_read_tokens = [int(match) for match in re.findall(r"'cache_read_tokens':\s*([0-9]+)", value)]
+    cache_write_tokens = [int(match) for match in re.findall(r"'cache_write_tokens':\s*([0-9]+)", value)]
+    model_names = re.findall(r"'model_name':\s*'([^']+)'", value)
+    latest_prompt = prompt_tokens[-1] if prompt_tokens else 0
+    latest_completion = completion_tokens[-1] if completion_tokens else 0
+    latest_cache_read = cache_read_tokens[-1] if cache_read_tokens else 0
+    latest_cache_write = cache_write_tokens[-1] if cache_write_tokens else 0
+    token_total = latest_prompt + latest_completion
+    payload: Dict[str, Any] = {}
+    if costs:
+        payload["cost_usd"] = costs[-1]
+    if token_total:
+        payload["token_total"] = token_total
+        payload["prompt_tokens"] = latest_prompt
+        payload["completion_tokens"] = latest_completion
+        payload["cache_read_tokens"] = latest_cache_read
+        payload["cache_write_tokens"] = latest_cache_write
+    if model_names:
+        payload["usage_model"] = model_names[-1]
+    return payload

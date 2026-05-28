@@ -64,6 +64,87 @@ def test_ensure_codex_shim_on_user_path_is_non_destructive(tmp_path):
     assert user_codex.read_text(encoding="utf-8") == "existing"
 
 
+def test_spawn_forwards_minimal_worker_prompt_to_node_bridge():
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+    calls = []
+    bridge._call = lambda command, payload, timeout: calls.append((command, payload, timeout)) or {
+        "session": {"id": "oryn-workspace-42", "project_id": "OrynWorkspace", "status": "working"}
+    }
+
+    session = bridge.spawn(
+        project_id="OrynWorkspace",
+        prompt="Read-only benchmark.",
+        minimal_worker_prompt=True,
+    )
+
+    assert session.id == "oryn-workspace-42"
+    assert calls == [(
+        "spawn",
+        {
+            "project_id": "OrynWorkspace",
+            "prompt": "Read-only benchmark.",
+            "issue_id": None,
+            "branch": None,
+            "agent": "codex",
+            "minimal_worker_prompt": True,
+        },
+        180,
+    )]
+
+
+def test_run_codex_exec_benchmark_uses_noninteractive_cli(tmp_path, monkeypatch):
+    config = tmp_path / "ao.yaml"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config.write_text(
+        f"""
+defaults:
+  agent: codex
+projects:
+  OrynWorkspace:
+    path: {workspace}
+    agentConfig:
+      model: gpt-test
+      reasoningEffort: medium
+""",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        output_file = args[args.index("--output-last-message") + 1]
+        with open(output_file, "w", encoding="utf-8") as handle:
+            handle.write("BENCHMARK_RESULT\nFINAL_MARKER: BENCH_DONE\n")
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            "BENCHMARK_RESULT\nFINAL_MARKER: BENCH_DONE\n",
+            "tokens used\n1,234\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    bridge = AOBridge(config_path=str(config), codex_real_bin="/opt/test/bin/codex")
+
+    result = bridge.run_codex_exec_benchmark(
+        project_id="OrynWorkspace",
+        prompt="Run benchmark.",
+        timeout_seconds=12,
+    )
+
+    args, kwargs = calls[0]
+    assert args[:2] == ["/opt/test/bin/codex", "exec"]
+    assert "--sandbox" in args and "read-only" in args
+    assert "--cd" in args and str(workspace) in args
+    assert "--model" in args and "gpt-test" in args
+    assert args[-1] == "-"
+    assert kwargs["input"] == "Run benchmark."
+    assert result["status"] == "completed"
+    assert result["summary"] == "BENCHMARK_RESULT\nFINAL_MARKER: BENCH_DONE"
+    assert result["token_total"] == 1234
+    assert result["workspace_path"] == str(workspace)
+
+
 def test_kill_forces_tmux_and_session_process_cleanup(monkeypatch):
     bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
     calls = []

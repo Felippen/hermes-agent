@@ -190,6 +190,9 @@ def _persist_start_event_direct(
     selected_runtime: Optional[str] = None,
     runtime_selection_reason: Optional[str] = None,
     runtime_fallback_reason: Optional[str] = None,
+    runtime_policy_evidence: Optional[Dict[str, Any]] = None,
+    runtime_policy_status: Optional[str] = None,
+    runtime_policy_reason: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Persist AO start metadata when this tool runs without a parent callback."""
     try:
@@ -239,6 +242,9 @@ def _persist_start_event_direct(
             "selected_runtime": selected_runtime,
             "runtime_selection_reason": runtime_selection_reason,
             "runtime_fallback_reason": runtime_fallback_reason,
+            "runtime_policy_evidence": runtime_policy_evidence,
+            "runtime_policy_status": runtime_policy_status,
+            "runtime_policy_reason": runtime_policy_reason,
         }.items():
             if value is not None:
                 payload[key] = value

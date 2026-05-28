@@ -17,6 +17,7 @@ def select_worker_runtime(
     permissions: Optional[str] = None,
     project_id: Optional[str] = None,
     runtimes: Optional[Iterable[Dict[str, Any]]] = None,
+    runtime_policy_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     profile = dict(profile or {})
     explicit_runtime = _normalize_requested_runtime(requested_runtime)
@@ -32,6 +33,8 @@ def select_worker_runtime(
             reason=f"Task requested runtime {explicit_runtime}.",
             candidate_runtimes=candidate_ids,
             required_capabilities=required,
+            runtime_policy_status="not_applicable",
+            runtime_policy_reason="Explicit runtime requests bypass auto runtime policy.",
         )
 
     if profile_runtime and profile_runtime != AUTO_RUNTIME:
@@ -41,12 +44,31 @@ def select_worker_runtime(
             reason=f"Launch profile selected runtime {profile_runtime}.",
             candidate_runtimes=candidate_ids,
             required_capabilities=required,
+            runtime_policy_status="not_applicable",
+            runtime_policy_reason="Explicit launch profile runtime bypasses auto runtime policy.",
         )
 
     task_kind = _infer_task_kind(goal=goal, prompt=prompt, permissions=permissions or profile.get("permissions"))
     if task_kind == "inspect":
         openhands = _runtime_by_id(candidates, "openhands")
+        policy = _runtime_policy_status(runtime_policy_evidence)
+        if policy["runtime_policy_status"] == "degraded":
+            fallback_reason = f"OpenHands benchmark evidence degraded: {policy['runtime_policy_reason']}"
+            return _decision(
+                selected_runtime=DEFAULT_RUNTIME,
+                selection_mode="fallback",
+                reason="Read-only inspection fell back to AO because benchmark evidence degraded OpenHands.",
+                candidate_runtimes=candidate_ids,
+                fallback_runtime=DEFAULT_RUNTIME,
+                required_capabilities=required,
+                warnings=[fallback_reason],
+                runtime_fallback_reason=fallback_reason,
+                **policy,
+            )
         if _runtime_satisfies(openhands, required):
+            warnings = []
+            if policy["runtime_policy_status"] == "insufficient_evidence":
+                warnings.append(policy["runtime_policy_reason"])
             return _decision(
                 selected_runtime="openhands",
                 selection_mode="auto",
@@ -54,6 +76,8 @@ def select_worker_runtime(
                 candidate_runtimes=candidate_ids,
                 fallback_runtime=DEFAULT_RUNTIME,
                 required_capabilities=required,
+                warnings=warnings,
+                **policy,
             )
         warning = _runtime_unavailable_reason(openhands, "OpenHands is unavailable or missing required capabilities.")
         return _decision(
@@ -65,6 +89,9 @@ def select_worker_runtime(
             required_capabilities=required,
             warnings=[warning],
             runtime_fallback_reason=warning,
+            runtime_policy_status="fallback",
+            runtime_policy_reason="OpenHands failed runtime availability or capability checks.",
+            runtime_policy_evidence=runtime_policy_evidence or {},
         )
 
     reason = {
@@ -79,6 +106,9 @@ def select_worker_runtime(
         candidate_runtimes=candidate_ids,
         fallback_runtime=None,
         required_capabilities=required,
+        runtime_policy_status="not_applicable",
+        runtime_policy_reason="Benchmark evidence only gates read-only OpenHands auto-selection.",
+        runtime_policy_evidence=runtime_policy_evidence or {},
     )
 
 
@@ -149,6 +179,9 @@ def _decision(
     fallback_runtime: Optional[str] = None,
     warnings: Optional[list[str]] = None,
     runtime_fallback_reason: Optional[str] = None,
+    runtime_policy_status: str = "not_applicable",
+    runtime_policy_reason: Optional[str] = None,
+    runtime_policy_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "selected_runtime": selected_runtime,
@@ -159,4 +192,24 @@ def _decision(
         "required_capabilities": required_capabilities,
         "warnings": warnings or [],
         "runtime_fallback_reason": runtime_fallback_reason,
+        "runtime_policy_status": runtime_policy_status,
+        "runtime_policy_reason": runtime_policy_reason,
+        "runtime_policy_evidence": runtime_policy_evidence or {},
+    }
+
+
+def _runtime_policy_status(evidence: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not evidence:
+        return {
+            "runtime_policy_status": "insufficient_evidence",
+            "runtime_policy_reason": "No benchmark evidence was available for runtime policy gating.",
+            "runtime_policy_evidence": {},
+        }
+    status = str(evidence.get("status") or "insufficient_evidence")
+    if status not in {"insufficient_evidence", "healthy", "degraded"}:
+        status = "insufficient_evidence"
+    return {
+        "runtime_policy_status": status,
+        "runtime_policy_reason": str(evidence.get("reason") or "Runtime policy evidence was inconclusive."),
+        "runtime_policy_evidence": evidence,
     }

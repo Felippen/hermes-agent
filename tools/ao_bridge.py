@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -122,6 +125,7 @@ class AOBridge:
         agent: Optional[str] = None,
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        minimal_worker_prompt: bool = False,
     ) -> AOSession:
         defaults = self._project_agent_defaults.get(project_id) or {}
         resolved_agent = agent or defaults.get("agent")
@@ -135,6 +139,7 @@ class AOBridge:
                 "issue_id": issue_id,
                 "branch": branch,
                 "agent": resolved_agent,
+                "minimal_worker_prompt": bool(minimal_worker_prompt),
             },
             timeout=180,
         )
@@ -163,6 +168,78 @@ class AOBridge:
         payload = self._call("send", {"session_id": session_id, "message": message}, timeout=60)
         session = payload.get("session")
         return self._with_project_defaults(AOSession.from_payload(session)) if session else None
+
+    def run_codex_exec_benchmark(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        timeout_seconds: int = 180,
+    ) -> Dict[str, Any]:
+        """Run a benchmark prompt through Codex exec without AO/tmux interaction."""
+
+        defaults = self._project_agent_defaults.get(project_id) or {}
+        resolved_model = model or defaults.get("model")
+        project_path = self._project_paths.get(project_id) or os.getcwd()
+        session_id = f"codex-exec-{uuid.uuid4().hex[:10]}"
+        with tempfile.NamedTemporaryFile(prefix=f"{session_id}-", suffix=".txt", delete=False) as handle:
+            output_path = Path(handle.name)
+        args = [
+            self.codex_real_bin,
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--cd",
+            str(project_path),
+            "--output-last-message",
+            str(output_path),
+        ]
+        if resolved_model:
+            args.extend(["--model", str(resolved_model)])
+        args.append("-")
+        started_at = time.time()
+        try:
+            proc = subprocess.run(
+                args,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                timeout=max(1, int(timeout_seconds or 180)),
+                env=self._bridge_env(),
+                check=False,
+            )
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            proc = subprocess.CompletedProcess(args, returncode=124, stdout=exc.stdout or "", stderr=exc.stderr or "")
+            timed_out = True
+        duration = time.time() - started_at
+        try:
+            final_message = output_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            final_message = ""
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        return {
+            "session_id": session_id,
+            "project_id": project_id,
+            "status": "timeout" if timed_out else "completed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "summary": final_message or stdout.strip(),
+            "output_tail": combined[-12000:],
+            "duration_seconds": duration,
+            "workspace_path": str(project_path),
+            "agent": "codex",
+            "model": resolved_model,
+            "reasoning_effort": defaults.get("reasoning_effort"),
+            "token_total": self._parse_codex_token_total(combined),
+        }
 
     def kill(self, session_id: str, *, session: Optional[AOSession] = None, force: bool = True) -> None:
         self._call("kill", {"session_id": session_id}, timeout=60)
@@ -501,6 +578,30 @@ class AOBridge:
                 ),
             }
         return result
+
+    @cached_property
+    def _project_paths(self) -> Dict[str, str]:
+        try:
+            import yaml
+
+            raw = yaml.safe_load(Path(self.config_path).read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+        result: Dict[str, str] = {}
+        for project_id, project in (raw.get("projects") or {}).items():
+            if isinstance(project, dict) and project.get("path"):
+                result[str(project_id)] = str(Path(str(project.get("path"))).expanduser())
+        return result
+
+    @staticmethod
+    def _parse_codex_token_total(output: str) -> Optional[int]:
+        match = re.search(r"tokens used\s*\n\s*([0-9,]+)", output or "", re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
 
     @staticmethod
     def _read_flat_session_file(path: Path) -> Dict[str, Any]:

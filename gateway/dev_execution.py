@@ -20,6 +20,7 @@ from gateway.dev_worker_runtimes import (
     list_worker_runtimes,
     normalize_runtime,
 )
+from gateway.dev_control.runtime_policy_evidence import latest_runtime_policy_evidence
 from gateway.dev_control.runtime_selection import select_worker_runtime
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
@@ -485,6 +486,7 @@ def resolve_launch_defaults(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     permissions: Optional[str] = None,
+    runtime_policy_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     profile = get_launch_profile(profile_id) or {}
     runtime_selection = select_worker_runtime(
@@ -495,6 +497,7 @@ def resolve_launch_defaults(
         permissions=permissions or profile.get("permissions"),
         project_id=project_id or profile.get("project_id") or "OrynWorkspace",
         runtimes=list_worker_runtimes(),
+        runtime_policy_evidence=runtime_policy_evidence,
     )
     resolved_runtime = runtime_selection["selected_runtime"]
     resolved_model = model or profile.get("model") or DEFAULT_MODEL
@@ -513,6 +516,9 @@ def resolve_launch_defaults(
         "selected_runtime": runtime_selection["selected_runtime"],
         "runtime_selection_reason": runtime_selection["reason"],
         "runtime_fallback_reason": runtime_selection.get("runtime_fallback_reason"),
+        "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+        "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+        "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
     }
     if resolved["launch_profile_id"] and not profile:
         resolved["profile_warning"] = f"Unknown launch profile: {resolved['launch_profile_id']}"
@@ -528,8 +534,13 @@ def select_execution_runtime(
     project_id: Optional[str] = None,
     permissions: Optional[str] = None,
     runtimes: Optional[Iterable[Dict[str, Any]]] = None,
+    db_path: Optional[Path] = None,
+    runtime_policy_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     profile = get_launch_profile(profile_id) or {}
+    evidence = runtime_policy_evidence
+    if evidence is None:
+        evidence = latest_runtime_policy_evidence(db_path)
     return select_worker_runtime(
         goal=goal,
         prompt=prompt,
@@ -538,6 +549,7 @@ def select_execution_runtime(
         permissions=permissions or profile.get("permissions"),
         project_id=project_id or profile.get("project_id") or "OrynWorkspace",
         runtimes=runtimes or list_worker_runtimes(),
+        runtime_policy_evidence=evidence,
     )
 
 
@@ -660,6 +672,9 @@ def _persist_runtime_start_event(
             "selected_runtime",
             "runtime_selection_reason",
             "runtime_fallback_reason",
+            "runtime_policy_evidence",
+            "runtime_policy_status",
+            "runtime_policy_reason",
         ):
             if metadata.get(key) is not None:
                 payload[key] = metadata.get(key)
@@ -1415,6 +1430,7 @@ class DevExecutionStore:
 
     def _normalize_tasks(self, plan_id: str, tasks: list[Dict[str, Any]], now: float) -> list[Dict[str, Any]]:
         normalized: list[Dict[str, Any]] = []
+        runtime_policy_evidence = latest_runtime_policy_evidence(self.db_path)
         for index, raw in enumerate(tasks or [], start=1):
             prompt = str((raw or {}).get("prompt") or "").strip()
             if not prompt:
@@ -1428,6 +1444,7 @@ class DevExecutionStore:
                 model=(raw or {}).get("model"),
                 reasoning_effort=(raw or {}).get("reasoning_effort"),
                 permissions=(raw or {}).get("permissions"),
+                runtime_policy_evidence=runtime_policy_evidence,
             )
             runtime_selection = select_execution_runtime(
                 goal=(raw or {}).get("goal") or prompt.splitlines()[0],
@@ -1436,6 +1453,7 @@ class DevExecutionStore:
                 runtime=(raw or {}).get("runtime"),
                 project_id=profile.get("project_id"),
                 permissions=profile.get("permissions"),
+                runtime_policy_evidence=runtime_policy_evidence,
             )
             profile.update({
                 "runtime": runtime_selection["selected_runtime"],
@@ -1443,6 +1461,9 @@ class DevExecutionStore:
                 "selected_runtime": runtime_selection["selected_runtime"],
                 "runtime_selection_reason": runtime_selection["reason"],
                 "runtime_fallback_reason": runtime_selection.get("runtime_fallback_reason"),
+                "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+                "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+                "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
             })
             if profile["runtime"] == "openhands" and profile.get("model") in {None, "", DEFAULT_MODEL, "gpt-5.5"}:
                 profile["model"] = os.getenv("OPENHANDS_MODEL") or DEFAULT_OPENHANDS_MODEL
@@ -1536,6 +1557,7 @@ def launch_execution_plan(
     launched: list[Dict[str, Any]] = []
     failures: list[Dict[str, Any]] = []
     tasks = [task for task in plan.get("tasks") or [] if not wanted or task.get("task_id") in wanted]
+    runtime_policy_evidence = latest_runtime_policy_evidence(store.db_path)
     for task in tasks:
         profile_payload = (task.get("payload") or {}).get("resolved_profile") or {}
         profile = resolve_launch_defaults(
@@ -1546,6 +1568,7 @@ def launch_execution_plan(
             model=profile_payload.get("model"),
             reasoning_effort=profile_payload.get("reasoning_effort"),
             permissions=profile_payload.get("permissions"),
+            runtime_policy_evidence=runtime_policy_evidence,
         )
         runtime_selection = select_execution_runtime(
             goal=task.get("goal"),
@@ -1554,6 +1577,7 @@ def launch_execution_plan(
             runtime=(task.get("payload") or {}).get("runtime"),
             project_id=profile.get("project_id"),
             permissions=profile.get("permissions"),
+            runtime_policy_evidence=runtime_policy_evidence,
         )
         profile.update({
             "runtime": runtime_selection["selected_runtime"],
@@ -1561,6 +1585,9 @@ def launch_execution_plan(
             "selected_runtime": runtime_selection["selected_runtime"],
             "runtime_selection_reason": runtime_selection["reason"],
             "runtime_fallback_reason": runtime_selection.get("runtime_fallback_reason"),
+            "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+            "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+            "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
         })
         if profile["runtime"] == "openhands" and profile.get("model") in {None, "", DEFAULT_MODEL, "gpt-5.5"}:
             profile["model"] = os.getenv("OPENHANDS_MODEL") or DEFAULT_OPENHANDS_MODEL
@@ -1590,6 +1617,7 @@ def launch_execution_plan(
                 agent=profile.get("agent"),
                 model=profile.get("model"),
                 reasoning_effort=profile.get("reasoning_effort"),
+                minimal_worker_prompt=minimal_worker_prompt,
             )
         except Exception as exc:
             if (
@@ -1606,12 +1634,17 @@ def launch_execution_plan(
                     "selection_mode": "fallback",
                     "runtime_fallback_reason": fallback_reason,
                     "warnings": [*(runtime_selection.get("warnings") or []), fallback_reason],
+                    "runtime_policy_status": "fallback",
+                    "runtime_policy_reason": "OpenHands launch failed after runtime policy selection.",
                 }
                 profile.update({
                     "runtime_selection": runtime_selection,
                     "selected_runtime": DEFAULT_RUNTIME,
                     "runtime_selection_reason": runtime_selection["reason"],
                     "runtime_fallback_reason": fallback_reason,
+                    "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+                    "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+                    "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
                 })
                 if minimal_worker_prompt:
                     launch_prompt = profiled_prompt
@@ -1627,6 +1660,7 @@ def launch_execution_plan(
                         agent=profile.get("agent"),
                         model=profile.get("model"),
                         reasoning_effort=profile.get("reasoning_effort"),
+                        minimal_worker_prompt=minimal_worker_prompt,
                     )
                 except Exception as fallback_exc:
                     failures.append({"task_id": task.get("task_id"), "goal": task.get("goal"), "error": str(fallback_exc)})
@@ -1654,6 +1688,9 @@ def launch_execution_plan(
             "selected_runtime": runtime_selection["selected_runtime"],
             "runtime_selection_reason": runtime_selection["reason"],
             "runtime_fallback_reason": runtime_selection.get("runtime_fallback_reason"),
+            "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+            "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+            "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
         }
         preview = f"{_runtime_label(runtime)} session {session.id} spawned from Dev plan {plan_id}"
         if runtime == DEFAULT_RUNTIME:
@@ -1674,6 +1711,9 @@ def launch_execution_plan(
                 selected_runtime=runtime_selection["selected_runtime"],
                 runtime_selection_reason=runtime_selection["reason"],
                 runtime_fallback_reason=runtime_selection.get("runtime_fallback_reason"),
+                runtime_policy_evidence=runtime_selection.get("runtime_policy_evidence") or {},
+                runtime_policy_status=runtime_selection.get("runtime_policy_status"),
+                runtime_policy_reason=runtime_selection.get("runtime_policy_reason"),
             )
             _persist_start_event_direct(
                 session=session,
@@ -1694,6 +1734,9 @@ def launch_execution_plan(
                 selected_runtime=runtime_selection["selected_runtime"],
                 runtime_selection_reason=runtime_selection["reason"],
                 runtime_fallback_reason=runtime_selection.get("runtime_fallback_reason"),
+                runtime_policy_evidence=runtime_selection.get("runtime_policy_evidence") or {},
+                runtime_policy_status=runtime_selection.get("runtime_policy_status"),
+                runtime_policy_reason=runtime_selection.get("runtime_policy_reason"),
             )
         else:
             _persist_runtime_start_event(
@@ -1721,6 +1764,9 @@ def launch_execution_plan(
             "selected_runtime": runtime_selection["selected_runtime"],
             "runtime_selection_reason": runtime_selection["reason"],
             "runtime_fallback_reason": runtime_selection.get("runtime_fallback_reason"),
+            "runtime_policy_evidence": runtime_selection.get("runtime_policy_evidence") or {},
+            "runtime_policy_status": runtime_selection.get("runtime_policy_status"),
+            "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
             "session": session.event_fields(),
             "launch_profile_id": metadata["launch_profile_id"],
         })
@@ -3399,6 +3445,9 @@ def _append_review_action_event(
         "selected_runtime",
         "runtime_selection_reason",
         "runtime_fallback_reason",
+        "runtime_policy_evidence",
+        "runtime_policy_status",
+        "runtime_policy_reason",
     ):
         value = event_payload.get(key) or task.get(key) or resolved_profile.get(key)
         if value is not None:
@@ -3456,6 +3505,9 @@ def _append_lifecycle_start_event(
         "selected_runtime",
         "runtime_selection_reason",
         "runtime_fallback_reason",
+        "runtime_policy_evidence",
+        "runtime_policy_status",
+        "runtime_policy_reason",
     ):
         value = prompt_meta.get(key) or task.get(key) or resolved_profile.get(key)
         if value is not None:
@@ -3789,6 +3841,21 @@ def _derive_task_status(task: Dict[str, Any], *, bridge: Any, event_store: Any =
         (prompt_meta or {}).get("runtime_selection"),
         profile_payload.get("runtime_selection"),
     )
+    runtime_policy_evidence = _first_non_empty(
+        (latest_event or {}).get("runtime_policy_evidence"),
+        (runtime_selection or {}).get("runtime_policy_evidence") if isinstance(runtime_selection, dict) else None,
+        profile_payload.get("runtime_policy_evidence"),
+    )
+    runtime_policy_status = _first_non_empty(
+        (latest_event or {}).get("runtime_policy_status"),
+        (runtime_selection or {}).get("runtime_policy_status") if isinstance(runtime_selection, dict) else None,
+        profile_payload.get("runtime_policy_status"),
+    )
+    runtime_policy_reason = _first_non_empty(
+        (latest_event or {}).get("runtime_policy_reason"),
+        (runtime_selection or {}).get("runtime_policy_reason") if isinstance(runtime_selection, dict) else None,
+        profile_payload.get("runtime_policy_reason"),
+    )
 
     derived.update({
         "status": task_status,
@@ -3801,6 +3868,9 @@ def _derive_task_status(task: Dict[str, Any], *, bridge: Any, event_store: Any =
         "runtime_session_id": ao_session_id,
         "runtime_project_id": _first_non_empty(_session_attr(session, "project_id"), task.get("project_id"), (prompt_meta or {}).get("project_id")),
         "runtime_selection": runtime_selection,
+        "runtime_policy_evidence": runtime_policy_evidence,
+        "runtime_policy_status": runtime_policy_status,
+        "runtime_policy_reason": runtime_policy_reason,
         "selected_runtime": _first_non_empty(
             (latest_event or {}).get("selected_runtime"),
             (prompt_meta or {}).get("selected_runtime"),

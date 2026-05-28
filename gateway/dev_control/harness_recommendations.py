@@ -175,6 +175,7 @@ def generate_harness_recommendations(
         "object": "hermes.dev_harness_recommendation_run",
         "recommendation_run_id": run_id,
         "report_id": report.get("report_id"),
+        "benchmark_run_id": (benchmark or {}).get("benchmark_run_id"),
         "created_at": created_at,
         "scope": report.get("scope") or {},
         "component_hashes": report.get("component_hashes") or {},
@@ -360,7 +361,7 @@ def _recommend_runtime_fallback(
         report=report,
         category="runtime_policy",
         title="Review automatic runtime fallback causes before changing selection policy",
-        priority="medium" if count >= 3 else "low",
+        priority="medium" if task_count >= 10 and count >= 3 else "low",
         confidence=0.76,
         impact="Improves routing stability by identifying why selected runtimes could not launch.",
         risk="Medium. Runtime policy changes can accidentally move write tasks to the wrong runtime.",
@@ -459,6 +460,16 @@ def _recommend_supervisor_policy(report: Dict[str, Any]) -> Optional[Dict[str, A
 def _benchmark_runtime_reason(benchmark: Dict[str, Any], runtime_results: list[Dict[str, Any]]) -> str:
     metrics = []
     for item in runtime_results:
+        cost_text = (
+            f"${item.get('total_cost_usd')}"
+            if int(item.get("cost_sample_count") or 0) > 0
+            else "unavailable"
+        )
+        token_text = (
+            str(item.get("total_tokens"))
+            if int(item.get("token_sample_count") or 0) > 0
+            else "unavailable"
+        )
         metrics.append(
             f"{item.get('runtime')}: median score {item.get('median_score')}, "
             f"task quality {item.get('median_task_quality_score')}, "
@@ -467,7 +478,8 @@ def _benchmark_runtime_reason(benchmark: Dict[str, Any], runtime_results: list[D
             f"required evidence pass rate {item.get('required_evidence_pass_rate')}, "
             f"delivery failure rate {item.get('delivery_failure_rate')}, "
             f"avg duration {item.get('average_duration_seconds')}s, "
-            f"cost ${item.get('total_cost_usd')}"
+            f"tokens {token_text}, "
+            f"cost {cost_text}"
         )
     return (
         f"Benchmark {benchmark.get('benchmark_run_id')} provides controlled benchmark evidence: "
@@ -481,10 +493,22 @@ def _benchmark_runtime_implementation_brief(runtime_results: list[Dict[str, Any]
     observations = [
         "Compare median runtime score, task quality, contract compliance, marker pass rate, required evidence pass rate, delivery failure rate, duration, and cost across repeated live runs.",
     ]
-    if "ao" in by_runtime:
-        observations.append("Track whether AO remains faster but shows lower contract compliance on read-only benchmark prompts.")
-    if "openhands" in by_runtime:
-        observations.append("Track whether OpenHands remains slower but produces cleaner read-only inspection summaries.")
+    ao = by_runtime.get("ao")
+    openhands = by_runtime.get("openhands")
+    if ao and openhands:
+        ao_duration = _metric(ao, "average_duration_seconds")
+        openhands_duration = _metric(openhands, "average_duration_seconds")
+        ao_score = _metric(ao, "median_score")
+        openhands_score = _metric(openhands, "median_score")
+        faster = "OpenHands" if openhands_duration and (not ao_duration or openhands_duration < ao_duration) else "AO"
+        higher_score = "OpenHands" if openhands_score > ao_score else "AO" if ao_score > openhands_score else "neither runtime"
+        observations.append(
+            f"Track whether {faster} remains faster and whether {higher_score} keeps the stronger median quality score on read-only inspection prompts."
+        )
+    elif ao:
+        observations.append("Track AO read-only benchmark latency, quality, and contract compliance across repeated runs.")
+    elif openhands:
+        observations.append("Track OpenHands read-only benchmark latency, quality, and contract compliance across repeated runs.")
     posture = _benchmark_runtime_policy_posture(runtime_results)
     if posture:
         observations.append(posture)
