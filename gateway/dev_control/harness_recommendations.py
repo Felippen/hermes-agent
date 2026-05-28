@@ -384,22 +384,20 @@ def _recommend_runtime_warning_rate(
     benchmark_runtime_results = (benchmark or {}).get("runtime_results") or []
     if benchmark_runtime_results:
         scored = [item for item in benchmark_runtime_results if item.get("average_score") is not None]
-        low_scoring = [item for item in scored if float(item.get("average_score") or 0) < 0.75]
-        if low_scoring:
-            runtime_labels = ", ".join(str(item.get("runtime")) for item in low_scoring)
+        if scored:
             return _recommendation(
                 report=report,
                 category="runtime_policy",
                 title="Use controlled benchmark evidence before changing runtime selection",
                 priority="low",
-                confidence=0.72,
+                confidence=0.74,
                 impact="Improves runtime policy decisions by favoring controlled AO/OpenHands comparisons over noisy historical samples.",
                 risk="Medium. Benchmark samples are still limited and must not directly mutate routing defaults.",
                 affected_components=["runtime-selection-policy", "launch-profiles"],
                 evidence_refs=[],
-                reason=f"Benchmark {(benchmark or {}).get('benchmark_run_id')} found lower scoring runtime result(s): {runtime_labels}.",
-                suggested_change="Repeat the benchmark across more read-only cases before changing runtime selection defaults.",
-                implementation_brief="Compare benchmark averages, marker pass counts, cost, and duration across at least two live runs before proposing runtime policy changes.",
+                reason=_benchmark_runtime_reason(benchmark or {}, scored),
+                suggested_change=_benchmark_runtime_suggested_change(scored),
+                implementation_brief=_benchmark_runtime_implementation_brief(scored),
                 non_goals=["Do not mutate runtime policy from one benchmark run.", "Do not change write-task routing from read-only benchmark evidence."],
             )
         return None
@@ -456,6 +454,95 @@ def _recommend_supervisor_policy(report: Dict[str, Any]) -> Optional[Dict[str, A
         implementation_brief="Add a Dev prompt/report that lists stale approvals and human-review plans for manual triage.",
         non_goals=["Do not auto-apply retry, repair-retry, reassign, or human-review actions."],
     )
+
+
+def _benchmark_runtime_reason(benchmark: Dict[str, Any], runtime_results: list[Dict[str, Any]]) -> str:
+    metrics = []
+    for item in runtime_results:
+        metrics.append(
+            f"{item.get('runtime')}: median score {item.get('median_score')}, "
+            f"task quality {item.get('median_task_quality_score')}, "
+            f"contract compliance {item.get('median_contract_compliance_score')}, "
+            f"marker pass rate {item.get('marker_pass_rate')}, "
+            f"required evidence pass rate {item.get('required_evidence_pass_rate')}, "
+            f"delivery failure rate {item.get('delivery_failure_rate')}, "
+            f"avg duration {item.get('average_duration_seconds')}s, "
+            f"cost ${item.get('total_cost_usd')}"
+        )
+    return (
+        f"Benchmark {benchmark.get('benchmark_run_id')} provides controlled benchmark evidence: "
+        + "; ".join(metrics)
+        + ". Treat this as routing input, not an automatic policy change."
+    )
+
+
+def _benchmark_runtime_implementation_brief(runtime_results: list[Dict[str, Any]]) -> str:
+    by_runtime = {str(item.get("runtime") or ""): item for item in runtime_results}
+    observations = [
+        "Compare median runtime score, task quality, contract compliance, marker pass rate, required evidence pass rate, delivery failure rate, duration, and cost across repeated live runs.",
+    ]
+    if "ao" in by_runtime:
+        observations.append("Track whether AO remains faster but shows lower contract compliance on read-only benchmark prompts.")
+    if "openhands" in by_runtime:
+        observations.append("Track whether OpenHands remains slower but produces cleaner read-only inspection summaries.")
+    posture = _benchmark_runtime_policy_posture(runtime_results)
+    if posture:
+        observations.append(posture)
+    observations.append("Require more benchmark samples before proposing runtime-selection default changes.")
+    return " ".join(observations)
+
+
+def _benchmark_runtime_suggested_change(runtime_results: list[Dict[str, Any]]) -> str:
+    posture = _benchmark_runtime_policy_posture(runtime_results)
+    if posture:
+        return posture
+    return "Repeat the benchmark across more read-only cases before changing runtime selection defaults."
+
+
+def _benchmark_runtime_policy_posture(runtime_results: list[Dict[str, Any]]) -> str:
+    by_runtime = {str(item.get("runtime") or ""): item for item in runtime_results}
+    ao = by_runtime.get("ao")
+    openhands = by_runtime.get("openhands")
+    if not ao or not openhands:
+        return ""
+
+    ao_score = _metric(ao, "median_score")
+    openhands_score = _metric(openhands, "median_score")
+    ao_quality = _metric(ao, "median_task_quality_score")
+    openhands_quality = _metric(openhands, "median_task_quality_score")
+    ao_contract = _metric(ao, "median_contract_compliance_score")
+    openhands_contract = _metric(openhands, "median_contract_compliance_score")
+    ao_delivery_fail = _metric(ao, "delivery_failure_rate")
+    openhands_delivery_fail = _metric(openhands, "delivery_failure_rate")
+    ao_duration = _metric(ao, "average_duration_seconds")
+    openhands_duration = _metric(openhands, "average_duration_seconds")
+
+    if openhands_delivery_fail > 0:
+        return "Keep AO as the read-only fallback and investigate OpenHands delivery failures before expanding auto-routing."
+    if ao_delivery_fail > 0 and openhands_delivery_fail == 0:
+        return "Preserve AO for write/recovery tasks, but investigate whether read-only inspection should prefer OpenHands when AO delivery fails."
+
+    openhands_quality_advantage = openhands_quality >= ao_quality + 0.05
+    openhands_contract_advantage = openhands_contract >= ao_contract + 0.25
+    comparable_score = openhands_score >= ao_score - 0.05
+    openhands_slower = openhands_duration > ao_duration * 1.5 if ao_duration > 0 else False
+
+    if comparable_score and (openhands_quality_advantage or openhands_contract_advantage):
+        speed_note = " despite higher latency" if openhands_slower else ""
+        return (
+            "If repeated live benchmarks confirm this pattern, propose keeping AO as the production default for write/retry/recovery "
+            f"while preferring OpenHands for read-only inspection{speed_note}, with AO fallback unchanged."
+        )
+    if ao_score > openhands_score + 0.1 and ao_quality >= openhands_quality:
+        return "Keep AO preferred for read-only inspection until OpenHands quality or contract compliance improves in repeated benchmarks."
+    return "Keep current runtime-selection defaults and collect more comparable read-only benchmark samples."
+
+
+def _metric(item: Dict[str, Any], key: str) -> float:
+    try:
+        return float(item.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _recommendation(

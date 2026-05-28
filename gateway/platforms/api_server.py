@@ -94,7 +94,11 @@ from gateway.dev_control.harness_recommendations import (
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
 )
-from gateway.dev_control.read_models import build_agent_board_response, build_dev_plans_response
+from gateway.dev_control.read_models import (
+    build_agent_board_response,
+    build_agent_board_rows,
+    build_dev_plans_response,
+)
 from tools.openhands_bridge import (
     openhands_server_status,
     start_openhands_server,
@@ -1675,31 +1679,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": data
         })
-
-    async def _handle_skills(self, request: "web.Request") -> "web.Response":
-        """GET /v1/skills — Return installed skill slash commands for inline pickers."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            from agent.skill_commands import get_skill_commands
-
-            data = []
-            for cmd, info in sorted(get_skill_commands().items()):
-                cmd_name = cmd.lstrip("/")
-                data.append({
-                    "name": cmd,
-                    "description": str(info.get("description") or f"Invoke the {info.get('name', cmd_name)} skill"),
-                    "displayName": str(info.get("name") or cmd_name),
-                })
-            return web.json_response({
-                "object": "list",
-                "data": data,
-            })
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("skills catalog failed: %s", exc)
-            return web.json_response({"object": "list", "data": []})
 
     async def _handle_complete_slash(self, request: "web.Request") -> "web.Response":
         """POST /v1/complete/slash — live slash-command completion."""
@@ -5641,67 +5620,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if store is None:
             return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
 
-        events = store.list_events(
-            session_id=params.get("session_id") or None,
-            run_id=params.get("run_id") or None,
-            subagent_id=params.get("subagent_id") or None,
-            ao_session_id=params.get("ao_session_id") or None,
-            limit=2000,
-        )
-        rows_by_id: Dict[str, Dict[str, Any]] = {}
-        counts_by_id: Dict[str, int] = {}
-        latest_actions_by_id: Dict[str, Dict[str, Any]] = {}
-        latest_lifecycle_at_by_id: Dict[str, float] = {}
-        for event in events:
-            row_id = str(event.get("subagent_id") or event.get("ao_session_id") or "")
-            if not row_id:
-                continue
-            counts_by_id[row_id] = counts_by_id.get(row_id, 0) + 1
-            previous_row = rows_by_id.get(row_id)
-            next_row = self._subagent_board_item_from_event(event, counts_by_id[row_id])
-            if event.get("event") == "subagent.action" and previous_row:
-                for key in ("goal", "summary", "created_at"):
-                    if not next_row.get(key):
-                        next_row[key] = previous_row.get(key)
-            rows_by_id[row_id] = next_row
-            if event.get("event") == "subagent.action":
-                latest_actions_by_id[row_id] = event
-            else:
-                latest_lifecycle_at_by_id[row_id] = self._subagent_event_order_value(event)
-
-        project_id = params.get("project_id") or None
-        try:
-            from tools.ao_bridge import AOBridge
-
-            bridge = AOBridge()
-            for session in bridge.list(project_id=project_id):
-                row_id = f"ao:{session.id}"
-                existing = rows_by_id.get(row_id) or {}
-                rows_by_id[row_id] = self._merge_ao_session_into_board_item(
-                    existing,
-                    session,
-                    store,
-                    runtime_health=bridge.runtime_health(session),
-                )
-        except Exception as exc:
-            logger.debug("AO sessions unavailable for subagent board: %s", exc)
-
-        for row_id, row in list(rows_by_id.items()):
-            action_event = latest_actions_by_id.get(row_id)
-            if action_event and self._subagent_action_belongs_to_current_lifecycle(
-                action_event,
-                latest_lifecycle_at_by_id.get(row_id),
-            ):
-                self._apply_recent_action_fields(row, action_event)
-            self._apply_summary_quality_fields(row)
-
-        filtered = [
-            item for item in rows_by_id.values()
-            if self._subagent_board_item_matches(item, params)
-        ]
-        filtered.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
-        data = filtered[:limit]
-        return web.json_response(build_agent_board_response(data))
+        rows = build_agent_board_rows(store=store, params=params, limit=limit)
+        return web.json_response(build_agent_board_response(rows))
 
     def _bounded_query_limit(self, request: "web.Request", *, default: int = 100) -> int:
         try:

@@ -25,6 +25,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from gateway.dev_execution import DevExecutionStore, _extract_completion_summary, supervisor_loop_tick
+from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
 from tools.ao_bridge import AOSession
 from tools.openhands_bridge import OpenHandsSession
@@ -548,6 +549,53 @@ class TestRunEvents:
         assert data["total"] == 1
         assert data["data"][0]["event"] == "subagent.start"
         assert data["data"][0]["subagent_id"] == "child-1"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_events_replay_accepts_legacy_events_without_schema_version(self, adapter, tmp_path):
+        adapter._subagent_event_store = SubagentEventStore(tmp_path / "state.db")
+        legacy_payload = {
+            "event": "subagent.complete",
+            "run_id": "run_legacy",
+            "session_id": "session-legacy",
+            "subagent_id": "child-legacy",
+            "runtime": "hermes",
+            "status": "completed",
+            "summary": "Legacy event before schema version.",
+            "created_at": 123.0,
+        }
+        with adapter._subagent_event_store._conn:
+            adapter._subagent_event_store._conn.execute(
+                """
+                INSERT INTO subagent_events (
+                    created_at, session_id, run_id, subagent_id, parent_id,
+                    runtime, ao_session_id, event_type, status, goal, summary, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    123.0,
+                    "session-legacy",
+                    "run_legacy",
+                    "child-legacy",
+                    None,
+                    "hermes",
+                    None,
+                    "subagent.complete",
+                    "completed",
+                    None,
+                    "Legacy event before schema version.",
+                    json.dumps(legacy_payload),
+                ),
+            )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_legacy/subagents/events")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["total"] == 1
+        assert data["data"][0]["event"] == "subagent.complete"
+        assert "schema_version" not in data["data"][0]
 
     @pytest.mark.asyncio
     async def test_global_subagent_events_endpoint_filters_events(self, adapter, tmp_path):
@@ -1335,6 +1383,51 @@ class TestRunEvents:
 
         assert rec["benchmark_snapshot"]["benchmark_run_id"] == benchmark["benchmark_run_id"]
         assert rec["summary"]["benchmark_run_id"] == benchmark["benchmark_run_id"]
+        runtime_recs = [
+            item for item in rec["recommendations"]
+            if item["category"] == "runtime_policy"
+            and "controlled benchmark evidence" in item["reason"]
+        ]
+        assert runtime_recs
+        reason = runtime_recs[0]["reason"]
+        assert "median score" in reason
+        assert "task quality" in reason
+        assert "contract compliance" in reason
+        assert "marker pass rate" in reason
+        assert "required evidence pass rate" in reason
+        assert "delivery failure rate" in reason
+        assert "avg duration" in reason
+        assert "not an automatic policy change" in reason
+        assert "Keep AO preferred for read-only inspection" in runtime_recs[0]["suggested_change"]
+        assert "Require more benchmark samples" in runtime_recs[0]["implementation_brief"]
+        assert "Do not mutate runtime policy" in runtime_recs[0]["non_goals"][0]
+
+    def test_benchmark_policy_posture_can_recommend_read_only_openhands_watch(self):
+        from gateway.dev_control.harness_recommendations import _benchmark_runtime_policy_posture
+
+        posture = _benchmark_runtime_policy_posture([
+            {
+                "runtime": "ao",
+                "median_score": 0.884,
+                "median_task_quality_score": 0.964,
+                "median_contract_compliance_score": 0.5,
+                "delivery_failure_rate": 0.0,
+                "average_duration_seconds": 1.679,
+            },
+            {
+                "runtime": "openhands",
+                "median_score": 0.887,
+                "median_task_quality_score": 0.75,
+                "median_contract_compliance_score": 1.0,
+                "delivery_failure_rate": 0.0,
+                "average_duration_seconds": 9.708,
+            },
+        ])
+
+        assert "AO as the production default for write/retry/recovery" in posture
+        assert "OpenHands for read-only inspection" in posture
+        assert "despite higher latency" in posture
+        assert "AO fallback unchanged" in posture
 
     def test_dev_create_execution_plan_tool_schema_accepts_runtime_selection_inputs(self):
         from tools.dev_execution_tools import DEV_CREATE_EXECUTION_PLAN_SCHEMA
@@ -3804,6 +3897,10 @@ class TestRunEvents:
             "goal": "Native work",
             "status": "running",
             "message": "Reading files",
+            "context_usage": {
+                "session": {"total_tokens": 42},
+                "categories": [{"key": "tools", "label": "Tools", "tokens": 12}],
+            },
         })
         adapter._subagent_event_store.append_event({
             "event": "subagent.complete",
@@ -3827,9 +3924,18 @@ class TestRunEvents:
                 data = await resp.json()
 
         rows = {item["id"]: item for item in data["data"]}
+        with patch("tools.ao_bridge.AOBridge", return_value=bridge):
+            direct_rows = {
+                item["id"]: item
+                for item in build_agent_board_rows(store=adapter._subagent_event_store, params={}, limit=250)
+            }
         assert rows["native-1"]["lane"] == "running"
+        assert direct_rows["native-1"]["lane"] == rows["native-1"]["lane"]
+        assert rows["native-1"]["token_total"] == 42
+        assert rows["native-1"]["context_usage_categories"][0]["key"] == "tools"
         assert rows["native-1"]["can_open"] is False
         assert rows["ao:oryn-workspace-9"]["lane"] == "failed"
+        assert direct_rows["ao:oryn-workspace-9"]["lane"] == rows["ao:oryn-workspace-9"]["lane"]
         assert rows["ao:oryn-workspace-9"]["lane_reason"] == "Worker was stopped before completing."
         assert rows["ao:oryn-workspace-9"]["attention_level"] == "high"
         assert rows["ao:oryn-workspace-9"]["group_key"] == "project:OrynWorkspace"

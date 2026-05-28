@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import inspect
 import json
 import os
 import stat
@@ -979,6 +980,11 @@ class TestCapabilitiesEndpoint:
 
 
 class TestSkillsEndpoint:
+    def test_skills_handler_is_not_shadowed_by_inline_completion_handler(self):
+        source = inspect.getsource(APIServerAdapter)
+        assert source.count("async def _handle_skills") == 1
+        assert source.count("async def _handle_complete_skills") == 1
+
     @pytest.mark.asyncio
     async def test_skills_returns_list_envelope(self, adapter):
         fake_skills = [
