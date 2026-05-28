@@ -23,10 +23,26 @@ async function loadAO() {
   return { loadConfig: core.loadConfig, getSessionManager: cli.getSessionManager };
 }
 
-function normalizeSession(session) {
+function projectDefaults(config, projectId) {
+  const project = config.projects?.[projectId] || {};
+  const agentConfig = project.agentConfig || {};
+  return {
+    agent: project.agent || config.defaults?.agent || null,
+    model: agentConfig.model || null,
+    reasoning_effort:
+      agentConfig.reasoningEffort ||
+      agentConfig.reasoning_effort ||
+      agentConfig.modelReasoningEffort ||
+      agentConfig.model_reasoning_effort ||
+      null,
+  };
+}
+
+function normalizeSession(session, config) {
   if (!session) return null;
   const runtimeHandle = session.runtimeHandle || null;
   const metadata = session.metadata || {};
+  const defaults = projectDefaults(config, session.projectId);
   return {
     id: session.id,
     project_id: session.projectId,
@@ -36,8 +52,12 @@ function normalizeSession(session) {
     issue_id: session.issueId,
     workspace_path: session.workspacePath,
     tmux_name: metadata.tmuxName || runtimeHandle?.id || null,
-    agent: metadata.agent || null,
-    model: null,
+    agent: metadata.agent || defaults.agent,
+    model: metadata.model || defaults.model,
+    reasoning_effort:
+      metadata.reasoningEffort ||
+      metadata.reasoning_effort ||
+      defaults.reasoning_effort,
     pr: session.pr?.url || session.pr || null,
     summary: session.agentInfo?.summary || metadata.summary || null,
     created_at: session.createdAt,
@@ -64,13 +84,13 @@ async function main() {
       branch: input.branch || undefined,
       agent: input.agent || undefined,
     });
-    console.log(JSON.stringify({ ok: true, session: normalizeSession(session) }));
+    console.log(JSON.stringify({ ok: true, session: normalizeSession(session, config) }));
     return;
   }
 
   if (command === "status") {
     const session = await sm.get(input.session_id);
-    console.log(JSON.stringify({ ok: Boolean(session), session: normalizeSession(session) }));
+    console.log(JSON.stringify({ ok: Boolean(session), session: normalizeSession(session, config) }));
     return;
   }
 
@@ -83,13 +103,13 @@ async function main() {
   if (command === "send") {
     await sm.send(input.session_id, input.message || "");
     const session = await sm.get(input.session_id);
-    console.log(JSON.stringify({ ok: true, session: normalizeSession(session) }));
+    console.log(JSON.stringify({ ok: true, session: normalizeSession(session, config) }));
     return;
   }
 
   if (command === "list") {
     const sessions = await sm.list(input.project_id || undefined);
-    console.log(JSON.stringify({ ok: true, sessions: sessions.map(normalizeSession) }));
+    console.log(JSON.stringify({ ok: true, sessions: sessions.map((session) => normalizeSession(session, config)) }));
     return;
   }
 

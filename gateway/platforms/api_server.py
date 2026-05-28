@@ -55,6 +55,52 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.dev_execution import (
+    DevExecutionStore,
+    apply_execution_plan_review,
+    apply_supervisor_approval,
+    approve_supervisor_approval,
+    deny_supervisor_approval,
+    derive_execution_plan_status,
+    get_runbook,
+    get_supervisor_approval,
+    launch_execution_plan,
+    list_supervisor_loop_status,
+    list_runbooks,
+    list_supervisor_approvals,
+    list_launch_profiles,
+    list_worker_runtimes,
+    next_execution_step,
+    review_execution_plan,
+    select_execution_runtime,
+    set_project_runbook,
+    set_supervisor_loop,
+    set_execution_plan_test_state,
+    supervise_execution_plans,
+    supervisor_loop_tick,
+    synthesize_execution_plan,
+)
+from gateway.dev_control.harness_observability import (
+    generate_harness_report,
+    list_harness_components,
+)
+from gateway.dev_control.harness_benchmarks import (
+    get_harness_benchmark_run,
+    list_harness_benchmark_runs,
+    run_harness_benchmark,
+)
+from gateway.dev_control.harness_recommendations import (
+    generate_harness_recommendations,
+    get_harness_recommendation_run,
+    list_harness_recommendation_runs,
+)
+from gateway.dev_control.read_models import build_agent_board_response, build_dev_plans_response
+from tools.openhands_bridge import (
+    openhands_server_status,
+    start_openhands_server,
+    stop_openhands_server,
+)
+from gateway.platforms.kanban_api_routes import register_kanban_routes
 from gateway.subagent_events import SubagentEventStore, events_response
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -816,6 +862,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._subagent_event_store: Optional[SubagentEventStore] = None
+        self._dev_execution_store: Optional[DevExecutionStore] = None
+        self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -1056,6 +1104,15 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Subagent event store unavailable: %s", exc)
         return self._subagent_event_store
+
+    def _ensure_dev_execution_store(self) -> Optional[DevExecutionStore]:
+        """Lazily initialise persistent Dev execution plan storage."""
+        if self._dev_execution_store is None:
+            try:
+                self._dev_execution_store = DevExecutionStore()
+            except Exception as exc:
+                logger.warning("Dev execution store unavailable: %s", exc)
+        return self._dev_execution_store
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -1779,6 +1836,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "slash_dispatch": True,
                 "slash_command_catalog": True,
                 "slash_chat_interception": True,
+                "kanban": True,
                 "slash_execution": "full",
                 "cors": bool(self._cors_origins),
             },
@@ -1822,8 +1880,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 "ao_session_follow_up": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/follow-up"},
                 "ao_session_retry": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/retry"},
                 "ao_session_reassign": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/reassign"},
-             },
-         })
+                "session_subagent_events": {"method": "GET", "path": "/v1/sessions/{session_id}/subagents/events"},
+                "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
+                "subagent_board": {"method": "GET", "path": "/v1/subagents/board"},
+                "subagent_events": {"method": "GET", "path": "/v1/subagents/events"},
+                "dev_worker_runtimes": {"method": "GET", "path": "/v1/dev/runtimes"},
+                "dev_runtime_selection": {"method": "POST", "path": "/v1/dev/runtime-selection"},
+                "dev_harness_components": {"method": "GET", "path": "/v1/dev/harness/components"},
+                "dev_harness_report": {"method": "POST", "path": "/v1/dev/harness/report"},
+                "dev_harness_recommendations": {"method": "POST", "path": "/v1/dev/harness/recommendations"},
+                "dev_harness_recommendation_runs": {"method": "GET", "path": "/v1/dev/harness/recommendations"},
+                "dev_harness_benchmark": {"method": "POST", "path": "/v1/dev/harness/benchmarks"},
+                "dev_harness_benchmark_runs": {"method": "GET", "path": "/v1/dev/harness/benchmarks"},
+                "kanban_board": {"method": "GET", "path": "/v1/kanban/board"},
+                "kanban_events": {"method": "GET", "path": "/v1/kanban/events"},
+            },
+        })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4977,13 +5049,91 @@ class APIServerAdapter(BasePlatformAdapter):
                     goal=prompt_meta.get("goal") or event.get("goal"),
                     issue_id=prompt_meta.get("issue_id") or event.get("issue_id"),
                     branch=prompt_meta.get("branch") or event.get("branch"),
-                    agent=prompt_meta.get("agent"),
+                    agent=prompt_meta.get("agent") or event.get("agent"),
                     model=prompt_meta.get("model") or event.get("model"),
+                    reasoning_effort=prompt_meta.get("reasoning_effort") or event.get("reasoning_effort"),
+                    launch_profile_id=prompt_meta.get("launch_profile_id") or event.get("launch_profile_id"),
+                    launch_plan_id=prompt_meta.get("launch_plan_id") or event.get("launch_plan_id"),
+                    launch_task_id=prompt_meta.get("launch_task_id") or event.get("launch_task_id"),
+                    permissions=prompt_meta.get("permissions") or event.get("permissions"),
+                    acceptance_criteria=prompt_meta.get("acceptance_criteria") or event.get("acceptance_criteria"),
                 )
             return store.append_event(event, session_id=session_id)
         except Exception as exc:
             logger.debug("Failed to persist subagent event: %s", exc)
             return event
+
+    def _persist_ao_action_event(
+        self,
+        *,
+        action: str,
+        source_session_id: str,
+        status: str,
+        message: str,
+        session: Any = None,
+        target_session_id: Optional[str] = None,
+        base_event: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist an AO operator action without treating Open as history."""
+        event_payload: Dict[str, Any] = dict(base_event or {})
+        if session is not None:
+            event_payload.update(session.event_fields())
+        event_payload.update({
+            "event": "subagent.action",
+            "subagent_id": event_payload.get("subagent_id") or f"ao:{source_session_id}",
+            "runtime": "ao",
+            "ao_session_id": source_session_id,
+            "action": action,
+            "action_status": status,
+            "status": status if action == "stop" else event_payload.get("status") or status,
+            "source_ao_session_id": source_session_id,
+            "target_ao_session_id": target_session_id,
+            "message": message,
+            "preview": message,
+            "timestamp": time.time(),
+        })
+        event_payload.pop("event_id", None)
+        event_payload.pop("created_at", None)
+        return self._persist_subagent_event(event_payload)
+
+    @staticmethod
+    def _ao_action_response(
+        *,
+        action: str,
+        source_session_id: str,
+        status: str,
+        message: str,
+        session_payload: Optional[Dict[str, Any]] = None,
+        event: Optional[Dict[str, Any]] = None,
+        target_session_id: Optional[str] = None,
+        ok: bool = True,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": ok,
+            "mode": action,
+            "action": action,
+            "source_session_id": source_session_id,
+            "source_ao_session_id": source_session_id,
+            "target_ao_session_id": target_session_id,
+            "status": status,
+            "message": message,
+            "session": session_payload,
+            "event": event,
+            "action_event": event,
+        }
+
+    @staticmethod
+    def _ao_stop_event_is_terminal(event: Optional[Dict[str, Any]]) -> bool:
+        if not event:
+            return False
+        status = str(event.get("status") or event.get("action_status") or "").lower()
+        action = str(event.get("action") or "").lower()
+        event_type = str(event.get("event") or "").lower()
+        if action == "stop" and status in {"killed", "terminated", "cancelled", "canceled", "already_stopped"}:
+            return True
+        if event_type == "subagent.complete" and status in {"killed", "terminated", "cancelled", "canceled", "failed"}:
+            return True
+        return False
 
     def _make_run_event_callback(
         self,
@@ -5456,11 +5606,552 @@ class APIServerAdapter(BasePlatformAdapter):
             run_id=run_id,
         ))
 
+    async def _handle_subagent_events(self, request: "web.Request") -> "web.Response":
+        """GET /v1/subagents/events — replay persisted subagent events with filters."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        limit = self._bounded_query_limit(request, default=500)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+        params = request.rel_url.query
+        return web.json_response(events_response(
+            store.list_events(
+                session_id=params.get("session_id") or None,
+                run_id=params.get("run_id") or None,
+                subagent_id=params.get("subagent_id") or None,
+                ao_session_id=params.get("ao_session_id") or None,
+                runtime=params.get("runtime") or None,
+                status=params.get("status") or None,
+                limit=limit,
+            ),
+        ))
+
+    async def _handle_subagent_board(self, request: "web.Request") -> "web.Response":
+        """GET /v1/subagents/board — latest subagent/AO worker rows for Oryn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        params = request.rel_url.query
+        limit = self._bounded_query_limit(request, default=250)
+        store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+
+        events = store.list_events(
+            session_id=params.get("session_id") or None,
+            run_id=params.get("run_id") or None,
+            subagent_id=params.get("subagent_id") or None,
+            ao_session_id=params.get("ao_session_id") or None,
+            limit=2000,
+        )
+        rows_by_id: Dict[str, Dict[str, Any]] = {}
+        counts_by_id: Dict[str, int] = {}
+        latest_actions_by_id: Dict[str, Dict[str, Any]] = {}
+        latest_lifecycle_at_by_id: Dict[str, float] = {}
+        for event in events:
+            row_id = str(event.get("subagent_id") or event.get("ao_session_id") or "")
+            if not row_id:
+                continue
+            counts_by_id[row_id] = counts_by_id.get(row_id, 0) + 1
+            previous_row = rows_by_id.get(row_id)
+            next_row = self._subagent_board_item_from_event(event, counts_by_id[row_id])
+            if event.get("event") == "subagent.action" and previous_row:
+                for key in ("goal", "summary", "created_at"):
+                    if not next_row.get(key):
+                        next_row[key] = previous_row.get(key)
+            rows_by_id[row_id] = next_row
+            if event.get("event") == "subagent.action":
+                latest_actions_by_id[row_id] = event
+            else:
+                latest_lifecycle_at_by_id[row_id] = self._subagent_event_order_value(event)
+
+        project_id = params.get("project_id") or None
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            for session in bridge.list(project_id=project_id):
+                row_id = f"ao:{session.id}"
+                existing = rows_by_id.get(row_id) or {}
+                rows_by_id[row_id] = self._merge_ao_session_into_board_item(
+                    existing,
+                    session,
+                    store,
+                    runtime_health=bridge.runtime_health(session),
+                )
+        except Exception as exc:
+            logger.debug("AO sessions unavailable for subagent board: %s", exc)
+
+        for row_id, row in list(rows_by_id.items()):
+            action_event = latest_actions_by_id.get(row_id)
+            if action_event and self._subagent_action_belongs_to_current_lifecycle(
+                action_event,
+                latest_lifecycle_at_by_id.get(row_id),
+            ):
+                self._apply_recent_action_fields(row, action_event)
+            self._apply_summary_quality_fields(row)
+
+        filtered = [
+            item for item in rows_by_id.values()
+            if self._subagent_board_item_matches(item, params)
+        ]
+        filtered.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+        data = filtered[:limit]
+        return web.json_response(build_agent_board_response(data))
+
     def _bounded_query_limit(self, request: "web.Request", *, default: int = 100) -> int:
         try:
             return max(1, min(int(request.rel_url.query.get("limit", str(default))), 2000))
         except Exception:
             return default
+
+    @staticmethod
+    def _subagent_runtime(payload: Dict[str, Any]) -> str:
+        runtime = str(payload.get("runtime") or "").strip().lower()
+        if runtime:
+            return runtime
+        return "ao" if payload.get("ao_session_id") else "hermes"
+
+    @staticmethod
+    def _subagent_lane(status: Optional[str]) -> str:
+        raw = str(status or "").strip().lower()
+        if raw in {"queued", "pending", "created", "scheduled"}:
+            return "queued"
+        if raw in {"needs_input", "input_required", "waiting_for_input", "blocked", "paused", "approval_required"}:
+            return "needs_input"
+        if raw in {"failed", "fail", "error", "errored", "killed", "terminated", "timed_out", "timeout", "cancelled", "canceled"}:
+            return "failed"
+        if raw in {"completed", "complete", "done", "success", "succeeded", "merged"}:
+            return "completed"
+        if raw in {"spawned", "running", "thinking", "progress", "working", "active", ""}:
+            return "running"
+        return "running"
+
+    @staticmethod
+    def _subagent_lane_reason(status: Optional[str], lane: str, runtime: str) -> str:
+        raw = str(status or "").strip().lower()
+        if lane == "queued":
+            return "Worker is queued and has not started active work yet."
+        if lane == "running":
+            return "Worker is active and reporting progress."
+        if lane == "needs_input":
+            return "Worker is waiting for input or approval."
+        if lane == "failed":
+            if raw in {"killed", "terminated", "cancelled", "canceled"}:
+                return "Worker was stopped before completing."
+            if raw in {"timed_out", "timeout"}:
+                return "Worker timed out before completing."
+            return "Worker ended with a failed status."
+        if lane == "completed":
+            return "Worker reached a terminal completed state."
+        return f"{runtime.title()} worker status is {raw or 'unknown'}."
+
+    @staticmethod
+    def _subagent_attention_level(lane: str) -> str:
+        if lane == "failed":
+            return "high"
+        if lane == "needs_input":
+            return "medium"
+        return "none"
+
+    @staticmethod
+    def _subagent_group_fields(payload: Dict[str, Any], runtime: str) -> Dict[str, str]:
+        project_id = str(payload.get("ao_project_id") or "").strip()
+        if project_id:
+            return {
+                "group_key": f"project:{project_id}",
+                "group_label": project_id,
+                "group_kind": "project",
+            }
+        session_id = str(payload.get("session_id") or "").strip()
+        if session_id:
+            short_session = session_id[:8]
+            return {
+                "group_key": f"session:{session_id}",
+                "group_label": f"Session {short_session}",
+                "group_kind": "session",
+            }
+        label = "AO" if runtime == "ao" else "Hermes Native"
+        return {
+            "group_key": f"runtime:{runtime}",
+            "group_label": label,
+            "group_kind": "runtime",
+        }
+
+    @staticmethod
+    def _subagent_numeric(payload: Dict[str, Any], *keys: str) -> Optional[float]:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _subagent_token_total(payload: Dict[str, Any]) -> Optional[int]:
+        direct = payload.get("token_total") or payload.get("total_tokens")
+        if direct is not None:
+            try:
+                return int(direct)
+            except (TypeError, ValueError):
+                pass
+        total = 0
+        seen = False
+        for key in ("input_tokens", "output_tokens", "reasoning_tokens"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                total += int(value)
+                seen = True
+            except (TypeError, ValueError):
+                pass
+        return total if seen else None
+
+    @staticmethod
+    def _subagent_current_activity(payload: Dict[str, Any]) -> Optional[str]:
+        for key in ("message", "text", "preview", "activity", "summary", "tool_name", "tool"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _apply_recent_action_fields(item: Dict[str, Any], event: Dict[str, Any]) -> None:
+        item["recent_action"] = event.get("action")
+        item["recent_action_status"] = event.get("action_status") or event.get("status")
+        item["recent_action_message"] = event.get("message") or event.get("preview")
+        item["recent_action_at"] = event.get("created_at") or event.get("timestamp")
+
+    @staticmethod
+    def _subagent_event_order_value(event: Dict[str, Any]) -> float:
+        for key in ("created_at", "timestamp", "event_id"):
+            value = event.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    @classmethod
+    def _subagent_action_belongs_to_current_lifecycle(
+        cls,
+        action_event: Dict[str, Any],
+        latest_lifecycle_at: Optional[float],
+    ) -> bool:
+        if latest_lifecycle_at is None:
+            return True
+        return cls._subagent_event_order_value(action_event) >= latest_lifecycle_at
+
+    @staticmethod
+    def _apply_summary_quality_fields(item: Dict[str, Any]) -> None:
+        summary = str(item.get("summary") or "").strip()
+        status = str(item.get("status") or "").lower()
+        goal = str(item.get("goal") or "")
+        current = str(item.get("current_activity") or "")
+        text = summary or current
+        warning: Optional[str] = None
+
+        if status in {"completed", "complete", "done", "success", "succeeded"}:
+            if not summary:
+                warning = "Worker completed without a final summary."
+            elif len(summary) < 24:
+                warning = "Worker summary is very short."
+
+        expected_prefixes = sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{3,}_DONE\b", f"{goal}\n{text}")))
+        for prefix in expected_prefixes:
+            if prefix not in summary:
+                warning = f"Worker summary is missing expected completion marker {prefix}."
+                break
+
+        weak_patterns = (
+            "did not produce a clear",
+            "was still searching",
+            "no definitive answer",
+            "cannot confirm",
+            "verification gap",
+            "partial exploration",
+            "focused on project activation",
+        )
+        lower_summary = summary.lower()
+        if summary and any(pattern in lower_summary for pattern in weak_patterns):
+            warning = "Worker summary looks incomplete or inconclusive."
+
+        tool_log_lines = sum(
+            1 for line in summary.splitlines()
+            if re.match(r"^\s*(ran|read|searched|grep|rg|sed|cat|terminal|mcp_|activated)\b", line.lower())
+        )
+        if summary and tool_log_lines >= max(2, len([line for line in summary.splitlines() if line.strip()]) // 2):
+            warning = "Worker summary mostly describes tool activity instead of a conclusion."
+
+        item["summary_quality"] = "warning" if warning else "ok"
+        item["summary_warning"] = warning
+
+    def _subagent_board_item_from_event(self, event: Dict[str, Any], event_count: int) -> Dict[str, Any]:
+        status = event.get("status")
+        runtime = self._subagent_runtime(event)
+        row_id = str(event.get("subagent_id") or event.get("ao_session_id"))
+        created_at = event.get("created_at")
+        lane = self._subagent_lane(status)
+        group_fields = self._subagent_group_fields(event, runtime)
+        has_prompt_meta = False
+        return {
+            "id": row_id,
+            "subagent_id": event.get("subagent_id"),
+            "parent_id": event.get("parent_id"),
+            "session_id": event.get("session_id"),
+            "run_id": event.get("run_id"),
+            "runtime": runtime,
+            "runtime_session_id": event.get("runtime_session_id") or event.get("ao_session_id"),
+            "runtime_project_id": event.get("runtime_project_id") or event.get("ao_project_id"),
+            "runtime_selection": event.get("runtime_selection"),
+            "selected_runtime": event.get("selected_runtime") or runtime,
+            "runtime_selection_reason": event.get("runtime_selection_reason"),
+            "runtime_fallback_reason": event.get("runtime_fallback_reason"),
+            "status": status,
+            "lane": lane,
+            "lane_reason": self._subagent_lane_reason(status, lane, runtime),
+            "attention_level": self._subagent_attention_level(lane),
+            "goal": event.get("goal"),
+            "summary": event.get("summary"),
+            "current_activity": self._subagent_current_activity(event),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "last_activity_at": created_at,
+            "event_count": event_count,
+            "ao_session_id": event.get("ao_session_id"),
+            "ao_project_id": event.get("ao_project_id"),
+            "workspace_path": event.get("workspace_path"),
+            "branch": event.get("branch"),
+            "issue_id": event.get("issue_id"),
+            "tmux_name": event.get("tmux_name"),
+            "open_url": event.get("open_url"),
+            "open_command": event.get("open_command"),
+            "agent": event.get("agent"),
+            "model": event.get("model"),
+            "reasoning_effort": event.get("reasoning_effort"),
+            "launch_profile_id": event.get("launch_profile_id"),
+            "launch_plan_id": event.get("launch_plan_id"),
+            "launch_task_id": event.get("launch_task_id"),
+            "permissions": event.get("permissions"),
+            "acceptance_criteria": event.get("acceptance_criteria") or [],
+            "duration_seconds": self._subagent_numeric(event, "duration_seconds"),
+            "token_total": self._subagent_token_total(event),
+            "cost_usd": self._subagent_numeric(event, "cost_usd"),
+            "files_read": event.get("files_read") or [],
+            "files_written": event.get("files_written") or [],
+            "output_tail": event.get("output_tail") or [],
+            "recent_action": event.get("action") if event.get("event") == "subagent.action" else None,
+            "recent_action_status": event.get("action_status") if event.get("event") == "subagent.action" else None,
+            "recent_action_message": event.get("message") if event.get("event") == "subagent.action" else None,
+            "recent_action_at": event.get("created_at") or event.get("timestamp") if event.get("event") == "subagent.action" else None,
+            "summary_quality": "ok",
+            "summary_warning": None,
+            "runtime_health": None,
+            "runtime_warning": None,
+            "diagnostic_status": None,
+            "diagnostic_message": None,
+            "recovery_recommendation": None,
+            "transcript_available": False,
+            "transcript_tail": None,
+            "transcript_captured_at": None,
+            "has_prompt_metadata": has_prompt_meta,
+            "action_unavailable_reason": "AO controls are only available for AO-backed workers." if runtime != "ao" else None,
+            **group_fields,
+            "can_open": runtime == "ao" and bool(event.get("ao_session_id")),
+            "can_stop": False,
+            "can_follow_up": False,
+            "can_retry": False,
+            "can_reassign": False,
+        }
+
+    def _merge_ao_session_into_board_item(
+        self,
+        item: Dict[str, Any],
+        session: Any,
+        store: SubagentEventStore,
+        *,
+        runtime_health: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        row = dict(item)
+        row_id = f"ao:{session.id}"
+        status = row.get("status") or session.display_status
+        runtime_health = runtime_health or {"runtime_health": "ok", "runtime_warning": None}
+        is_stale = runtime_health.get("runtime_health") == "stale"
+        if is_stale:
+            status = "terminated"
+        lane = self._subagent_lane(status)
+        if lane == "running":
+            status = session.display_status
+            lane = self._subagent_lane(status)
+            if is_stale:
+                status = "terminated"
+                lane = "failed"
+        prompt_meta = store.get_ao_prompt(session.id)
+        group_fields = self._subagent_group_fields({
+            **row,
+            "ao_project_id": session.project_id or row.get("ao_project_id"),
+        }, "ao")
+        action_unavailable_reason = None
+        if lane == "running":
+            action_unavailable_reason = "Retry and reassign are available after the worker reaches a terminal state."
+        elif not prompt_meta:
+            action_unavailable_reason = "Original AO prompt metadata is unavailable for retry or reassign."
+        prompt_agent = (prompt_meta or {}).get("agent")
+        prompt_model = (prompt_meta or {}).get("model")
+        prompt_reasoning_effort = (prompt_meta or {}).get("reasoning_effort")
+        prompt_launch_profile_id = (prompt_meta or {}).get("launch_profile_id")
+        prompt_launch_plan_id = (prompt_meta or {}).get("launch_plan_id")
+        prompt_launch_task_id = (prompt_meta or {}).get("launch_task_id")
+        row.update({
+            "id": row.get("id") or row_id,
+            "subagent_id": row.get("subagent_id") or row_id,
+            "runtime": "ao",
+            "runtime_session_id": session.id,
+            "runtime_project_id": session.project_id or row.get("runtime_project_id") or row.get("ao_project_id"),
+            "status": status,
+            "lane": lane,
+            "lane_reason": runtime_health.get("runtime_warning") or self._subagent_lane_reason(status, lane, "ao"),
+            "attention_level": self._subagent_attention_level(lane),
+            "goal": row.get("goal") or (prompt_meta or {}).get("goal") or session.activity or f"AO session {session.id}",
+            "summary": row.get("summary") or session.summary,
+            "current_activity": session.activity or row.get("current_activity"),
+            "updated_at": row.get("updated_at") or time.time(),
+            "last_activity_at": row.get("last_activity_at") or row.get("updated_at") or time.time(),
+            "event_count": int(row.get("event_count") or 0),
+            "ao_session_id": session.id,
+            "ao_project_id": session.project_id or row.get("ao_project_id"),
+            "workspace_path": session.workspace_path or row.get("workspace_path"),
+            "branch": session.branch or row.get("branch"),
+            "issue_id": session.issue_id or row.get("issue_id"),
+            "tmux_name": session.tmux_name or row.get("tmux_name"),
+            "open_command": session.open_command or row.get("open_command"),
+            "agent": row.get("agent") or prompt_agent or session.agent,
+            "model": row.get("model") or prompt_model or session.model,
+            "reasoning_effort": row.get("reasoning_effort") or prompt_reasoning_effort or session.reasoning_effort,
+            "launch_profile_id": row.get("launch_profile_id") or prompt_launch_profile_id,
+            "launch_plan_id": row.get("launch_plan_id") or prompt_launch_plan_id,
+            "launch_task_id": row.get("launch_task_id") or prompt_launch_task_id,
+            "permissions": row.get("permissions") or (prompt_meta or {}).get("permissions"),
+            "acceptance_criteria": row.get("acceptance_criteria") or (prompt_meta or {}).get("acceptance_criteria") or [],
+            "duration_seconds": row.get("duration_seconds"),
+            "token_total": row.get("token_total"),
+            "cost_usd": row.get("cost_usd"),
+            "files_read": row.get("files_read") or [],
+            "files_written": row.get("files_written") or [],
+            "output_tail": row.get("output_tail") or [],
+            "recent_action": row.get("recent_action"),
+            "recent_action_status": row.get("recent_action_status"),
+            "recent_action_message": row.get("recent_action_message"),
+            "recent_action_at": row.get("recent_action_at"),
+            "summary_quality": row.get("summary_quality") or "ok",
+            "summary_warning": row.get("summary_warning") or runtime_health.get("runtime_warning"),
+            "runtime_health": runtime_health.get("runtime_health"),
+            "runtime_warning": runtime_health.get("runtime_warning"),
+            "diagnostic_status": "stale" if is_stale else lane,
+            "diagnostic_message": runtime_health.get("runtime_warning") or self._subagent_lane_reason(status, lane, "ao"),
+            "recovery_recommendation": self._ao_recovery_recommendation(status=status, lane=lane, is_stale=is_stale),
+            "transcript_available": bool(session.tmux_name) and not is_stale,
+            "transcript_tail": row.get("transcript_tail"),
+            "transcript_captured_at": row.get("transcript_captured_at"),
+            "has_prompt_metadata": bool(prompt_meta),
+            "action_unavailable_reason": action_unavailable_reason,
+            **group_fields,
+            "can_open": True,
+            "can_stop": (not is_stale) and lane in {"queued", "running", "needs_input"},
+            "can_follow_up": (not is_stale) and lane == "running",
+            "can_retry": lane in {"failed", "completed"} and bool(prompt_meta),
+            "can_reassign": lane in {"failed", "completed"} and bool(prompt_meta),
+        })
+        return row
+
+    @staticmethod
+    def _ao_recovery_recommendation(*, status: Optional[str], lane: str, is_stale: bool = False) -> str:
+        if is_stale:
+            return "Runtime is gone. Use Repair Retry to spawn a replacement from the original task context, or Open to inspect the worktree."
+        if lane == "running":
+            return "Worker is running. Use Resume or Follow-up to steer it, or Stop if it is no longer useful."
+        if lane == "needs_input":
+            return "Worker needs input. Send a follow-up or open the worker terminal/worktree for more detail."
+        if lane == "failed":
+            raw = str(status or "").lower()
+            if raw in {"killed", "terminated", "cancelled", "canceled"}:
+                return "Worker was stopped or terminated. Use Repair Retry to spawn a replacement with the latest diagnostics."
+            return "Worker failed. Use transcript tail and action history to diagnose, then Repair Retry if the original prompt is available."
+        if lane == "completed":
+            return "Worker completed. Review summary and transcript tail; Retry or Reassign if the result needs another pass."
+        return "Review diagnostics and choose a recovery action if needed."
+
+    @staticmethod
+    def _bounded_transcript_lines(request: "web.Request", *, default: int = 120) -> int:
+        try:
+            return max(20, min(int(request.rel_url.query.get("lines", str(default))), 240))
+        except Exception:
+            return default
+
+    def _subagent_board_item_matches(self, item: Dict[str, Any], params: Any) -> bool:
+        runtime = params.get("runtime")
+        if runtime:
+            wanted = runtime.lower()
+            actual = str(item.get("runtime") or "").lower()
+            if wanted == "native":
+                wanted = "hermes"
+            if actual != wanted:
+                return False
+        status = params.get("status")
+        if status:
+            wanted_status = status.lower()
+            if wanted_status == "needs_attention":
+                wanted_status = "needs_input"
+            actual_status = str(item.get("status") or "").lower()
+            actual_lane = str(item.get("lane") or "").lower()
+            if wanted_status not in {actual_status, actual_lane}:
+                return False
+        lane = params.get("lane")
+        if lane and str(item.get("lane") or "").lower() != lane.lower():
+            return False
+        include_completed = str(params.get("include_completed") or "").lower()
+        if include_completed in {"0", "false", "no"} and item.get("lane") == "completed":
+            return False
+        group_kind = params.get("group_kind")
+        if group_kind and item.get("group_kind") != group_kind:
+            return False
+        group_key = params.get("group_key")
+        if group_key and item.get("group_key") != group_key:
+            return False
+        updated_after = params.get("updated_after")
+        if updated_after:
+            try:
+                if float(item.get("updated_at") or 0) <= float(updated_after):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        project_id = params.get("project_id")
+        if project_id and item.get("ao_project_id") != project_id:
+            return False
+        session_id = params.get("session_id")
+        if session_id and item.get("session_id") != session_id:
+            return False
+        ao_session_id = params.get("ao_session_id")
+        if ao_session_id and item.get("ao_session_id") != ao_session_id:
+            return False
+        needle = str(params.get("q") or params.get("search") or "").strip().lower()
+        if needle:
+            haystack = " ".join(str(item.get(key) or "") for key in (
+                "goal", "summary", "current_activity", "branch", "ao_project_id", "ao_session_id"
+            )).lower()
+            if needle not in haystack:
+                return False
+        return True
 
     def _ao_session_payload(self, session: Any, *, include_events: bool = False) -> Dict[str, Any]:
         def _scalar(value: Any) -> Any:
@@ -5493,8 +6184,28 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         store = self._ensure_subagent_event_store()
         prompt_meta = store.get_ao_prompt(session_id) if store and isinstance(session_id, str) else None
+        status_value = _scalar(getattr(session, "display_status", None))
+        if prompt_meta:
+            payload["agent"] = prompt_meta.get("agent") or payload.get("agent")
+            payload["model"] = prompt_meta.get("model") or payload.get("model")
+            payload["reasoning_effort"] = prompt_meta.get("reasoning_effort") or payload.get("reasoning_effort")
+            payload["runtime_selection"] = prompt_meta.get("runtime_selection") or payload.get("runtime_selection")
+            payload["selected_runtime"] = prompt_meta.get("selected_runtime") or payload.get("selected_runtime") or payload.get("runtime")
+            payload["runtime_selection_reason"] = prompt_meta.get("runtime_selection_reason") or payload.get("runtime_selection_reason")
+            payload["runtime_fallback_reason"] = prompt_meta.get("runtime_fallback_reason") or payload.get("runtime_fallback_reason")
+            payload["launch_profile_id"] = prompt_meta.get("launch_profile_id")
+            payload["launch_plan_id"] = prompt_meta.get("launch_plan_id")
+            payload["launch_task_id"] = prompt_meta.get("launch_task_id")
+            payload["permissions"] = prompt_meta.get("permissions")
+            payload["acceptance_criteria"] = prompt_meta.get("acceptance_criteria") or []
+        lane = self._subagent_lane(status_value)
+        payload["lane"] = lane
+        payload["lane_reason"] = self._subagent_lane_reason(status_value, lane, "ao")
+        payload["attention_level"] = self._subagent_attention_level(lane)
         payload["can_retry"] = bool(prompt_meta)
         payload["can_reassign"] = bool(prompt_meta)
+        payload["has_prompt_metadata"] = bool(prompt_meta)
+        payload["action_unavailable_reason"] = None if prompt_meta else "Original AO prompt metadata is unavailable for retry or reassign."
         if prompt_meta:
             payload["goal"] = prompt_meta.get("goal")
             payload["prompt_available"] = True
@@ -5503,6 +6214,772 @@ class APIServerAdapter(BasePlatformAdapter):
         if include_events and store and isinstance(session_id, str):
             payload["events"] = store.list_events(ao_session_id=session_id)
         return payload
+
+    async def _handle_dev_launch_profiles(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/launch-profiles — list Dev worker launch profiles."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        profiles = list_launch_profiles()
+        return web.json_response({"object": "list", "data": profiles, "total": len(profiles)})
+
+    async def _handle_dev_worker_runtimes(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/runtimes — list Dev worker runtimes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        runtimes = list_worker_runtimes()
+        return web.json_response({"object": "list", "data": runtimes, "total": len(runtimes)})
+
+    async def _handle_dev_runtime_selection(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/runtime-selection — dry-run Dev worker runtime selection."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = select_execution_runtime(
+            goal=body.get("goal"),
+            prompt=body.get("prompt"),
+            profile_id=body.get("profile_id") or body.get("launch_profile_id"),
+            runtime=body.get("runtime"),
+            project_id=body.get("project_id"),
+            permissions=body.get("permissions"),
+        )
+        return web.json_response({
+            "ok": True,
+            "object": "hermes.dev_runtime_selection",
+            **result,
+        })
+
+    async def _handle_dev_harness_components(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/harness/components — list active Dev harness components."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        components = list_harness_components(store=self._ensure_dev_execution_store())
+        return web.json_response({"object": "list", "data": components, "total": len(components)})
+
+    async def _handle_dev_harness_report(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/report — build an observe-only harness experience report."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        store = self._ensure_dev_execution_store()
+        event_store = self._ensure_subagent_event_store()
+        if store is None or event_store is None:
+            return web.json_response({"error": {"message": "Dev harness stores are unavailable"}}, status=503)
+        try:
+            report = generate_harness_report(
+                store=store,
+                event_store=event_store,
+                plan_ids=body.get("plan_ids"),
+                project_id=body.get("project_id"),
+                limit=body.get("limit") or 25,
+                since=body.get("since"),
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness report failed: {exc}"}}, status=500)
+        return web.json_response(report)
+
+    async def _handle_dev_harness_recommendations(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/harness/recommendations — list or generate recommendation runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        event_store = self._ensure_subagent_event_store()
+        if store is None or event_store is None:
+            return web.json_response({"error": {"message": "Dev harness stores are unavailable"}}, status=503)
+        if request.method == "GET":
+            result = list_harness_recommendation_runs(
+                store=store,
+                report_id=request.rel_url.query.get("report_id") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = generate_harness_recommendations(
+                store=store,
+                event_store=event_store,
+                report_id=body.get("report_id"),
+                plan_ids=body.get("plan_ids"),
+                project_id=body.get("project_id"),
+                limit=body.get("limit") or 25,
+                since=body.get("since"),
+                benchmark_run_id=body.get("benchmark_run_id"),
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness recommendations failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_recommendation_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/harness/recommendations/{recommendation_run_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev execution store unavailable"}}, status=503)
+        try:
+            result = get_harness_recommendation_run(
+                store=store,
+                recommendation_run_id=request.match_info["recommendation_run_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness recommendation lookup failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_benchmarks(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/harness/benchmarks — list or create benchmark runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        event_store = self._ensure_subagent_event_store()
+        if store is None or event_store is None:
+            return web.json_response({"error": {"message": "Dev harness stores are unavailable"}}, status=503)
+        if request.method == "GET":
+            return web.json_response(list_harness_benchmark_runs(
+                store=store,
+                limit=request.rel_url.query.get("limit") or 50,
+            ))
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = run_harness_benchmark(
+                store=store,
+                event_store=event_store,
+                runtimes=body.get("runtimes"),
+                cases=body.get("cases"),
+                mode=body.get("mode"),
+                live=_coerce_request_bool(body.get("live"), default=False),
+                project_id=body.get("project_id") or "OrynWorkspace",
+                max_cases=body.get("max_cases") or 3,
+                iterations=body.get("iterations") or 1,
+                timeout_seconds=body.get("timeout_seconds") or 180,
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness benchmark failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_benchmark_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/harness/benchmarks/{benchmark_run_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev execution store unavailable"}}, status=503)
+        try:
+            result = get_harness_benchmark_run(
+                store=store,
+                benchmark_run_id=request.match_info["benchmark_run_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness benchmark lookup failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_openhands_server_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/runtimes/openhands/server — inspect local OpenHands server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(openhands_server_status())
+
+    async def _handle_dev_openhands_server_start(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/runtimes/openhands/server/start — start local OpenHands server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = start_openhands_server(
+            cwd=body.get("cwd"),
+            server_url=body.get("server_url"),
+            wait_seconds=body.get("wait_seconds") or 5.0,
+        )
+        return web.json_response(result)
+
+    async def _handle_dev_openhands_server_stop(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/runtimes/openhands/server/stop — stop local OpenHands server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(stop_openhands_server())
+
+    async def _handle_dev_execution_plans(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/execution-plans — list or create Dev plans."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        if request.method == "GET":
+            limit = self._bounded_query_limit(request, default=50)
+            event_store = self._ensure_subagent_event_store()
+            raw_plans = store.list_plans(limit=limit)
+            plans = []
+            try:
+                from tools.ao_bridge import AOBridge
+
+                bridge = AOBridge()
+            except Exception:
+                bridge = None
+            for plan in raw_plans:
+                if bridge is None:
+                    plans.append(plan)
+                    continue
+                try:
+                    plans.append(derive_execution_plan_status(
+                        store=store,
+                        plan_id=plan["plan_id"],
+                        bridge=bridge,
+                        event_store=event_store,
+                    )["plan"])
+                except Exception:
+                    plans.append(plan)
+            return web.json_response(build_dev_plans_response(plans))
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        try:
+            plan = store.create_plan(
+                title=body.get("title") or "Dev execution plan",
+                vision_brief=body.get("vision_brief"),
+                tasks=body.get("tasks") or [],
+                runbook_id=body.get("runbook_id"),
+                policy_profile=body.get("policy_profile"),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response({"ok": True, "plan": plan})
+
+    async def _handle_dev_execution_plan_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/execution-plans/{plan_id} — fetch one Dev plan."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            result = derive_execution_plan_status(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+            )
+        except KeyError:
+            return web.json_response(_openai_error(f"Dev execution plan not found: {plan_id}"), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response({"ok": True, "plan": result["plan"], "status": result["status"], "summary": result["summary"]})
+
+    async def _handle_dev_execution_plan_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/execution-plans/{plan_id}/status — derived Dev plan status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            result = derive_execution_plan_status(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_synthesize(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/synthesize — compact Dev report."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            result = synthesize_execution_plan(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_review(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/execution-plans/{plan_id}/review — Dev recommendation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        include_synthesis = True
+        if request.method == "GET":
+            include_synthesis = str(request.query.get("include_synthesis", "true")).lower() not in {"0", "false", "no"}
+        else:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if isinstance(body, dict) and "include_synthesis" in body:
+                include_synthesis = bool(body.get("include_synthesis"))
+        try:
+            result = review_execution_plan(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+                include_synthesis=include_synthesis,
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_apply_review(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/apply-review — apply current Dev recommendation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = apply_execution_plan_review(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+                include_synthesis=bool(body.get("include_synthesis", True)),
+                message=body.get("message"),
+                instruction=body.get("instruction"),
+                project_id=body.get("project_id"),
+                agent=body.get("agent"),
+                model=body.get("model"),
+                reasoning_effort=body.get("reasoning_effort"),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plans_supervise(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/supervise — run guarded Dev supervision."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = supervise_execution_plans(
+                store=store,
+                plan_ids=body.get("plan_ids") or None,
+                limit=int(body.get("limit") or 20),
+                project_id=body.get("project_id") or None,
+                reviewable_only=bool(body.get("reviewable_only", False)),
+                event_store=self._ensure_subagent_event_store(),
+                apply_guarded_actions=bool(body.get("apply_guarded_actions", True)),
+                include_synthesis=bool(body.get("include_synthesis", False)),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_next_step(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/execution-plans/{plan_id}/next-step — recommendation-only next step."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        include_synthesis = False
+        if request.method == "GET":
+            include_synthesis = str(request.query.get("include_synthesis", "false")).lower() in {"1", "true", "yes"}
+        else:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if isinstance(body, dict) and "include_synthesis" in body:
+                include_synthesis = bool(body.get("include_synthesis"))
+        try:
+            result = next_execution_step(
+                store=store,
+                plan_id=plan_id,
+                event_store=self._ensure_subagent_event_store(),
+                include_synthesis=include_synthesis,
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_test_state(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/test-state — inject deterministic Dev fixture state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = set_execution_plan_test_state(
+                store=store,
+                plan_id=plan_id,
+                task_id=body.get("task_id") or "",
+                state=body.get("state") or "",
+                event_store=self._ensure_subagent_event_store(),
+                summary=body.get("summary"),
+                status_reason=body.get("status_reason"),
+                ao_session_id=body.get("ao_session_id"),
+                runtime=body.get("runtime"),
+                project_id=body.get("project_id"),
+                files_read=body.get("files_read") if isinstance(body.get("files_read"), list) else None,
+                files_written=body.get("files_written") if isinstance(body.get("files_written"), list) else None,
+                verification_evidence=body.get("verification_evidence") if isinstance(body.get("verification_evidence"), list) else None,
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_runbooks(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/runbooks — list or upsert project Dev runbooks."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                result = list_runbooks(
+                    store=store,
+                    project_id=request.query.get("project_id") or None,
+                    limit=self._bounded_query_limit(request, default=100),
+                )
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = set_project_runbook(
+                store=store,
+                project_id=body.get("project_id") or "",
+                policy_profile=body.get("policy_profile") or "standard",
+                max_follow_ups_per_task=body.get("max_follow_ups_per_task"),
+                max_retries_per_task=body.get("max_retries_per_task"),
+                supervisor_enabled=body.get("supervisor_enabled"),
+                supervisor_interval_seconds=body.get("supervisor_interval_seconds"),
+                supervisor_limit=body.get("supervisor_limit"),
+                supervisor_include_synthesis=body.get("supervisor_include_synthesis"),
+                supervisor_apply_guarded_actions=body.get("supervisor_apply_guarded_actions"),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_loop(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/supervisor/loop — inspect or configure guarded supervisor loop."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                result = list_supervisor_loop_status(
+                    store=store,
+                    project_id=request.query.get("project_id") or None,
+                )
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = set_supervisor_loop(
+                store=store,
+                project_id=body.get("project_id") or "",
+                supervisor_enabled=body.get("supervisor_enabled"),
+                supervisor_interval_seconds=body.get("supervisor_interval_seconds"),
+                supervisor_limit=body.get("supervisor_limit"),
+                supervisor_include_synthesis=body.get("supervisor_include_synthesis"),
+                supervisor_apply_guarded_actions=body.get("supervisor_apply_guarded_actions"),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_runbook_detail(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/runbooks/{runbook_id} — fetch or update one Dev runbook."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        runbook_id = str(request.match_info.get("runbook_id") or "").strip()
+        if request.method == "GET":
+            try:
+                result = get_runbook(store=store, runbook_id=runbook_id)
+            except KeyError as exc:
+                return web.json_response(_openai_error(str(exc)), status=404)
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        existing = store.get_runbook(runbook_id)
+        if not existing:
+            return web.json_response(_openai_error(f"Dev runbook not found: {runbook_id}"), status=404)
+        try:
+            result = set_project_runbook(
+                store=store,
+                project_id=body.get("project_id") or existing.get("project_id") or "",
+                policy_profile=body.get("policy_profile") or existing.get("policy_profile") or "standard",
+                max_follow_ups_per_task=body.get("max_follow_ups_per_task", existing.get("max_follow_ups_per_task")),
+                max_retries_per_task=body.get("max_retries_per_task", existing.get("max_retries_per_task")),
+                supervisor_enabled=body.get("supervisor_enabled", existing.get("supervisor_enabled")),
+                supervisor_interval_seconds=body.get("supervisor_interval_seconds", existing.get("supervisor_interval_seconds")),
+                supervisor_limit=body.get("supervisor_limit", existing.get("supervisor_limit")),
+                supervisor_include_synthesis=body.get("supervisor_include_synthesis", existing.get("supervisor_include_synthesis")),
+                supervisor_apply_guarded_actions=body.get("supervisor_apply_guarded_actions", existing.get("supervisor_apply_guarded_actions")),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/supervisor/approvals — list Dev supervisor approvals."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        params = request.rel_url.query
+        try:
+            result = list_supervisor_approvals(
+                store=store,
+                status=params.get("status") or None,
+                plan_id=params.get("plan_id") or None,
+                limit=self._bounded_query_limit(request, default=50),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_approval_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/supervisor/approvals/{approval_id} — fetch one approval."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        approval_id = str(request.match_info.get("approval_id") or "").strip()
+        try:
+            result = get_supervisor_approval(store=store, approval_id=approval_id)
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_approval_approve(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/supervisor/approvals/{approval_id}/approve — approve one request."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        approval_id = str(request.match_info.get("approval_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = approve_supervisor_approval(
+                store=store,
+                approval_id=approval_id,
+                resolved_by=body.get("resolved_by"),
+                message=body.get("message"),
+                instruction=body.get("instruction"),
+                project_id=body.get("project_id"),
+                agent=body.get("agent"),
+                model=body.get("model"),
+                reasoning_effort=body.get("reasoning_effort"),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_approval_deny(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/supervisor/approvals/{approval_id}/deny — deny one request."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        approval_id = str(request.match_info.get("approval_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = deny_supervisor_approval(
+                store=store,
+                approval_id=approval_id,
+                resolved_by=body.get("resolved_by"),
+                message=body.get("message"),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_supervisor_approval_apply(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/supervisor/approvals/{approval_id}/apply — consume and apply approval."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        approval_id = str(request.match_info.get("approval_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = apply_supervisor_approval(
+                store=store,
+                approval_id=approval_id,
+                event_store=self._ensure_subagent_event_store(),
+                include_synthesis=bool(body.get("include_synthesis", True)),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result, status=200 if result.get("ok") else 409)
+
+    async def _handle_dev_execution_plan_launch(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/launch — launch plan tasks."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        event_store = self._ensure_subagent_event_store()
+        if store is None:
+            return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
+        plan_id = str(request.match_info.get("plan_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        task_ids = body.get("task_ids") if isinstance(body, dict) else None
+        try:
+            result = launch_execution_plan(
+                store=store,
+                plan_id=plan_id,
+                task_ids=task_ids,
+                event_store=event_store,
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
 
     async def _handle_ao_sessions(self, request: "web.Request") -> "web.Response":
         """GET /v1/ao/sessions — list AO sessions known to AO/Hermes."""
@@ -5543,6 +7020,80 @@ class APIServerAdapter(BasePlatformAdapter):
             "session": self._ao_session_payload(session, include_events=True),
         })
 
+    def _ao_diagnostics_payload(self, *, session: Any, bridge: Any, lines: int) -> Dict[str, Any]:
+        store = self._ensure_subagent_event_store()
+        latest = store.latest_event_for_ao_session(session.id) if store else None
+        events = store.list_events(ao_session_id=session.id, limit=500) if store else []
+        latest_lifecycle_at = None
+        for event in events:
+            if event.get("event") != "subagent.action":
+                latest_lifecycle_at = self._subagent_event_order_value(event)
+        last_action = next(
+            (
+                event for event in reversed(events)
+                if event.get("event") == "subagent.action"
+                and self._subagent_action_belongs_to_current_lifecycle(event, latest_lifecycle_at)
+            ),
+            None,
+        )
+        runtime_health = bridge.runtime_health(session)
+        is_stale = runtime_health.get("runtime_health") == "stale"
+        status = "terminated" if is_stale else session.display_status
+        lane = "failed" if is_stale else self._subagent_lane(status)
+        transcript_tail = bridge.capture_output(session, lines=lines) if session.tmux_name else ""
+        diagnostic_message = (
+            runtime_health.get("runtime_warning")
+            or (latest or {}).get("summary")
+            or (latest or {}).get("message")
+            or session.activity
+            or self._subagent_lane_reason(status, lane, "ao")
+        )
+        return {
+            "object": "hermes.ao_session_diagnostics",
+            "session_id": session.id,
+            "session": self._ao_session_payload(session, include_events=False),
+            "runtime_health": runtime_health.get("runtime_health"),
+            "runtime_warning": runtime_health.get("runtime_warning"),
+            "tmux_alive": runtime_health.get("tmux_alive"),
+            "process_alive": runtime_health.get("process_alive"),
+            "diagnostic_status": "stale" if is_stale else lane,
+            "diagnostic_message": diagnostic_message,
+            "recovery_recommendation": self._ao_recovery_recommendation(
+                status=status,
+                lane=lane,
+                is_stale=is_stale,
+            ),
+            "last_action": last_action,
+            "last_event": latest,
+            "transcript_available": bool(transcript_tail),
+            "transcript_tail": transcript_tail,
+            "transcript_lines": lines,
+            "transcript_captured_at": time.time(),
+            "can_resume": (not is_stale) and lane == "running",
+            "can_repair_retry": bool(store.get_ao_prompt(session.id) if store else None),
+            "can_stop": (not is_stale) and lane in {"queued", "running", "needs_input"},
+            "can_open": True,
+        }
+
+    async def _handle_ao_session_diagnostics(self, request: "web.Request") -> "web.Response":
+        """GET /v1/ao/sessions/{session_id}/diagnostics — recovery-oriented AO detail."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        lines = self._bounded_transcript_lines(request)
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            session = bridge.status(session_id)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        if not session:
+            return web.json_response(_openai_error("AO session not found"), status=404)
+        return web.json_response(self._ao_diagnostics_payload(session=session, bridge=bridge, lines=lines))
+
     async def _handle_ao_session_follow_up(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/follow-up — send a message to a running AO worker."""
         auth_err = self._check_auth(request)
@@ -5564,6 +7115,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session = bridge.send(session_id, message) or bridge.status(session_id)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        progress_event = None
+        action_event = None
         if session:
             self._persist_subagent_event({
                 "event": "subagent.progress",
@@ -5580,11 +7133,95 @@ class APIServerAdapter(BasePlatformAdapter):
                 "preview": "Follow-up sent",
                 "timestamp": time.time(),
             })
-        return web.json_response({"ok": True, "session": self._ao_session_payload(session) if session else None})
+            progress_event = self._ensure_subagent_event_store().latest_event_for_ao_session(session.id) if self._ensure_subagent_event_store() else None
+        action_event = self._persist_ao_action_event(
+            action="follow-up",
+            source_session_id=session_id,
+            status="succeeded",
+            message="Follow-up sent",
+            session=session,
+            base_event=progress_event,
+        )
+        return web.json_response(self._ao_action_response(
+            action="follow-up",
+            source_session_id=session_id,
+            status=session.display_status if session else "unknown",
+            message="Follow-up sent",
+            session_payload=self._ao_session_payload(session) if session else None,
+            event=action_event,
+        ))
+
+    async def _handle_ao_session_resume(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/resume — steer a running AO worker from diagnostics."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        message = str(body.get("message") or "").strip() or (
+            "Resume from your latest state. Report current blockers, continue the original task, "
+            "and produce a concise status update."
+        )
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+            before = bridge.status(session_id)
+            if not before:
+                return web.json_response(_openai_error("AO session not found"), status=404)
+            runtime_health = bridge.runtime_health(before)
+            if runtime_health.get("runtime_health") == "stale" or self._subagent_lane(before.display_status) != "running":
+                return web.json_response(
+                    _openai_error("AO session is not running; use Repair Retry instead."),
+                    status=409,
+                )
+            session = bridge.send(session_id, message) or bridge.status(session_id) or before
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+
+        progress_event = self._persist_subagent_event({
+            "event": "subagent.progress",
+            "subagent_id": f"ao:{session.id}",
+            "runtime": "ao",
+            "ao_session_id": session.id,
+            "ao_project_id": session.project_id,
+            "workspace_path": session.workspace_path,
+            "branch": session.branch,
+            "tmux_name": session.tmux_name,
+            "open_command": session.open_command,
+            "status": session.display_status,
+            "message": "Resume sent",
+            "preview": "Resume sent",
+            "timestamp": time.time(),
+        })
+        action_event = self._persist_ao_action_event(
+            action="resume",
+            source_session_id=session_id,
+            status="succeeded",
+            message="Resume sent",
+            session=session,
+            base_event=progress_event,
+        )
+        return web.json_response(self._ao_action_response(
+            action="resume",
+            source_session_id=session_id,
+            status=session.display_status,
+            message="Resume sent",
+            session_payload=self._ao_session_payload(session),
+            event=action_event,
+        ))
 
     async def _handle_ao_session_retry(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/retry — spawn a replacement AO worker."""
         return await self._spawn_related_ao_session(request, mode="retry")
+
+    async def _handle_ao_session_repair_retry(self, request: "web.Request") -> "web.Response":
+        """POST /v1/ao/sessions/{session_id}/repair-retry — spawn a diagnostics-aware replacement."""
+        return await self._spawn_related_ao_session(request, mode="repair-retry")
 
     async def _handle_ao_session_reassign(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/reassign — spawn a replacement AO worker with optional overrides."""
@@ -5613,23 +7250,46 @@ class APIServerAdapter(BasePlatformAdapter):
         project_id = str(body.get("project_id") or prompt_meta.get("project_id") or "OrynWorkspace")
         agent = body.get("agent") or prompt_meta.get("agent")
         model = body.get("model") or prompt_meta.get("model")
+        reasoning_effort = body.get("reasoning_effort") or prompt_meta.get("reasoning_effort")
         goal = prompt_meta.get("goal") or f"{mode.title()} AO worker"
+        diagnostic_context = ""
+        if mode == "repair-retry":
+            try:
+                from tools.ao_bridge import AOBridge as _DiagnosticsAOBridge
+
+                diagnostics_bridge = _DiagnosticsAOBridge()
+                source_session = diagnostics_bridge.status(source_session_id)
+                if source_session:
+                    health = diagnostics_bridge.runtime_health(source_session)
+                    tail = diagnostics_bridge.capture_output(source_session, lines=120)
+                    diagnostic_context = "\n\nRecovery diagnostics:\n"
+                    diagnostic_context += f"Runtime health: {health.get('runtime_health') or 'unknown'}\n"
+                    if health.get("runtime_warning"):
+                        diagnostic_context += f"Runtime warning: {health.get('runtime_warning')}\n"
+                    if tail:
+                        diagnostic_context += "Recent transcript tail:\n" + tail[-8000:]
+            except Exception as exc:
+                logger.debug("Failed to collect AO repair-retry diagnostics for %s: %s", source_session_id, exc)
         prompt = self._related_ao_prompt(
             mode=mode,
             original_prompt=prompt_meta.get("prompt") or "",
             prior_summary=prior_summary,
-            instruction=instruction,
+            instruction=(instruction + diagnostic_context).strip(),
             model=model,
         )
         try:
             from tools.ao_bridge import AOBridge
+            from tools.ao_delegate_tool import build_ao_worker_prompt
 
             bridge = AOBridge()
+            launch_prompt = build_ao_worker_prompt(prompt, goal=f"{mode.title()}: {goal}")
             session = bridge.spawn(
                 project_id=project_id,
-                prompt=prompt,
+                prompt=launch_prompt,
                 issue_id=prompt_meta.get("issue_id"),
                 agent=agent,
+                model=model,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -5642,8 +7302,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 goal=f"{mode.title()}: {goal}",
                 issue_id=prompt_meta.get("issue_id"),
                 branch=session.branch,
-                agent=agent,
-                model=model,
+                agent=session.agent or agent,
+                model=session.model or model,
+                reasoning_effort=session.reasoning_effort or reasoning_effort,
+                launch_profile_id=prompt_meta.get("launch_profile_id"),
+                launch_plan_id=prompt_meta.get("launch_plan_id"),
+                launch_task_id=prompt_meta.get("launch_task_id"),
+                permissions=prompt_meta.get("permissions"),
+                acceptance_criteria=prompt_meta.get("acceptance_criteria") or [],
             )
         start_event = self._persist_subagent_event({
             "event": "subagent.start",
@@ -5659,18 +7325,36 @@ class APIServerAdapter(BasePlatformAdapter):
             "issue_id": session.issue_id,
             "tmux_name": session.tmux_name,
             "open_command": session.open_command,
+            "agent": session.agent,
             "model": session.model,
+            "reasoning_effort": session.reasoning_effort,
+            "launch_profile_id": prompt_meta.get("launch_profile_id"),
+            "launch_plan_id": prompt_meta.get("launch_plan_id"),
+            "launch_task_id": prompt_meta.get("launch_task_id"),
+            "permissions": prompt_meta.get("permissions"),
+            "acceptance_criteria": prompt_meta.get("acceptance_criteria") or [],
             "status": session.display_status,
             "message": f"AO {mode} session spawned from {source_session_id}",
             "timestamp": time.time(),
         })
-        return web.json_response({
-            "ok": True,
-            "mode": mode,
-            "source_session_id": source_session_id,
-            "session": self._ao_session_payload(session),
-            "event": start_event,
-        })
+        action_event = self._persist_ao_action_event(
+            action=mode,
+            source_session_id=source_session_id,
+            target_session_id=session.id,
+            status="succeeded",
+            message=f"AO {mode} session spawned",
+            session=session,
+            base_event=latest,
+        )
+        return web.json_response(self._ao_action_response(
+            action=mode,
+            source_session_id=source_session_id,
+            target_session_id=session.id,
+            status=session.display_status,
+            message=f"AO {mode} session spawned",
+            session_payload=self._ao_session_payload(session),
+            event=action_event,
+        ))
 
     @staticmethod
     def _related_ao_prompt(
@@ -5831,21 +7515,47 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
+        store = self._ensure_subagent_event_store()
+        latest = store.latest_event_for_ao_session(session_id) if store else None
+        if self._ao_stop_event_is_terminal(latest):
+            response = self._ao_action_response(
+                action="stop",
+                source_session_id=session_id,
+                status="already_stopped",
+                message="AO worker is already stopped.",
+                session_payload=None,
+                event=latest,
+            )
+            response["session_id"] = session_id
+            return web.json_response(response)
+
         try:
             from tools.ao_bridge import AOBridge
 
             bridge = AOBridge()
             before_session = bridge.status(session_id)
-            bridge.kill(session_id)
+            bridge.kill(session_id, session=before_session)
             try:
                 session = bridge.status(session_id) or before_session
             except Exception:
                 session = before_session
         except Exception as exc:
+            latest = store.latest_event_for_ao_session(session_id) if store else None
+            if self._ao_stop_event_is_terminal(latest):
+                response = self._ao_action_response(
+                    action="stop",
+                    source_session_id=session_id,
+                    status="already_stopped",
+                    message="AO worker is already stopped.",
+                    session_payload=None,
+                    event=latest,
+                )
+                response["session_id"] = session_id
+                return web.json_response(response)
             return web.json_response({"error": str(exc)}, status=404)
+        if session is not None and not isinstance(getattr(session, "id", None), str):
+            session = None
 
-        latest = None
-        store = self._ensure_subagent_event_store()
         if store:
             latest = store.latest_event_for_ao_session(session_id)
         event_payload: Dict[str, Any] = dict(latest or {})
@@ -5865,14 +7575,24 @@ class APIServerAdapter(BasePlatformAdapter):
         event_payload.pop("event_id", None)
         event_payload.pop("created_at", None)
         event = self._persist_subagent_event(event_payload)
-        return web.json_response({
-            "ok": True,
-            "mode": "stop",
-            "session_id": session_id,
-            "status": "killed",
-            "session": self._ao_session_payload(session) if session else None,
-            "event": event,
-        })
+        action_event = self._persist_ao_action_event(
+            action="stop",
+            source_session_id=session_id,
+            status="killed",
+            message="AO worker stopped by user.",
+            session=session,
+            base_event=event,
+        )
+        response = self._ao_action_response(
+            action="stop",
+            source_session_id=session_id,
+            status="killed",
+            message="AO worker stopped by user.",
+            session_payload=self._ao_session_payload(session) if session else None,
+            event=action_event,
+        )
+        response["session_id"] = session_id
+        return web.json_response(response)
 
     async def _handle_ao_session_open(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/open — open AO worktree and return attach info."""
@@ -5923,6 +7643,23 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
             for run_id in stale_statuses:
                 self._run_statuses.pop(run_id, None)
+
+    async def _run_dev_supervisor_loop(self) -> None:
+        """Run the project-opt-in Dev supervisor loop while the gateway is alive."""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                store = self._ensure_dev_execution_store()
+                if store is None:
+                    continue
+                supervisor_loop_tick(
+                    store=store,
+                    event_store=self._ensure_subagent_event_store(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[api_server] Dev supervisor loop tick failed")
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -5989,6 +7726,46 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_get("/v1/runs/{run_id}/subagents/events", self._handle_run_subagent_events)
+            self._app.router.add_get("/v1/subagents/board", self._handle_subagent_board)
+            self._app.router.add_get("/v1/subagents/events", self._handle_subagent_events)
+            self._app.router.add_get("/v1/dev/launch-profiles", self._handle_dev_launch_profiles)
+            self._app.router.add_get("/v1/dev/runtimes", self._handle_dev_worker_runtimes)
+            self._app.router.add_post("/v1/dev/runtime-selection", self._handle_dev_runtime_selection)
+            self._app.router.add_get("/v1/dev/harness/components", self._handle_dev_harness_components)
+            self._app.router.add_post("/v1/dev/harness/report", self._handle_dev_harness_report)
+            self._app.router.add_get("/v1/dev/harness/recommendations", self._handle_dev_harness_recommendations)
+            self._app.router.add_post("/v1/dev/harness/recommendations", self._handle_dev_harness_recommendations)
+            self._app.router.add_get("/v1/dev/harness/recommendations/{recommendation_run_id}", self._handle_dev_harness_recommendation_detail)
+            self._app.router.add_get("/v1/dev/harness/benchmarks", self._handle_dev_harness_benchmarks)
+            self._app.router.add_post("/v1/dev/harness/benchmarks", self._handle_dev_harness_benchmarks)
+            self._app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", self._handle_dev_harness_benchmark_detail)
+            self._app.router.add_get("/v1/dev/runtimes/openhands/server", self._handle_dev_openhands_server_status)
+            self._app.router.add_post("/v1/dev/runtimes/openhands/server/start", self._handle_dev_openhands_server_start)
+            self._app.router.add_post("/v1/dev/runtimes/openhands/server/stop", self._handle_dev_openhands_server_stop)
+            self._app.router.add_get("/v1/dev/execution-plans", self._handle_dev_execution_plans)
+            self._app.router.add_post("/v1/dev/execution-plans", self._handle_dev_execution_plans)
+            self._app.router.add_post("/v1/dev/execution-plans/supervise", self._handle_dev_execution_plans_supervise)
+            self._app.router.add_get("/v1/dev/supervisor/loop", self._handle_dev_supervisor_loop)
+            self._app.router.add_post("/v1/dev/supervisor/loop", self._handle_dev_supervisor_loop)
+            self._app.router.add_get("/v1/dev/runbooks", self._handle_dev_runbooks)
+            self._app.router.add_post("/v1/dev/runbooks", self._handle_dev_runbooks)
+            self._app.router.add_get("/v1/dev/runbooks/{runbook_id}", self._handle_dev_runbook_detail)
+            self._app.router.add_post("/v1/dev/runbooks/{runbook_id}", self._handle_dev_runbook_detail)
+            self._app.router.add_get("/v1/dev/supervisor/approvals", self._handle_dev_supervisor_approvals)
+            self._app.router.add_get("/v1/dev/supervisor/approvals/{approval_id}", self._handle_dev_supervisor_approval_detail)
+            self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/approve", self._handle_dev_supervisor_approval_approve)
+            self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/deny", self._handle_dev_supervisor_approval_deny)
+            self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/apply", self._handle_dev_supervisor_approval_apply)
+            self._app.router.add_get("/v1/dev/execution-plans/{plan_id}", self._handle_dev_execution_plan_detail)
+            self._app.router.add_get("/v1/dev/execution-plans/{plan_id}/status", self._handle_dev_execution_plan_status)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/synthesize", self._handle_dev_execution_plan_synthesize)
+            self._app.router.add_get("/v1/dev/execution-plans/{plan_id}/review", self._handle_dev_execution_plan_review)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/review", self._handle_dev_execution_plan_review)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/apply-review", self._handle_dev_execution_plan_apply_review)
+            self._app.router.add_get("/v1/dev/execution-plans/{plan_id}/next-step", self._handle_dev_execution_plan_next_step)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/next-step", self._handle_dev_execution_plan_next_step)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/test-state", self._handle_dev_execution_plan_test_state)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/launch", self._handle_dev_execution_plan_launch)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             self._app.router.add_get("/v1/ao/sessions", self._handle_ao_sessions)
@@ -6000,9 +7777,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             self._app.router.add_post("/v1/ao/sessions/{session_id}/stop", self._handle_ao_session_stop)
             self._app.router.add_post("/v1/ao/sessions/{session_id}/open", self._handle_ao_session_open)
+            self._app.router.add_get("/v1/ao/sessions/{session_id}/diagnostics", self._handle_ao_session_diagnostics)
             self._app.router.add_post("/v1/ao/sessions/{session_id}/follow-up", self._handle_ao_session_follow_up)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/resume", self._handle_ao_session_resume)
             self._app.router.add_post("/v1/ao/sessions/{session_id}/retry", self._handle_ao_session_retry)
+            self._app.router.add_post("/v1/ao/sessions/{session_id}/repair-retry", self._handle_ao_session_repair_retry)
             self._app.router.add_post("/v1/ao/sessions/{session_id}/reassign", self._handle_ao_session_reassign)
+            register_kanban_routes(self._app, self)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -6011,6 +7792,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
+
+            self._dev_supervisor_loop_task = asyncio.create_task(self._run_dev_supervisor_loop())
+            try:
+                self._background_tasks.add(self._dev_supervisor_loop_task)
+            except TypeError:
+                pass
+            if hasattr(self._dev_supervisor_loop_task, "add_done_callback"):
+                self._dev_supervisor_loop_task.add_done_callback(self._background_tasks.discard)
 
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:
@@ -6075,6 +7864,9 @@ class APIServerAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop the aiohttp web server."""
         self._mark_disconnected()
+        if self._dev_supervisor_loop_task:
+            self._dev_supervisor_loop_task.cancel()
+            self._dev_supervisor_loop_task = None
         if self._site:
             await self._site.stop()
             self._site = None

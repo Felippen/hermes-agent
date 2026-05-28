@@ -2749,6 +2749,36 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_tool_calls_then_empty_returns_latest_tool_results(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"phase 11"}', call_id="c1")
+        tool_turn = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok": true, "result": "PHASE11_APPLY_DONE"}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "tool_result_empty_recovery"
+        assert result["final_response"] != "(empty)"
+        assert "latest tool results" in result["final_response"]
+        assert "web_search" in result["final_response"]
+        assert "PHASE11_APPLY_DONE" in result["final_response"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

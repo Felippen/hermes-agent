@@ -1,7 +1,8 @@
 import os
+import signal
 import subprocess
 
-from tools.ao_bridge import AOBridge
+from tools.ao_bridge import AOBridge, AOSession
 
 
 def test_bridge_env_prepends_codex_shim(tmp_path, monkeypatch):
@@ -61,6 +62,171 @@ def test_ensure_codex_shim_on_user_path_is_non_destructive(tmp_path):
     bridge._ensure_codex_shim_on_user_path()
 
     assert user_codex.read_text(encoding="utf-8") == "existing"
+
+
+def test_kill_forces_tmux_and_session_process_cleanup(monkeypatch):
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+    calls = []
+    signals = []
+
+    bridge._call = lambda command, payload, timeout: calls.append((command, payload, timeout)) or {"ok": True}
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["tmux", "kill-session"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["pgrep", "-f"]:
+            pattern = args[-1]
+            output = "123\n" if pattern in {"oryn-workspace-42", "tmux-oryn-workspace-42"} else ""
+            return subprocess.CompletedProcess(args, 0 if output else 1, output, "")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "kill", fake_kill)
+
+    bridge.kill(
+        "oryn-workspace-42",
+        session=AOSession(id="oryn-workspace-42", tmux_name="tmux-oryn-workspace-42"),
+    )
+
+    assert calls == [("kill", {"session_id": "oryn-workspace-42"}, 60)]
+    assert (123, signal.SIGTERM) in signals
+
+
+def test_runtime_health_marks_running_session_stale(monkeypatch):
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["tmux", "has-session"]:
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        if args[:2] == ["pgrep", "-f"]:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    health = bridge.runtime_health(
+        AOSession(
+            id="oryn-workspace-42",
+            status="working",
+            tmux_name="tmux-oryn-workspace-42",
+        )
+    )
+
+    assert health["runtime_health"] == "stale"
+    assert "runtime is gone" in health["runtime_warning"]
+
+
+def test_runtime_health_keeps_terminal_session_ok_when_tmux_is_gone(monkeypatch):
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["tmux", "has-session"]:
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        if args[:2] == ["pgrep", "-f"]:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    health = bridge.runtime_health(
+        AOSession(
+            id="oryn-workspace-42",
+            status="done",
+            tmux_name="tmux-oryn-workspace-42",
+        )
+    )
+
+    assert health["runtime_health"] == "ok"
+    assert health["runtime_warning"] is None
+
+
+def test_archived_sessions_fill_agent_and_model_from_project_config(tmp_path):
+    home = tmp_path / "home"
+    config = tmp_path / "agent-orchestrator.yaml"
+    config.write_text(
+        """
+defaults:
+  agent: codex
+projects:
+  OrynWorkspace:
+    agentConfig:
+      model: gpt-5.5
+      reasoningEffort: medium
+""",
+        encoding="utf-8",
+    )
+    archive = home / ".agent-orchestrator" / "hash-oryn-workspace" / "sessions" / "archive"
+    archive.mkdir(parents=True)
+    (archive / "oryn-workspace-12_2026-05-27T11-02-59-567Z").write_text(
+        "\n".join([
+            "worktree=/tmp/oryn-workspace-12",
+            "branch=session/oryn-workspace-12",
+            "status=spawning",
+            "tmuxName=hash-oryn-workspace-12",
+            "project=OrynWorkspace",
+        ]),
+        encoding="utf-8",
+    )
+    bridge = AOBridge(
+        config_path=str(config),
+        home=str(home),
+        codex_real_bin="/opt/test/bin/codex",
+    )
+    bridge._call = lambda command, payload, timeout: {"sessions": []}
+
+    sessions = bridge.list(project_id="OrynWorkspace")
+
+    assert sessions[0].agent == "codex"
+    assert sessions[0].model == "gpt-5.5"
+    assert sessions[0].reasoning_effort == "medium"
+    assert sessions[0].event_fields()["agent"] == "codex"
+    assert sessions[0].event_fields()["model"] == "gpt-5.5"
+    assert sessions[0].event_fields()["reasoning_effort"] == "medium"
+
+
+def test_spawn_persists_resolved_launch_metadata_from_project_config(tmp_path):
+    config = tmp_path / "agent-orchestrator.yaml"
+    config.write_text(
+        """
+defaults:
+  agent: codex
+projects:
+  OrynWorkspace:
+    agentConfig:
+      model: gpt-5.5
+      reasoningEffort: high
+""",
+        encoding="utf-8",
+    )
+    bridge = AOBridge(
+        config_path=str(config),
+        codex_real_bin="/opt/test/bin/codex",
+    )
+    calls = []
+
+    def fake_call(command, payload, timeout):
+        calls.append((command, payload, timeout))
+        return {
+            "session": {
+                "id": "oryn-workspace-15",
+                "project_id": "OrynWorkspace",
+                "status": "spawning",
+            }
+        }
+
+    bridge._call = fake_call
+
+    session = bridge.spawn(project_id="OrynWorkspace", prompt="Smoke")
+
+    assert calls[0][1]["agent"] == "codex"
+    assert session.agent == "codex"
+    assert session.model == "gpt-5.5"
+    assert session.reasoning_effort == "high"
 
 
 def test_codex_shim_translates_ao_approval_mode(tmp_path):

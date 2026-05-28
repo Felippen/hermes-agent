@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -30,6 +33,7 @@ class AOSession:
     tmux_name: Optional[str] = None
     agent: Optional[str] = None
     model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
     pr: Any = None
     summary: Optional[str] = None
     open_command: Optional[str] = None
@@ -47,6 +51,7 @@ class AOSession:
             tmux_name=payload.get("tmux_name"),
             agent=payload.get("agent"),
             model=payload.get("model"),
+            reasoning_effort=payload.get("reasoning_effort") or payload.get("reasoningEffort"),
             pr=payload.get("pr"),
             summary=payload.get("summary"),
             open_command=payload.get("open_command"),
@@ -68,6 +73,8 @@ class AOSession:
     def event_fields(self) -> Dict[str, Any]:
         return {
             "runtime": "ao",
+            "runtime_session_id": self.id,
+            "runtime_project_id": self.project_id,
             "ao_session_id": self.id,
             "ao_project_id": self.project_id,
             "workspace_path": self.workspace_path,
@@ -75,7 +82,9 @@ class AOSession:
             "issue_id": self.issue_id,
             "tmux_name": self.tmux_name,
             "open_command": self.open_command,
+            "agent": self.agent,
             "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
             "status": self.display_status,
         }
 
@@ -111,7 +120,13 @@ class AOBridge:
         issue_id: Optional[str] = None,
         branch: Optional[str] = None,
         agent: Optional[str] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> AOSession:
+        defaults = self._project_agent_defaults.get(project_id) or {}
+        resolved_agent = agent or defaults.get("agent")
+        resolved_model = model or defaults.get("model")
+        resolved_reasoning_effort = reasoning_effort or defaults.get("reasoning_effort")
         payload = self._call(
             "spawn",
             {
@@ -119,34 +134,40 @@ class AOBridge:
                 "prompt": prompt,
                 "issue_id": issue_id,
                 "branch": branch,
-                "agent": agent,
+                "agent": resolved_agent,
             },
             timeout=180,
         )
-        return AOSession.from_payload(payload["session"])
+        session = self._with_project_defaults(AOSession.from_payload(payload["session"]))
+        session.agent = agent or session.agent or resolved_agent
+        session.model = model or session.model or resolved_model
+        session.reasoning_effort = reasoning_effort or session.reasoning_effort or resolved_reasoning_effort
+        return session
 
     def status(self, session_id: str) -> Optional[AOSession]:
         payload = self._call("status", {"session_id": session_id}, timeout=30)
         session = payload.get("session")
-        return AOSession.from_payload(session) if session else None
+        return self._with_project_defaults(AOSession.from_payload(session)) if session else None
 
     def list(self, project_id: Optional[str] = None) -> list[AOSession]:
         payload = self._call("list", {"project_id": project_id}, timeout=60)
-        sessions = [AOSession.from_payload(item) for item in payload.get("sessions") or []]
+        sessions = [self._with_project_defaults(AOSession.from_payload(item)) for item in payload.get("sessions") or []]
         seen = {session.id for session in sessions}
         for session in self._archived_sessions(project_id=project_id):
             if session.id not in seen:
-                sessions.append(session)
+                sessions.append(self._with_project_defaults(session))
                 seen.add(session.id)
         return sessions
 
     def send(self, session_id: str, message: str) -> Optional[AOSession]:
         payload = self._call("send", {"session_id": session_id, "message": message}, timeout=60)
         session = payload.get("session")
-        return AOSession.from_payload(session) if session else None
+        return self._with_project_defaults(AOSession.from_payload(session)) if session else None
 
-    def kill(self, session_id: str) -> None:
+    def kill(self, session_id: str, *, session: Optional[AOSession] = None, force: bool = True) -> None:
         self._call("kill", {"session_id": session_id}, timeout=60)
+        if force:
+            self.force_cleanup(session_id, session=session)
 
     def capture_output(self, session: AOSession, lines: int = 40) -> str:
         if not session.tmux_name:
@@ -164,6 +185,135 @@ class AOBridge:
         if proc.returncode != 0:
             return ""
         return proc.stdout.strip()
+
+    def force_cleanup(self, session_id: str, *, session: Optional[AOSession] = None) -> Dict[str, Any]:
+        """Best-effort cleanup for AO workers that survive the AO kill call."""
+        tmux_name = (session.tmux_name if session else None) or ""
+        killed_tmux = False
+        killed_process_patterns: list[str] = []
+
+        if tmux_name:
+            try:
+                proc = subprocess.run(
+                    ["tmux", "kill-session", "-t", tmux_name],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                killed_tmux = proc.returncode == 0
+            except Exception:
+                killed_tmux = False
+
+        for pattern in (session_id, tmux_name):
+            pattern = (pattern or "").strip()
+            if not pattern:
+                continue
+            if self._terminate_processes_matching(pattern):
+                killed_process_patterns.append(pattern)
+
+        return {
+            "killed_tmux": killed_tmux,
+            "killed_process_patterns": killed_process_patterns,
+        }
+
+    def runtime_health(self, session: AOSession) -> Dict[str, Any]:
+        """Return whether AO's stored session state still has a live runtime."""
+        tmux_alive = self._tmux_session_exists(session.tmux_name)
+        process_alive = bool(
+            self._matching_pids(session.id)
+            or self._matching_pids(session.tmux_name or "")
+        )
+        is_stale = (
+            not session.is_terminal
+            and bool(session.tmux_name)
+            and tmux_alive is False
+            and not process_alive
+        )
+        return {
+            "runtime_health": "stale" if is_stale else "ok",
+            "runtime_warning": "AO reports this worker as running, but its tmux/process runtime is gone." if is_stale else None,
+            "tmux_alive": tmux_alive,
+            "process_alive": process_alive,
+        }
+
+    @staticmethod
+    def _tmux_session_exists(tmux_name: Optional[str]) -> Optional[bool]:
+        if not tmux_name:
+            return None
+        try:
+            proc = subprocess.run(
+                ["tmux", "has-session", "-t", tmux_name],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return None
+        return proc.returncode == 0
+
+    @staticmethod
+    def _matching_pids(pattern: str) -> list[int]:
+        pattern = (pattern or "").strip()
+        if not pattern:
+            return []
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", pattern],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return []
+        if proc.returncode != 0:
+            return []
+
+        current_pid = os.getpid()
+        pids: list[int] = []
+        for raw in proc.stdout.splitlines():
+            try:
+                pid = int(raw.strip())
+            except ValueError:
+                continue
+            if pid != current_pid:
+                pids.append(pid)
+        return pids
+
+    @staticmethod
+    def _terminate_processes_matching(pattern: str) -> bool:
+        matched = False
+        pids = AOBridge._matching_pids(pattern)
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                matched = True
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+        if matched:
+            time.sleep(0.25)
+
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+        return matched
 
     def open_session(self, session_id: str) -> Dict[str, Any]:
         session = self.status(session_id)
@@ -308,9 +458,49 @@ class AOBridge:
                 branch=data.get("branch"),
                 workspace_path=data.get("worktree") or (runtime_data or {}).get("workspacePath"),
                 tmux_name=tmux_name,
+                agent=data.get("agent"),
+                model=data.get("model"),
+                reasoning_effort=data.get("reasoningEffort") or data.get("reasoning_effort"),
                 open_command=f"tmux attach -t {tmux_name}" if tmux_name else None,
             ))
         return sessions
+
+    def _with_project_defaults(self, session: AOSession) -> AOSession:
+        defaults = self._project_agent_defaults.get(session.project_id or "") if session.project_id else None
+        if defaults:
+            session.agent = session.agent or defaults.get("agent")
+            session.model = session.model or defaults.get("model")
+            session.reasoning_effort = session.reasoning_effort or defaults.get("reasoning_effort")
+        return session
+
+    @cached_property
+    def _project_agent_defaults(self) -> Dict[str, Dict[str, Optional[str]]]:
+        try:
+            import yaml
+
+            raw = yaml.safe_load(Path(self.config_path).read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+
+        defaults = raw.get("defaults") or {}
+        default_agent = defaults.get("agent")
+        projects = raw.get("projects") or {}
+        result: Dict[str, Dict[str, Optional[str]]] = {}
+        for project_id, project in projects.items():
+            if not isinstance(project, dict):
+                continue
+            agent_config = project.get("agentConfig") or {}
+            result[str(project_id)] = {
+                "agent": project.get("agent") or default_agent,
+                "model": agent_config.get("model"),
+                "reasoning_effort": (
+                    agent_config.get("reasoningEffort")
+                    or agent_config.get("reasoning_effort")
+                    or agent_config.get("modelReasoningEffort")
+                    or agent_config.get("model_reasoning_effort")
+                ),
+            }
+        return result
 
     @staticmethod
     def _read_flat_session_file(path: Path) -> Dict[str, Any]:

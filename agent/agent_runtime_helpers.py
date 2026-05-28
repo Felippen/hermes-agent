@@ -1698,9 +1698,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             prompt=function_args.get("prompt") or function_args.get("goal") or "",
             goal=function_args.get("goal"),
             project_id=function_args.get("project_id") or "OrynWorkspace",
+            profile_id=function_args.get("profile_id"),
+            model=function_args.get("model"),
+            reasoning_effort=function_args.get("reasoning_effort"),
+            permissions=function_args.get("permissions"),
+            launch_plan_id=function_args.get("launch_plan_id"),
+            launch_task_id=function_args.get("launch_task_id"),
+            acceptance_criteria=function_args.get("acceptance_criteria") or [],
             issue_id=function_args.get("issue_id"),
             branch=function_args.get("branch"),
             max_wait_seconds=function_args.get("max_wait_seconds") or 1800,
+            parent_agent=agent,
+        )
+    elif function_name == "ao_delegate_batch":
+        from tools.ao_delegate_tool import ao_delegate_batch as _ao_delegate_batch
+        return _ao_delegate_batch(
+            tasks=function_args.get("tasks") or [],
             parent_agent=agent,
         )
     else:

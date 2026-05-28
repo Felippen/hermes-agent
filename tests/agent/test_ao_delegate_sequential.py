@@ -59,11 +59,11 @@ class _FakeAgent:
         return None
 
     def _invoke_tool(self, function_name, function_args, *_args, **_kwargs):
-        assert function_name == "ao_delegate_task"
+        assert function_name in {"ao_delegate_task", "ao_delegate_batch"}
         if self.tool_progress_callback:
             self.tool_progress_callback(
                 "subagent.start",
-                tool_name="ao_delegate_task",
+                tool_name=function_name,
                 preview="AO spawned",
                 subagent_id="ao:oryn-workspace-1",
                 runtime="ao",
@@ -102,3 +102,33 @@ def test_sequential_ao_delegate_task_routes_through_agent_invoke_tool():
     assert agent.subagent_events[0][1]["subagent_id"] == "ao:oryn-workspace-1"
     assert messages[-1]["role"] == "tool"
     assert messages[-1]["name"] == "ao_delegate_task"
+
+
+def test_sequential_ao_delegate_batch_routes_through_agent_invoke_tool():
+    agent = _FakeAgent()
+    agent.tool_progress_callback = lambda event, **payload: agent.subagent_events.append((event, payload))
+    messages = []
+    assistant = SimpleNamespace(
+        tool_calls=[
+            _tool_call(
+                "ao_delegate_batch",
+                {
+                    "tasks": [
+                        {
+                            "goal": "Read-only inspection",
+                            "project_id": "OrynWorkspace",
+                            "prompt": "Inspect the board.",
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+
+    execute_tool_calls_sequential(agent, assistant, messages, effective_task_id="task-1")
+
+    assert agent.subagent_events
+    assert agent.subagent_events[0][0] == "subagent.start"
+    assert agent.subagent_events[0][1]["tool_name"] == "ao_delegate_batch"
+    assert messages[-1]["role"] == "tool"
+    assert messages[-1]["name"] == "ao_delegate_batch"

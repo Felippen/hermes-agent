@@ -689,7 +689,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif function_name == "ao_delegate_task":
+        elif function_name in {"ao_delegate_task", "ao_delegate_batch"}:
             try:
                 function_result = agent._invoke_tool(
                     function_name,

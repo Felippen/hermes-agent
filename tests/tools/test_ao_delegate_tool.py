@@ -1,10 +1,13 @@
 import json
 
+from gateway.subagent_events import SubagentEventStore
 from tools.ao_bridge import AOSession
 from tools.ao_delegate_tool import (
     _output_indicates_codex_complete,
     _summary_from_completed_output,
+    ao_delegate_batch,
     ao_delegate_task,
+    build_ao_worker_prompt,
 )
 
 
@@ -18,6 +21,9 @@ class FakeBridge:
             branch="feat/test",
             workspace_path="/tmp/worktree",
             tmux_name="abc-oryn-workspace-1",
+            agent="codex",
+            model="gpt-5.5",
+            reasoning_effort="medium",
             open_command="tmux attach -t abc-oryn-workspace-1",
         )
         self.done = AOSession(
@@ -28,6 +34,9 @@ class FakeBridge:
             branch="feat/test",
             workspace_path="/tmp/worktree",
             tmux_name="abc-oryn-workspace-1",
+            agent="codex",
+            model="gpt-5.5",
+            reasoning_effort="medium",
             open_command="tmux attach -t abc-oryn-workspace-1",
         )
         self.status_calls = 0
@@ -42,6 +51,31 @@ class FakeBridge:
 
     def capture_output(self, session, lines=40):
         return "worker finished\npytest passed"
+
+
+class FakeBatchBridge:
+    def __init__(self, fail_indexes=None):
+        self.fail_indexes = set(fail_indexes or [])
+        self.spawn_kwargs = []
+
+    def spawn(self, **kwargs):
+        index = len(self.spawn_kwargs) + 1
+        self.spawn_kwargs.append(kwargs)
+        if index in self.fail_indexes:
+            raise RuntimeError("spawn failed")
+        return AOSession(
+            id=f"oryn-workspace-{index}",
+            project_id=kwargs.get("project_id"),
+            status="working",
+            activity="active",
+            branch=f"feat/task-{index}",
+            workspace_path=f"/tmp/worktree-{index}",
+            tmux_name=f"tmux-{index}",
+            agent="codex",
+            model="gpt-5.5",
+            reasoning_effort="medium",
+            open_command=f"tmux attach -t tmux-{index}",
+        )
 
 
 class FakeBridgeWithCompletedTUI(FakeBridge):
@@ -146,8 +180,14 @@ def test_ao_delegate_task_emits_subagent_events_and_returns_session():
     assert payload["session"]["ao_session_id"] == "oryn-workspace-1"
     assert payload["session"]["workspace_path"] == "/tmp/worktree"
     assert bridge.spawn_kwargs["branch"] == "codex/test-branch"
+    assert "## Hermes AO Delegation Contract" in bridge.spawn_kwargs["prompt"]
+    assert "Run the test task" in bridge.spawn_kwargs["prompt"]
     assert parent.events
     assert parent.events[0][3]["branch"] == "feat/test"
+    assert parent.events[0][3]["_ao_prompt_metadata"]["prompt"] == "Run the test task"
+    assert parent.events[0][3]["_ao_prompt_metadata"]["agent"] == "codex"
+    assert parent.events[0][3]["_ao_prompt_metadata"]["model"] == "gpt-5.5"
+    assert parent.events[0][3]["_ao_prompt_metadata"]["reasoning_effort"] == "medium"
 
     event_names = [event[0] for event in parent.events]
     assert "subagent.start" in event_names
@@ -159,6 +199,90 @@ def test_ao_delegate_task_emits_subagent_events_and_returns_session():
     assert complete[3]["ao_project_id"] == "OrynWorkspace"
     assert complete[3]["branch"] == "feat/test"
     assert complete[3]["status"] == "completed"
+
+
+def test_ao_delegate_batch_spawns_multiple_workers_and_emits_start_events():
+    parent = ParentAgent()
+    bridge = FakeBatchBridge()
+    result = ao_delegate_batch(
+        tasks=[
+            {"goal": "Inspect UI", "prompt": "Read the board UI", "project_id": "OrynWorkspace"},
+            {"goal": "Inspect API", "prompt": "Read the board API", "project_id": "OrynPlatform"},
+        ],
+        parent_agent=parent,
+        bridge=bridge,
+    )
+
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["session_count"] == 2
+    assert payload["failure_count"] == 0
+    assert [call["project_id"] for call in bridge.spawn_kwargs] == ["OrynWorkspace", "OrynPlatform"]
+    assert "## Hermes AO Delegation Contract" in bridge.spawn_kwargs[0]["prompt"]
+    assert "Read the board UI" in bridge.spawn_kwargs[0]["prompt"]
+    assert bridge.spawn_kwargs[0]["prompt"] != "Read the board UI"
+    assert [event[0] for event in parent.events] == ["subagent.start", "subagent.start"]
+    assert parent.events[0][1] == "ao_delegate_batch"
+    assert parent.events[0][3]["task_index"] == 1
+    assert parent.events[1][3]["task_count"] == 2
+    assert parent.events[0][3]["_ao_prompt_metadata"]["prompt"] == "Read the board UI"
+    assert parent.events[0][3]["_ao_prompt_metadata"]["reasoning_effort"] == "medium"
+
+
+def test_build_ao_worker_prompt_makes_brief_authoritative_and_is_idempotent():
+    wrapped = build_ao_worker_prompt("Return only: unclear", goal="Weak summary test")
+
+    assert wrapped.startswith("## Hermes AO Delegation Contract")
+    assert "authoritative assignment" in wrapped
+    assert "Return only: unclear" in wrapped
+    assert build_ao_worker_prompt(wrapped, goal="Weak summary test") == wrapped
+
+
+def test_ao_delegate_batch_reports_partial_failures():
+    parent = ParentAgent()
+    result = ao_delegate_batch(
+        tasks=[
+            {"goal": "One", "prompt": "Task one"},
+            {"goal": "Two", "prompt": "Task two"},
+        ],
+        parent_agent=parent,
+        bridge=FakeBatchBridge(fail_indexes={2}),
+    )
+
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["session_count"] == 1
+    assert payload["failure_count"] == 1
+    assert payload["failures"][0]["task_index"] == 2
+    assert len(parent.events) == 1
+
+
+def test_ao_delegate_batch_persists_start_events_without_parent_callback(tmp_path):
+    store = SubagentEventStore(tmp_path / "state.db")
+    result = ao_delegate_batch(
+        tasks=[
+            {"goal": "Verify Agent Board action history UI", "prompt": "Inspect actions", "project_id": "OrynWorkspace"},
+            {"goal": "Verify weak summary warning behavior", "prompt": "Return unclear", "project_id": "OrynWorkspace"},
+        ],
+        bridge=FakeBatchBridge(),
+        event_store=store,
+    )
+
+    payload = json.loads(result)
+    events = store.list_events(limit=10)
+
+    assert payload["ok"] is True
+    assert [event["event"] for event in events] == ["subagent.start", "subagent.start"]
+    assert [event["tool_name"] for event in events] == ["ao_delegate_batch", "ao_delegate_batch"]
+    assert events[0]["goal"] == "Verify Agent Board action history UI"
+    assert events[0]["task_index"] == 1
+    assert events[1]["task_count"] == 2
+    assert store.get_ao_prompt("oryn-workspace-1")["prompt"] == "Inspect actions"
+    assert store.get_ao_prompt("oryn-workspace-1")["reasoning_effort"] == "medium"
+    assert store.get_ao_prompt("oryn-workspace-2")["goal"] == "Verify weak summary warning behavior"
+    store.close()
 
 
 def test_ao_delegate_task_completes_when_codex_tui_returns_to_prompt(monkeypatch):

@@ -76,6 +76,60 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _tool_result_empty_recovery_response(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Build a useful final response when a model goes empty after tool calls."""
+    recent_tools: list[Dict[str, str]] = []
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            name = str(message.get("name") or "tool")
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            recent_tools.append({
+                "name": name,
+                "content": content.strip(),
+            })
+            if len(recent_tools) >= 5:
+                break
+            continue
+        if recent_tools and role == "assistant" and message.get("tool_calls"):
+            break
+        if recent_tools and role not in {"tool"}:
+            break
+
+    if not recent_tools:
+        return None
+
+    recent_tools.reverse()
+    lines = [
+        "The model returned an empty message after running tools, so Hermes is returning the latest tool results instead of `(empty)`.",
+        "",
+        "Latest tool results:",
+    ]
+    for tool in recent_tools:
+        content = tool["content"] or "(no tool output)"
+        parsed = None
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            compact = json.dumps(parsed, ensure_ascii=False, indent=2)
+            preview = compact[:4000] + "\n..." if len(compact) > 4000 else compact
+        else:
+            preview = content[:4000] + "\n..." if len(content) > 4000 else content
+        lines.extend([
+            f"- `{tool['name']}`:",
+            "```text",
+            preview,
+            "```",
+        ])
+    return "\n".join(lines).strip()
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -3901,6 +3955,19 @@ def run_conversation(
                     # Exhausted retries and fallback chain (or no
                     # fallback configured).  Fall through to the
                     # "(empty)" terminal.
+                    tool_recovery_response = _tool_result_empty_recovery_response(messages)
+                    if tool_recovery_response:
+                        _turn_exit_reason = "tool_result_empty_recovery"
+                        agent._drop_trailing_empty_response_scaffolding(messages)
+                        assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        assistant_msg["content"] = tool_recovery_response
+                        messages.append(assistant_msg)
+                        agent._emit_status(
+                            "⚠️ Model stayed empty after tool calls — returning latest tool results"
+                        )
+                        final_response = tool_recovery_response
+                        break
+
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)

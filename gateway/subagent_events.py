@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from gateway.dev_control.events import normalize_subagent_event
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -45,6 +46,16 @@ CREATE TABLE IF NOT EXISTS ao_session_prompts (
     branch TEXT,
     agent TEXT,
     model TEXT,
+    reasoning_effort TEXT,
+    launch_profile_id TEXT,
+    launch_plan_id TEXT,
+    launch_task_id TEXT,
+    permissions TEXT,
+    acceptance_criteria TEXT,
+    runtime_selection TEXT,
+    selected_runtime TEXT,
+    runtime_selection_reason TEXT,
+    runtime_fallback_reason TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -63,16 +74,14 @@ class SubagentEventStore:
         self._lock = threading.Lock()
         with self._conn:
             self._conn.executescript(SCHEMA_SQL)
+            self._ensure_prompt_metadata_columns()
 
     def close(self) -> None:
         self._conn.close()
 
     def append_event(self, payload: Dict[str, Any], *, session_id: Optional[str] = None) -> Dict[str, Any]:
-        event = dict(payload)
-        created_at = float(event.get("created_at") or event.get("timestamp") or time.time())
-        if session_id:
-            event.setdefault("session_id", session_id)
-        event["created_at"] = created_at
+        event = normalize_subagent_event(payload, session_id=session_id)
+        created_at = float(event["created_at"])
 
         with self._lock, self._conn:
             cur = self._conn.execute(
@@ -107,7 +116,10 @@ class SubagentEventStore:
         *,
         session_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
         ao_session_id: Optional[str] = None,
+        runtime: Optional[str] = None,
+        status: Optional[str] = None,
         limit: int = 500,
     ) -> list[Dict[str, Any]]:
         clauses: list[str] = []
@@ -118,9 +130,18 @@ class SubagentEventStore:
         if run_id:
             clauses.append("run_id = ?")
             params.append(run_id)
+        if subagent_id:
+            clauses.append("subagent_id = ?")
+            params.append(subagent_id)
         if ao_session_id:
             clauses.append("ao_session_id = ?")
             params.append(ao_session_id)
+        if runtime:
+            clauses.append("runtime = ?")
+            params.append(runtime)
+        if status:
+            clauses.append("LOWER(status) = LOWER(?)")
+            params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, min(int(limit or 500), 2000)))
         rows = self._conn.execute(
@@ -146,15 +167,31 @@ class SubagentEventStore:
         branch: Optional[str],
         agent: Optional[str] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        launch_profile_id: Optional[str] = None,
+        launch_plan_id: Optional[str] = None,
+        launch_task_id: Optional[str] = None,
+        permissions: Optional[str] = None,
+        acceptance_criteria: Optional[Any] = None,
+        runtime_selection: Optional[Any] = None,
+        selected_runtime: Optional[str] = None,
+        runtime_selection_reason: Optional[str] = None,
+        runtime_fallback_reason: Optional[str] = None,
     ) -> None:
         now = time.time()
+        criteria_payload = json.dumps(acceptance_criteria or [], ensure_ascii=False)
+        runtime_selection_payload = json.dumps(runtime_selection or {}, ensure_ascii=False)
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO ao_session_prompts (
                     ao_session_id, project_id, prompt, goal, issue_id,
-                    branch, agent, model, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    branch, agent, model, reasoning_effort, launch_profile_id,
+                    launch_plan_id, launch_task_id, permissions, acceptance_criteria,
+                    runtime_selection, selected_runtime, runtime_selection_reason,
+                    runtime_fallback_reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ao_session_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     prompt = excluded.prompt,
@@ -163,22 +200,72 @@ class SubagentEventStore:
                     branch = excluded.branch,
                     agent = excluded.agent,
                     model = excluded.model,
+                    reasoning_effort = excluded.reasoning_effort,
+                    launch_profile_id = excluded.launch_profile_id,
+                    launch_plan_id = excluded.launch_plan_id,
+                    launch_task_id = excluded.launch_task_id,
+                    permissions = excluded.permissions,
+                    acceptance_criteria = excluded.acceptance_criteria,
+                    runtime_selection = excluded.runtime_selection,
+                    selected_runtime = excluded.selected_runtime,
+                    runtime_selection_reason = excluded.runtime_selection_reason,
+                    runtime_fallback_reason = excluded.runtime_fallback_reason,
                     updated_at = excluded.updated_at
                 """,
-                (ao_session_id, project_id, prompt, goal, issue_id, branch, agent, model, now, now),
+                (
+                    ao_session_id, project_id, prompt, goal, issue_id, branch,
+                    agent, model, reasoning_effort, launch_profile_id,
+                    launch_plan_id, launch_task_id, permissions, criteria_payload,
+                    runtime_selection_payload, selected_runtime, runtime_selection_reason,
+                    runtime_fallback_reason,
+                    now, now,
+                ),
             )
 
     def get_ao_prompt(self, ao_session_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             """
             SELECT ao_session_id, project_id, prompt, goal, issue_id, branch, agent, model,
-                   created_at, updated_at
+                   reasoning_effort, launch_profile_id, launch_plan_id, launch_task_id,
+                   permissions, acceptance_criteria, runtime_selection, selected_runtime,
+                   runtime_selection_reason, runtime_fallback_reason, created_at, updated_at
             FROM ao_session_prompts
             WHERE ao_session_id = ?
             """,
             (ao_session_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result["acceptance_criteria"] = json.loads(result.get("acceptance_criteria") or "[]")
+        except Exception:
+            result["acceptance_criteria"] = []
+        try:
+            result["runtime_selection"] = json.loads(result.get("runtime_selection") or "{}")
+        except Exception:
+            result["runtime_selection"] = {}
+        return result
+
+    def _ensure_prompt_metadata_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(ao_session_prompts)").fetchall()
+        }
+        for name in (
+            "reasoning_effort",
+            "launch_profile_id",
+            "launch_plan_id",
+            "launch_task_id",
+            "permissions",
+            "acceptance_criteria",
+            "runtime_selection",
+            "selected_runtime",
+            "runtime_selection_reason",
+            "runtime_fallback_reason",
+        ):
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE ao_session_prompts ADD COLUMN {name} TEXT")
 
     def latest_event_for_ao_session(self, ao_session_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
