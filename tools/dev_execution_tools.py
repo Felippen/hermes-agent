@@ -42,6 +42,30 @@ from gateway.dev_control.harness_recommendations import (
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
 )
+from gateway.dev_control.clarifications import (
+    DevClarificationStore,
+    answer_clarification,
+    cancel_clarification,
+    complete_clarification,
+    get_clarification,
+    list_clarifications,
+    start_clarification,
+)
+from gateway.dev_control.plan_artifacts import (
+    DevPlanArtifactStore,
+    approve_execution_plan_draft,
+    approve_plan_artifact,
+    cancel_execution_plan_draft,
+    cancel_plan_artifact,
+    create_execution_plan_from_artifact,
+    create_plan_artifact,
+    get_execution_plan_draft_review,
+    get_plan_artifact,
+    list_plan_artifact_builds,
+    list_plan_artifacts,
+    revise_execution_plan_draft,
+    revise_plan_artifact,
+)
 from gateway.subagent_events import SubagentEventStore
 from tools.openhands_bridge import (
     openhands_server_status,
@@ -174,6 +198,232 @@ DEV_HARNESS_BENCHMARK_RUNS_SCHEMA = {
             "benchmark_run_id": {"type": "string", "description": "Optional benchmark run id to fetch."},
             "limit": {"type": "integer", "description": "Maximum benchmark runs to list."},
         },
+    },
+}
+
+
+DEV_START_CLARIFICATION_SCHEMA = {
+    "name": "dev_start_clarification",
+    "description": "Start a durable Dev planning clarification session from a rough vision brief.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "vision_brief": {"type": "string", "description": "Rough vision or feature brief to clarify."},
+            "project_id": {"type": "string", "description": "Project id. Defaults to OrynWorkspace."},
+            "session_id": {"type": "string", "description": "Optional Oryn/Hermes chat session id to associate."},
+            "max_questions": {"type": "integer", "description": "Maximum questions, capped at 5."},
+        },
+        "required": ["vision_brief"],
+    },
+}
+
+
+DEV_CLARIFICATIONS_SCHEMA = {
+    "name": "dev_clarifications",
+    "description": "List or fetch durable Dev planning clarification sessions.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "clarification_id": {"type": "string", "description": "Optional clarification id to fetch."},
+            "project_id": {"type": "string", "description": "Optional project id filter."},
+            "session_id": {"type": "string", "description": "Optional session id filter."},
+            "status": {"type": "string", "description": "Optional status filter."},
+            "limit": {"type": "integer", "description": "Maximum sessions to list."},
+        },
+    },
+}
+
+
+DEV_ANSWER_CLARIFICATION_SCHEMA = {
+    "name": "dev_answer_clarification",
+    "description": "Answer, skip, or go back in an active Dev clarification session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "clarification_id": {"type": "string"},
+            "question_id": {"type": "string"},
+            "option_id": {"type": "string"},
+            "answer_text": {"type": "string"},
+            "skipped": {"type": "boolean", "default": False},
+            "back": {"type": "boolean", "default": False},
+        },
+        "required": ["clarification_id"],
+    },
+}
+
+
+DEV_COMPLETE_CLARIFICATION_SCHEMA = {
+    "name": "dev_complete_clarification",
+    "description": "Complete a Dev clarification session and produce a structured clarified brief.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "clarification_id": {"type": "string"},
+        },
+        "required": ["clarification_id"],
+    },
+}
+
+
+DEV_CANCEL_CLARIFICATION_SCHEMA = {
+    "name": "dev_cancel_clarification",
+    "description": "Cancel an active Dev clarification session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "clarification_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["clarification_id"],
+    },
+}
+
+
+DEV_PLAN_ARTIFACTS_SCHEMA = {
+    "name": "dev_plan_artifacts",
+    "description": "List or fetch durable Dev planning artifacts generated from clarifications.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string", "description": "Optional artifact id to fetch."},
+            "clarification_id": {"type": "string", "description": "Optional clarification id filter."},
+            "project_id": {"type": "string", "description": "Optional project id filter."},
+            "status": {"type": "string", "description": "Optional artifact status filter."},
+            "limit": {"type": "integer", "description": "Maximum artifacts to list."},
+        },
+    },
+}
+
+
+DEV_CREATE_PLAN_ARTIFACT_SCHEMA = {
+    "name": "dev_create_plan_artifact",
+    "description": "Create a durable planning artifact from a completed Dev clarification session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "clarification_id": {"type": "string"},
+        },
+        "required": ["clarification_id"],
+    },
+}
+
+
+DEV_REVISE_PLAN_ARTIFACT_SCHEMA = {
+    "name": "dev_revise_plan_artifact",
+    "description": "Create a revised version of a durable Dev planning artifact from feedback.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string"},
+            "feedback_instruction": {"type": "string"},
+            "feedback": {"type": "string"},
+        },
+        "required": ["plan_artifact_id"],
+    },
+}
+
+
+DEV_APPROVE_PLAN_ARTIFACT_SCHEMA = {
+    "name": "dev_approve_plan_artifact",
+    "description": "Mark a Dev planning artifact approved as ready for a future build transition.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string"},
+        },
+        "required": ["plan_artifact_id"],
+    },
+}
+
+
+DEV_CANCEL_PLAN_ARTIFACT_SCHEMA = {
+    "name": "dev_cancel_plan_artifact",
+    "description": "Cancel a Dev planning artifact without deleting its history.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["plan_artifact_id"],
+    },
+}
+
+
+DEV_CREATE_EXECUTION_PLAN_FROM_ARTIFACT_SCHEMA = {
+    "name": "dev_create_execution_plan_from_artifact",
+    "description": "Convert an approved Dev planning artifact into a planned Dev execution plan without launching workers.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string"},
+        },
+        "required": ["plan_artifact_id"],
+    },
+}
+
+
+DEV_PLAN_ARTIFACT_BUILDS_SCHEMA = {
+    "name": "dev_plan_artifact_builds",
+    "description": "List build audit records linking a Dev planning artifact to draft Dev execution plans.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_artifact_id": {"type": "string"},
+            "limit": {"type": "integer", "description": "Maximum build records to list."},
+        },
+        "required": ["plan_artifact_id"],
+    },
+}
+
+
+DEV_EXECUTION_PLAN_DRAFT_REVIEW_SCHEMA = {
+    "name": "dev_execution_plan_draft_review",
+    "description": "Get draft-review metadata for an artifact-created Dev execution plan.",
+    "parameters": {
+        "type": "object",
+        "properties": {"plan_id": {"type": "string"}},
+        "required": ["plan_id"],
+    },
+}
+
+
+DEV_REVISE_EXECUTION_PLAN_DRAFT_SCHEMA = {
+    "name": "dev_revise_execution_plan_draft",
+    "description": "Regenerate an unlaunched artifact-created Dev execution plan draft from feedback.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "feedback_instruction": {"type": "string"},
+            "feedback": {"type": "string"},
+        },
+        "required": ["plan_id"],
+    },
+}
+
+
+DEV_APPROVE_EXECUTION_PLAN_DRAFT_SCHEMA = {
+    "name": "dev_approve_execution_plan_draft",
+    "description": "Mark an artifact-created Dev execution plan draft as approved for later launch.",
+    "parameters": {
+        "type": "object",
+        "properties": {"plan_id": {"type": "string"}},
+        "required": ["plan_id"],
+    },
+}
+
+
+DEV_CANCEL_EXECUTION_PLAN_DRAFT_SCHEMA = {
+    "name": "dev_cancel_execution_plan_draft",
+    "description": "Cancel an artifact-created Dev execution plan draft without deleting history.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["plan_id"],
     },
 }
 
@@ -703,6 +953,235 @@ def _handle_dev_harness_benchmark_runs(args: Dict[str, Any], **kwargs) -> str:
     return tool_result(result)
 
 
+def _handle_dev_start_clarification(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = start_clarification(
+            store=DevClarificationStore(),
+            vision_brief=args.get("vision_brief") or "",
+            project_id=args.get("project_id") or "OrynWorkspace",
+            session_id=args.get("session_id"),
+            max_questions=args.get("max_questions") or 5,
+        )
+    except Exception as exc:
+        return tool_error(f"Dev clarification start failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_clarifications(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store = DevClarificationStore()
+        clarification_id = str(args.get("clarification_id") or "").strip()
+        if clarification_id:
+            result = get_clarification(store=store, clarification_id=clarification_id)
+        else:
+            result = list_clarifications(
+                store=store,
+                project_id=args.get("project_id"),
+                session_id=args.get("session_id"),
+                status=args.get("status"),
+                limit=args.get("limit") or 50,
+            )
+    except KeyError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"Dev clarification lookup failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_answer_clarification(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = answer_clarification(
+            store=DevClarificationStore(),
+            clarification_id=args.get("clarification_id") or "",
+            question_id=args.get("question_id"),
+            option_id=args.get("option_id"),
+            answer_text=args.get("answer_text"),
+            skipped=bool(args.get("skipped", False)),
+            back=bool(args.get("back", False)),
+        )
+    except Exception as exc:
+        return tool_error(f"Dev clarification answer failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_complete_clarification(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = complete_clarification(
+            store=DevClarificationStore(),
+            clarification_id=args.get("clarification_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev clarification complete failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_cancel_clarification(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = cancel_clarification(
+            store=DevClarificationStore(),
+            clarification_id=args.get("clarification_id") or "",
+            reason=args.get("reason"),
+        )
+    except Exception as exc:
+        return tool_error(f"Dev clarification cancel failed: {exc}")
+    return tool_result(result)
+
+
+def _plan_artifact_stores() -> tuple[DevPlanArtifactStore, DevClarificationStore]:
+    execution_store = DevExecutionStore()
+    return (
+        DevPlanArtifactStore(db_path=execution_store.db_path),
+        DevClarificationStore(db_path=execution_store.db_path),
+    )
+
+
+def _handle_dev_plan_artifacts(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, _ = _plan_artifact_stores()
+        plan_artifact_id = str(args.get("plan_artifact_id") or "").strip()
+        if plan_artifact_id:
+            result = get_plan_artifact(store=store, plan_artifact_id=plan_artifact_id)
+        else:
+            result = list_plan_artifacts(
+                store=store,
+                clarification_id=args.get("clarification_id"),
+                project_id=args.get("project_id"),
+                status=args.get("status"),
+                limit=args.get("limit") or 50,
+            )
+    except KeyError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"Dev plan artifact lookup failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_create_plan_artifact(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, clarification_store = _plan_artifact_stores()
+        result = create_plan_artifact(
+            store=store,
+            clarification_store=clarification_store,
+            clarification_id=args.get("clarification_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev plan artifact creation failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_revise_plan_artifact(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, clarification_store = _plan_artifact_stores()
+        result = revise_plan_artifact(
+            store=store,
+            clarification_store=clarification_store,
+            plan_artifact_id=args.get("plan_artifact_id") or "",
+            feedback=args.get("feedback_instruction") or args.get("feedback") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev plan artifact revision failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_approve_plan_artifact(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, _ = _plan_artifact_stores()
+        result = approve_plan_artifact(
+            store=store,
+            plan_artifact_id=args.get("plan_artifact_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev plan artifact approval failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_cancel_plan_artifact(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, _ = _plan_artifact_stores()
+        result = cancel_plan_artifact(
+            store=store,
+            plan_artifact_id=args.get("plan_artifact_id") or "",
+            reason=args.get("reason"),
+        )
+    except Exception as exc:
+        return tool_error(f"Dev plan artifact cancel failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_create_execution_plan_from_artifact(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        artifact_store, _ = _plan_artifact_stores()
+        result = create_execution_plan_from_artifact(
+            artifact_store=artifact_store,
+            execution_store=DevExecutionStore(),
+            plan_artifact_id=args.get("plan_artifact_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev artifact build failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_plan_artifact_builds(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        store, _ = _plan_artifact_stores()
+        result = list_plan_artifact_builds(
+            store=store,
+            plan_artifact_id=args.get("plan_artifact_id") or "",
+            limit=args.get("limit") or 25,
+        )
+    except Exception as exc:
+        return tool_error(f"Dev artifact build lookup failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_execution_plan_draft_review(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = get_execution_plan_draft_review(
+            execution_store=DevExecutionStore(),
+            plan_id=args.get("plan_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev draft review lookup failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_revise_execution_plan_draft(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        artifact_store, _ = _plan_artifact_stores()
+        result = revise_execution_plan_draft(
+            artifact_store=artifact_store,
+            execution_store=DevExecutionStore(),
+            plan_id=args.get("plan_id") or "",
+            feedback=args.get("feedback_instruction") or args.get("feedback") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev draft revision failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_approve_execution_plan_draft(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = approve_execution_plan_draft(
+            execution_store=DevExecutionStore(),
+            plan_id=args.get("plan_id") or "",
+        )
+    except Exception as exc:
+        return tool_error(f"Dev draft approval failed: {exc}")
+    return tool_result(result)
+
+
+def _handle_dev_cancel_execution_plan_draft(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        result = cancel_execution_plan_draft(
+            execution_store=DevExecutionStore(),
+            plan_id=args.get("plan_id") or "",
+            reason=args.get("reason"),
+        )
+    except Exception as exc:
+        return tool_error(f"Dev draft cancellation failed: {exc}")
+    return tool_result(result)
+
+
 def _handle_dev_openhands_server_status(args: Dict[str, Any], **kwargs) -> str:
     return tool_result(openhands_server_status())
 
@@ -1127,6 +1606,150 @@ registry.register(
     handler=_handle_dev_harness_benchmark_runs,
     emoji="Dev",
     max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_start_clarification",
+    toolset="delegation",
+    schema=DEV_START_CLARIFICATION_SCHEMA,
+    handler=_handle_dev_start_clarification,
+    emoji="Dev",
+    max_result_size_chars=40_000,
+)
+
+registry.register(
+    name="dev_clarifications",
+    toolset="delegation",
+    schema=DEV_CLARIFICATIONS_SCHEMA,
+    handler=_handle_dev_clarifications,
+    emoji="Dev",
+    max_result_size_chars=40_000,
+)
+
+registry.register(
+    name="dev_answer_clarification",
+    toolset="delegation",
+    schema=DEV_ANSWER_CLARIFICATION_SCHEMA,
+    handler=_handle_dev_answer_clarification,
+    emoji="Dev",
+    max_result_size_chars=40_000,
+)
+
+registry.register(
+    name="dev_complete_clarification",
+    toolset="delegation",
+    schema=DEV_COMPLETE_CLARIFICATION_SCHEMA,
+    handler=_handle_dev_complete_clarification,
+    emoji="Dev",
+    max_result_size_chars=40_000,
+)
+
+registry.register(
+    name="dev_cancel_clarification",
+    toolset="delegation",
+    schema=DEV_CANCEL_CLARIFICATION_SCHEMA,
+    handler=_handle_dev_cancel_clarification,
+    emoji="Dev",
+    max_result_size_chars=40_000,
+)
+
+registry.register(
+    name="dev_plan_artifacts",
+    toolset="delegation",
+    schema=DEV_PLAN_ARTIFACTS_SCHEMA,
+    handler=_handle_dev_plan_artifacts,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_create_plan_artifact",
+    toolset="delegation",
+    schema=DEV_CREATE_PLAN_ARTIFACT_SCHEMA,
+    handler=_handle_dev_create_plan_artifact,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_revise_plan_artifact",
+    toolset="delegation",
+    schema=DEV_REVISE_PLAN_ARTIFACT_SCHEMA,
+    handler=_handle_dev_revise_plan_artifact,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_approve_plan_artifact",
+    toolset="delegation",
+    schema=DEV_APPROVE_PLAN_ARTIFACT_SCHEMA,
+    handler=_handle_dev_approve_plan_artifact,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_cancel_plan_artifact",
+    toolset="delegation",
+    schema=DEV_CANCEL_PLAN_ARTIFACT_SCHEMA,
+    handler=_handle_dev_cancel_plan_artifact,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_create_execution_plan_from_artifact",
+    toolset="delegation",
+    schema=DEV_CREATE_EXECUTION_PLAN_FROM_ARTIFACT_SCHEMA,
+    handler=_handle_dev_create_execution_plan_from_artifact,
+    emoji="Dev",
+    max_result_size_chars=80_000,
+)
+
+registry.register(
+    name="dev_plan_artifact_builds",
+    toolset="delegation",
+    schema=DEV_PLAN_ARTIFACT_BUILDS_SCHEMA,
+    handler=_handle_dev_plan_artifact_builds,
+    emoji="Dev",
+    max_result_size_chars=60_000,
+)
+
+registry.register(
+    name="dev_execution_plan_draft_review",
+    toolset="delegation",
+    schema=DEV_EXECUTION_PLAN_DRAFT_REVIEW_SCHEMA,
+    handler=_handle_dev_execution_plan_draft_review,
+    emoji="Dev",
+    max_result_size_chars=80_000,
+)
+
+registry.register(
+    name="dev_revise_execution_plan_draft",
+    toolset="delegation",
+    schema=DEV_REVISE_EXECUTION_PLAN_DRAFT_SCHEMA,
+    handler=_handle_dev_revise_execution_plan_draft,
+    emoji="Dev",
+    max_result_size_chars=100_000,
+)
+
+registry.register(
+    name="dev_approve_execution_plan_draft",
+    toolset="delegation",
+    schema=DEV_APPROVE_EXECUTION_PLAN_DRAFT_SCHEMA,
+    handler=_handle_dev_approve_execution_plan_draft,
+    emoji="Dev",
+    max_result_size_chars=80_000,
+)
+
+registry.register(
+    name="dev_cancel_execution_plan_draft",
+    toolset="delegation",
+    schema=DEV_CANCEL_EXECUTION_PLAN_DRAFT_SCHEMA,
+    handler=_handle_dev_cancel_execution_plan_draft,
+    emoji="Dev",
+    max_result_size_chars=80_000,
 )
 
 registry.register(

@@ -16,6 +16,11 @@ from gateway.dev_execution import (
     derive_execution_plan_status,
     launch_execution_plan,
 )
+from gateway.dev_control.worker_output_contract import (
+    append_worker_output_contract,
+    parse_worker_output_contract,
+    worker_output_contract_score,
+)
 from gateway.dev_worker_runtimes import WorkerRuntimeRouter, list_worker_runtimes
 from gateway.subagent_events import SubagentEventStore
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
@@ -377,9 +382,10 @@ def _run_case_for_runtime(
             "minimal_worker_prompt": True,
             "acceptance_criteria": [
                 f"Final line must be exactly: {_expected_marker_line(case['marker'])}",
-                "Use the BENCHMARK_RESULT structured output contract.",
-                "Report concise file-backed findings.",
-                "Do not edit files.",
+        "Use the BENCHMARK_RESULT structured output contract.",
+        "Include Worker Output Contract v2 DEV_WORKER_EVIDENCE JSON.",
+        "Report concise file-backed findings.",
+        "Do not edit files.",
             ],
         }],
     )
@@ -468,6 +474,9 @@ def _run_case_for_runtime(
         "files_read_count": len(task_status.get("files_read") or []),
         "verification_evidence_count": len(task_status.get("verification_evidence") or []),
         "summary_warning": task_status.get("summary_warning"),
+        "output_contract_status": task_status.get("output_contract_status"),
+        "output_contract_warning": task_status.get("output_contract_warning"),
+        "output_contract_score": task_status.get("output_contract_score"),
     })
 
 
@@ -602,6 +611,10 @@ def _score_result(result: Dict[str, Any]) -> Dict[str, Any]:
     required_terms = [str(term).strip() for term in (result.get("required_evidence_terms") or []) if str(term).strip()]
     summary_warning = str(result.get("summary_warning") or result.get("status_reason") or "").lower()
     combined_output = "\n".join(part for part in (summary, output_tail) if part)
+    output_contract = parse_worker_output_contract(combined_output)
+    output_contract_score = result.get("output_contract_score")
+    if output_contract_score is None:
+        output_contract_score = worker_output_contract_score(output_contract, required_marker=marker)
     runtime_delivery_failed = bool(result.get("runtime_delivery_failed")) or status == "runtime_delivery_failed"
     status_score = 1.0 if status == "completed" else 0.5 if status == "needs_review" else 0.0
     marker_in_summary = False if runtime_delivery_failed else _marker_line_present(summary, marker)
@@ -630,7 +643,7 @@ def _score_result(result: Dict[str, Any]) -> Dict[str, Any]:
     delivery_score = 0.0 if runtime_delivery_failed else 1.0 if status not in {"validated", "skipped"} else None
     task_quality_score = None if status in {"validated", "skipped"} else round((summary_score + evidence_score + findings_score + specificity_score) / 4.0, 3)
     contract_compliance_score = None if status in {"validated", "skipped"} else round(
-        (marker_score + (1.0 if structured_result_present else 0.0)) / 2.0,
+        (marker_score + (1.0 if structured_result_present else 0.0) + float(output_contract_score or 0.0)) / 3.0,
         3,
     )
     if status in {"validated", "skipped"}:
@@ -648,6 +661,9 @@ def _score_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "delivery_score": delivery_score,
         "task_quality_score": task_quality_score,
         "contract_compliance_score": contract_compliance_score,
+        "output_contract_score": None if status in {"validated", "skipped"} else output_contract_score,
+        "output_contract_status": result.get("output_contract_status") or output_contract.get("output_contract_status"),
+        "output_contract_warning": result.get("output_contract_warning") or output_contract.get("output_contract_warning"),
         "findings_score": findings_score,
         "findings_count": findings_count,
         "expected_evidence_terms": expected_terms,
@@ -680,6 +696,7 @@ def _aggregate_runtime_results(case_results: list[Dict[str, Any]]) -> list[Dict[
         delivery_scored = [float(item["delivery_score"]) for item in results if item.get("delivery_score") is not None]
         quality_scored = [float(item["task_quality_score"]) for item in results if item.get("task_quality_score") is not None]
         contract_scored = [float(item["contract_compliance_score"]) for item in results if item.get("contract_compliance_score") is not None]
+        output_contract_scored = [float(item["output_contract_score"]) for item in results if item.get("output_contract_score") is not None]
         marker_results = [item for item in results if item.get("overall_score") is not None]
         required_results = [item for item in results if item.get("overall_score") is not None and item.get("required_evidence_terms")]
         cost_results = [item for item in results if item.get("cost_usd") is not None]
@@ -701,6 +718,8 @@ def _aggregate_runtime_results(case_results: list[Dict[str, Any]]) -> list[Dict[
             "median_task_quality_score": _median(quality_scored),
             "average_contract_compliance_score": round(sum(contract_scored) / len(contract_scored), 3) if contract_scored else None,
             "median_contract_compliance_score": _median(contract_scored),
+            "average_output_contract_score": round(sum(output_contract_scored) / len(output_contract_scored), 3) if output_contract_scored else None,
+            "median_output_contract_score": _median(output_contract_scored),
             "marker_pass_count": sum(1 for item in results if item.get("marker_present")),
             "marker_pass_rate": _rate(sum(1 for item in marker_results if item.get("marker_present")), len(marker_results)),
             "required_evidence_pass_count": sum(1 for item in required_results if item.get("required_evidence_score") == 1.0),
@@ -724,6 +743,7 @@ def _benchmark_summary(case_results: list[Dict[str, Any]], runtime_results: list
     delivery_scored = [float(item["delivery_score"]) for item in case_results if item.get("delivery_score") is not None]
     quality_scored = [float(item["task_quality_score"]) for item in case_results if item.get("task_quality_score") is not None]
     contract_scored = [float(item["contract_compliance_score"]) for item in case_results if item.get("contract_compliance_score") is not None]
+    output_contract_scored = [float(item["output_contract_score"]) for item in case_results if item.get("output_contract_score") is not None]
     marker_results = [item for item in case_results if item.get("overall_score") is not None]
     required_results = [item for item in case_results if item.get("overall_score") is not None and item.get("required_evidence_terms")]
     return {
@@ -743,6 +763,8 @@ def _benchmark_summary(case_results: list[Dict[str, Any]], runtime_results: list
         "median_task_quality_score": _median(quality_scored),
         "average_contract_compliance_score": round(sum(contract_scored) / len(contract_scored), 3) if contract_scored else None,
         "median_contract_compliance_score": _median(contract_scored),
+        "average_output_contract_score": round(sum(output_contract_scored) / len(output_contract_scored), 3) if output_contract_scored else None,
+        "median_output_contract_score": _median(output_contract_scored),
         "marker_pass_rate": _rate(sum(1 for item in marker_results if item.get("marker_present")), len(marker_results)),
         "required_evidence_pass_rate": _rate(
             sum(1 for item in required_results if item.get("required_evidence_score") == 1.0),
@@ -856,9 +878,10 @@ def _with_marker_contract(prompt: str, marker: str) -> str:
     expected = _expected_marker_line(marker)
     if expected in str(prompt or "").splitlines():
         return str(prompt or "").strip()
-    return (
+    benchmark_prompt = (
         f"{str(prompt or '').strip()}\n\n"
         "Output contract:\n"
+        "Include this benchmark result section:\n"
         "Return only this shape:\n"
         "BENCHMARK_RESULT\n"
         f"marker: {str(marker or '').strip()}\n"
@@ -869,6 +892,7 @@ def _with_marker_contract(prompt: str, marker: str) -> str:
         f"{expected}\n"
         "Do not translate, paraphrase, quote, explain, prefix, suffix, or omit the final marker line."
     )
+    return append_worker_output_contract(benchmark_prompt)
 
 
 def _with_required_evidence_contract(prompt: str, required_terms: list[str]) -> str:

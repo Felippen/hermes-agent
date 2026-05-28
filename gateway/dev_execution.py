@@ -22,6 +22,12 @@ from gateway.dev_worker_runtimes import (
 )
 from gateway.dev_control.runtime_policy_evidence import latest_runtime_policy_evidence
 from gateway.dev_control.runtime_selection import select_worker_runtime
+from gateway.dev_control.worker_output_contract import (
+    append_worker_output_contract,
+    output_contract_fields_from_event,
+    parse_worker_output_contract,
+    worker_output_contract_score,
+)
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -45,6 +51,7 @@ SUPERVISOR_APPROVAL_TTL_SECONDS = 24 * 60 * 60
 APPROVABLE_SUPERVISOR_ACTIONS = {"retry", "repair_retry", "reassign"}
 DEV_TEST_STATES = {"completed_ok", "completed_weak", "failed_repairable", "failed_unrepairable", "running"}
 DEFAULT_POLICY_PROFILE = "standard"
+DEV_PLAN_DRAFT_STATUSES = {"draft", "revision_requested", "approved_for_launch", "cancelled"}
 DEFAULT_SUPERVISOR_INTERVAL_SECONDS = 60
 DEFAULT_SUPERVISOR_LIMIT = 10
 MIN_SUPERVISOR_INTERVAL_SECONDS = 15
@@ -310,6 +317,46 @@ CREATE TABLE IF NOT EXISTS dev_execution_supervisor_loop_state (
     updated_at REAL NOT NULL,
     payload TEXT
 );
+
+CREATE TABLE IF NOT EXISTS dev_execution_plan_draft_reviews (
+    plan_id TEXT PRIMARY KEY,
+    plan_artifact_id TEXT NOT NULL,
+    build_id TEXT,
+    draft_status TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    revision_history TEXT NOT NULL,
+    source TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    approved_at REAL,
+    cancelled_at REAL,
+    payload TEXT,
+    FOREIGN KEY(plan_id) REFERENCES dev_execution_plans(plan_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dev_execution_plan_draft_reviews_artifact
+    ON dev_execution_plan_draft_reviews(plan_artifact_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS dev_execution_plan_launch_records (
+    launch_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    plan_artifact_id TEXT,
+    build_id TEXT,
+    draft_version INTEGER,
+    launch_scope TEXT NOT NULL,
+    requested_task_ids TEXT NOT NULL,
+    launched_task_ids TEXT NOT NULL,
+    failed_task_ids TEXT NOT NULL,
+    launched_count INTEGER NOT NULL,
+    failure_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    payload TEXT,
+    FOREIGN KEY(plan_id) REFERENCES dev_execution_plans(plan_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dev_execution_plan_launch_records_plan
+    ON dev_execution_plan_launch_records(plan_id, created_at DESC);
 """
 
 
@@ -584,7 +631,7 @@ def build_profiled_prompt(
             parts.extend(f"- {item}" for item in criteria)
         parts.append("")
     parts.append((prompt or "").strip())
-    return "\n".join(parts).strip()
+    return append_worker_output_contract("\n".join(parts).strip())
 
 
 def _runtime_label(runtime: Optional[str]) -> str:
@@ -809,6 +856,16 @@ class DevExecutionStore:
         ).fetchall()
         plan = dict(row)
         plan["tasks"] = [self._task_from_row(task_row) for task_row in task_rows]
+        if draft_review := self.get_draft_review(plan_id):
+            plan.update({
+                "draft_review": draft_review,
+                "draft_status": draft_review.get("draft_status"),
+                "draft_version": draft_review.get("version"),
+                "draft_plan_artifact_id": draft_review.get("plan_artifact_id"),
+                "draft_build_id": draft_review.get("build_id"),
+                "draft_approved_at": draft_review.get("approved_at"),
+                "draft_cancelled_at": draft_review.get("cancelled_at"),
+            })
         if latest_supervisor := self.latest_supervisor_record(plan_id):
             plan.update({
                 "supervisor_status": latest_supervisor.get("status"),
@@ -1005,6 +1062,145 @@ class DevExecutionStore:
                 return _resolved_runbook(runbook)
         return _builtin_runbook(policy_profile=DEFAULT_POLICY_PROFILE, source="global")
 
+    def create_draft_review(
+        self,
+        *,
+        plan_id: str,
+        plan_artifact_id: str,
+        build_id: Optional[str],
+        source: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        plan_id = str(plan_id or "").strip()
+        plan_artifact_id = str(plan_artifact_id or "").strip()
+        if not plan_id or not plan_artifact_id:
+            raise ValueError("plan_id and plan_artifact_id are required")
+        if not self.get_plan(plan_id):
+            raise KeyError(f"Dev execution plan not found: {plan_id}")
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO dev_execution_plan_draft_reviews (
+                    plan_id, plan_artifact_id, build_id, draft_status, version,
+                    revision_history, source, created_at, updated_at,
+                    approved_at, cancelled_at, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    plan_artifact_id = excluded.plan_artifact_id,
+                    build_id = excluded.build_id,
+                    draft_status = excluded.draft_status,
+                    version = excluded.version,
+                    revision_history = excluded.revision_history,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at,
+                    approved_at = excluded.approved_at,
+                    cancelled_at = excluded.cancelled_at,
+                    payload = excluded.payload
+                """,
+                (
+                    plan_id,
+                    plan_artifact_id,
+                    str(build_id).strip() if build_id else None,
+                    "draft",
+                    1,
+                    json.dumps([], ensure_ascii=False),
+                    source,
+                    now,
+                    now,
+                    None,
+                    None,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                ),
+            )
+        review = self.get_draft_review(plan_id)
+        if not review:
+            raise RuntimeError("Draft review record was not persisted")
+        return review
+
+    def get_draft_review(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM dev_execution_plan_draft_reviews WHERE plan_id = ?",
+            (str(plan_id or "").strip(),),
+        ).fetchone()
+        review = self._draft_review_from_row(row)
+        if review:
+            review["launch_records"] = self.list_launch_records(plan_id)
+        return review
+
+    def update_draft_review(self, plan_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        current = self.get_draft_review(plan_id)
+        if not current:
+            raise KeyError(f"Draft review not found for Dev execution plan: {plan_id}")
+        payload = {**current, **updates, "updated_at": time.time()}
+        status = str(payload.get("draft_status") or "").strip()
+        if status not in DEV_PLAN_DRAFT_STATUSES:
+            raise ValueError(f"Unsupported draft status: {status}")
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE dev_execution_plan_draft_reviews
+                SET plan_artifact_id = ?, build_id = ?, draft_status = ?,
+                    version = ?, revision_history = ?, source = ?,
+                    updated_at = ?, approved_at = ?, cancelled_at = ?, payload = ?
+                WHERE plan_id = ?
+                """,
+                (
+                    payload["plan_artifact_id"],
+                    payload.get("build_id"),
+                    status,
+                    int(payload.get("version") or 1),
+                    json.dumps(payload.get("revision_history") or [], ensure_ascii=False),
+                    payload.get("source"),
+                    float(payload["updated_at"]),
+                    payload.get("approved_at"),
+                    payload.get("cancelled_at"),
+                    json.dumps(payload.get("payload") or {}, ensure_ascii=False),
+                    plan_id,
+                ),
+            )
+        review = self.get_draft_review(plan_id)
+        if not review:
+            raise RuntimeError("Draft review record was not updated")
+        return review
+
+    def plan_has_launched_tasks(self, plan_id: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM dev_execution_plan_tasks
+            WHERE plan_id = ?
+              AND (
+                ao_session_id IS NOT NULL
+                OR LOWER(status) NOT IN ('planned')
+              )
+            """,
+            (str(plan_id or "").strip(),),
+        ).fetchone()
+        return bool(row and int(row["count"] or 0) > 0)
+
+    def replace_plan_tasks(self, *, plan_id: str, tasks: list[Dict[str, Any]]) -> Dict[str, Any]:
+        plan = self.get_plan(plan_id)
+        if not plan:
+            raise KeyError(f"Dev execution plan not found: {plan_id}")
+        if self.plan_has_launched_tasks(plan_id):
+            raise ValueError("Draft plan tasks cannot be revised after any task has launched")
+        now = time.time()
+        normalized_tasks = self._normalize_tasks(plan_id, tasks, now)
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM dev_execution_plan_tasks WHERE plan_id = ?", (plan_id,))
+            for task in normalized_tasks:
+                self._insert_task(task)
+            self._conn.execute(
+                """
+                UPDATE dev_execution_plans
+                SET status = ?, updated_at = ?
+                WHERE plan_id = ?
+                """,
+                ("planned", now, plan_id),
+            )
+        return self.get_plan(plan_id) or {**plan, "tasks": normalized_tasks}
+
     def update_task_launch(self, *, plan_id: str, task_id: str, ao_session_id: str, status: str = "launched") -> None:
         now = time.time()
         with self._lock, self._conn:
@@ -1024,6 +1220,98 @@ class DevExecutionStore:
                 """,
                 ("launched", now, plan_id),
             )
+
+    def append_launch_record(
+        self,
+        *,
+        plan_id: str,
+        draft_review: Dict[str, Any],
+        requested_task_ids: Optional[list[str]],
+        launched: list[Dict[str, Any]],
+        failures: list[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        plan_id = str(plan_id or "").strip()
+        requested = [str(task_id).strip() for task_id in (requested_task_ids or []) if str(task_id).strip()]
+        launched_task_ids = [
+            str(item.get("task_id") or "").strip()
+            for item in launched
+            if str(item.get("task_id") or "").strip()
+        ]
+        failed_task_ids = [
+            str(item.get("task_id") or "").strip()
+            for item in failures
+            if str(item.get("task_id") or "").strip()
+        ]
+        if not requested:
+            launch_scope = "all"
+        elif len(requested) == 1:
+            launch_scope = "smoke"
+        else:
+            launch_scope = "subset"
+        if launched_task_ids and failed_task_ids:
+            status = "partial"
+        elif launched_task_ids:
+            status = "succeeded"
+        elif failed_task_ids:
+            status = "failed"
+        else:
+            status = "noop"
+        launch_id = f"devlaunch-{uuid.uuid4().hex[:10]}"
+        created_at = time.time()
+        payload = {
+            "launched": launched,
+            "failures": failures,
+        }
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO dev_execution_plan_launch_records (
+                    launch_id, plan_id, plan_artifact_id, build_id, draft_version,
+                    launch_scope, requested_task_ids, launched_task_ids, failed_task_ids,
+                    launched_count, failure_count, status, created_at, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    launch_id,
+                    plan_id,
+                    draft_review.get("plan_artifact_id"),
+                    draft_review.get("build_id"),
+                    int(draft_review.get("version") or 1),
+                    launch_scope,
+                    json.dumps(requested, ensure_ascii=False),
+                    json.dumps(launched_task_ids, ensure_ascii=False),
+                    json.dumps(failed_task_ids, ensure_ascii=False),
+                    len(launched_task_ids),
+                    len(failed_task_ids),
+                    status,
+                    created_at,
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+        record = self.get_launch_record(launch_id)
+        if not record:
+            raise RuntimeError("Launch record was not persisted")
+        return record
+
+    def get_launch_record(self, launch_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM dev_execution_plan_launch_records WHERE launch_id = ?",
+            (str(launch_id or "").strip(),),
+        ).fetchone()
+        return self._launch_record_from_row(row)
+
+    def list_launch_records(self, plan_id: str, *, limit: int = 20) -> list[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM dev_execution_plan_launch_records
+            WHERE plan_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (str(plan_id or "").strip(), max(1, min(int(limit or 20), 100))),
+        ).fetchall()
+        return [record for row in rows if (record := self._launch_record_from_row(row))]
 
     def append_supervisor_record(
         self,
@@ -1537,6 +1825,43 @@ class DevExecutionStore:
             task["payload"] = {}
         return task
 
+    @staticmethod
+    def _draft_review_from_row(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        review = dict(row)
+        try:
+            review["revision_history"] = json.loads(review.get("revision_history") or "[]")
+        except Exception:
+            review["revision_history"] = []
+        try:
+            review["payload"] = json.loads(review.get("payload") or "{}")
+        except Exception:
+            review["payload"] = {}
+        review["version"] = int(review.get("version") or 1)
+        review["object"] = "hermes.dev_execution_plan_draft_review"
+        return review
+
+    @staticmethod
+    def _launch_record_from_row(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        record = dict(row)
+        for key in ("requested_task_ids", "launched_task_ids", "failed_task_ids"):
+            try:
+                record[key] = json.loads(record.get(key) or "[]")
+            except Exception:
+                record[key] = []
+        try:
+            record["payload"] = json.loads(record.get("payload") or "{}")
+        except Exception:
+            record["payload"] = {}
+        record["draft_version"] = int(record.get("draft_version") or 0) or None
+        record["launched_count"] = int(record.get("launched_count") or 0)
+        record["failure_count"] = int(record.get("failure_count") or 0)
+        record["object"] = "hermes.dev_execution_plan_launch_record"
+        return record
+
 
 def launch_execution_plan(
     *,
@@ -1549,6 +1874,11 @@ def launch_execution_plan(
     plan = store.get_plan(plan_id)
     if not plan:
         raise KeyError(f"Dev execution plan not found: {plan_id}")
+    draft_review = store.get_draft_review(plan_id)
+    if draft_review and draft_review.get("draft_status") != "approved_for_launch":
+        raise ValueError(
+            f"Artifact-created Dev execution plan draft is {draft_review.get('draft_status')}; approve draft before launch."
+        )
 
     from tools.ao_delegate_tool import _emit, _persist_start_event_direct, build_ao_worker_prompt
 
@@ -1771,11 +2101,22 @@ def launch_execution_plan(
             "launch_profile_id": metadata["launch_profile_id"],
         })
 
+    launch_record = None
+    if draft_review:
+        launch_record = store.append_launch_record(
+            plan_id=plan_id,
+            draft_review=draft_review,
+            requested_task_ids=task_ids,
+            launched=launched,
+            failures=failures,
+        )
+
     return {
         "ok": bool(launched),
         "plan": store.get_plan(plan_id),
         "launched": launched,
         "failures": failures,
+        "launch_record": launch_record,
     }
 
 
@@ -1879,9 +2220,25 @@ def synthesize_execution_plan(
         files = _list_unique((task.get("files_read") or []) + (task.get("files_written") or []))
         if files:
             report_lines.append(f"  Files: {', '.join(files[:8])}")
+        findings = task.get("findings") or []
+        if findings:
+            report_lines.append(f"  Findings: {'; '.join(str(item) for item in findings[:4])}")
+        changed = task.get("files_changed") or []
+        if changed:
+            report_lines.append(f"  Files changed: {', '.join(str(item) for item in changed[:8])}")
+        commands = task.get("commands_run") or []
+        if commands:
+            report_lines.append(f"  Commands: {'; '.join(str(item) for item in commands[:4])}")
         evidence = task.get("verification_evidence") or []
         if evidence:
-            report_lines.append(f"  Verification: {'; '.join(evidence[:4])}")
+            verification_status = task.get("verification_status")
+            label = f"Verification ({verification_status})" if verification_status else "Verification"
+            report_lines.append(f"  {label}: {'; '.join(str(item) for item in evidence[:4])}")
+        gaps = task.get("unresolved_gaps") or []
+        if gaps:
+            for gap in gaps:
+                unresolved_gaps.append(f"{task.get('goal') or task.get('task_id')}: {gap}")
+            report_lines.append(f"  Unresolved gaps: {'; '.join(str(item) for item in gaps[:4])}")
         if task_status in {"failed", "needs_review"} and not task.get("summary_warning"):
             unresolved_gaps.append(f"{task.get('goal') or task.get('task_id')}: {task.get('status_reason') or task_status}")
 
@@ -3602,7 +3959,7 @@ def _related_review_action_prompt(
         parts.extend(["", f"Requested model/agent preference: {model}"])
     if instruction:
         parts.extend(["", "Additional instruction:", instruction])
-    return "\n".join(part for part in parts if part is not None)
+    return append_worker_output_contract("\n".join(part for part in parts if part is not None))
 
 
 def _review_decision_from_status(
@@ -3823,18 +4180,42 @@ def _derive_task_status(task: Dict[str, Any], *, bridge: Any, event_store: Any =
         and not _summary_warning(goal_text, event_summary, "completed")
     ):
         summary = event_summary
-    summary_warning = _summary_warning(goal_text, summary, task_status)
+    contract_fields = output_contract_fields_from_event(latest_event)
+    if not contract_fields.get("output_contract_status"):
+        contract_text = "\n".join(
+            str(part or "")
+            for part in (
+                summary,
+                event_summary,
+                (latest_event or {}).get("output_tail"),
+            )
+        )
+        contract_fields = parse_worker_output_contract(contract_text)
+        marker = contract_fields.get("final_marker")
+        contract_fields["output_contract_score"] = worker_output_contract_score(contract_fields, required_marker=marker)
+    if contract_fields.get("structured_summary"):
+        summary = contract_fields["structured_summary"]
+    summary_for_warning = summary
+    if contract_fields.get("final_marker"):
+        summary_for_warning = f"{summary or ''}\n{contract_fields['final_marker']}"
+    summary_warning = _summary_warning(goal_text, summary_for_warning, task_status)
+    if (
+        task_status == "completed"
+        and contract_fields.get("unresolved_gaps")
+        and not summary_warning
+    ):
+        summary_warning = "Worker reported unresolved gaps in structured evidence."
     if task_status == "completed" and summary_warning:
         task_status = "needs_review"
         reason = summary_warning
 
     files_read = _list_unique(
-        (latest_event or {}).get("files_read") or []
+        (latest_event or {}).get("files_read") or contract_fields.get("files_read") or []
     )
     files_written = _list_unique(
-        (latest_event or {}).get("files_written") or []
+        (latest_event or {}).get("files_written") or contract_fields.get("files_changed") or []
     )
-    evidence = _verification_evidence(summary, task_events)
+    evidence = _list_unique((contract_fields.get("verification_evidence") or []) + _verification_evidence(summary, task_events))
     profile_payload = (task.get("payload") or {}).get("resolved_profile") or {}
     runtime_selection = _first_non_empty(
         (latest_event or {}).get("runtime_selection"),
@@ -3864,6 +4245,7 @@ def _derive_task_status(task: Dict[str, Any], *, bridge: Any, event_store: Any =
         "summary": summary,
         "summary_quality": "warning" if summary_warning else ("pending" if task_status in {"planned", "running", "launched"} else "ok"),
         "summary_warning": summary_warning,
+        **contract_fields,
         "runtime": runtime,
         "runtime_session_id": ao_session_id,
         "runtime_project_id": _first_non_empty(_session_attr(session, "project_id"), task.get("project_id"), (prompt_meta or {}).get("project_id")),
@@ -4014,6 +4396,10 @@ def _sync_completion_from_transcript(
         "acceptance_criteria": payload.get("acceptance_criteria") or task.get("acceptance_criteria") or [],
         "timestamp": time.time(),
     })
+    contract_fields = parse_worker_output_contract(transcript)
+    marker = contract_fields.get("final_marker") or (markers[0] if len(markers) == 1 else None)
+    contract_fields["output_contract_score"] = worker_output_contract_score(contract_fields, required_marker=marker)
+    payload.update(contract_fields)
     if (runtime or DEFAULT_RUNTIME) in {DEFAULT_RUNTIME, "fixture"}:
         payload["ao_session_id"] = task.get("ao_session_id")
         payload["ao_project_id"] = payload.get("ao_project_id") or task.get("project_id")

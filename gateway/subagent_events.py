@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from gateway.dev_control.events import normalize_subagent_event
+from gateway.dev_control.worker_output_contract import parse_worker_output_contract, worker_output_contract_score
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -80,6 +81,7 @@ class SubagentEventStore:
         self._conn.close()
 
     def append_event(self, payload: Dict[str, Any], *, session_id: Optional[str] = None) -> Dict[str, Any]:
+        payload = self._with_output_contract_fields(payload)
         event = normalize_subagent_event(payload, session_id=session_id)
         created_at = float(event["created_at"])
 
@@ -286,6 +288,41 @@ class SubagentEventStore:
         payload["event_id"] = int(row["event_id"])
         payload.setdefault("created_at", float(row["created_at"]))
         return payload
+
+    @staticmethod
+    def _with_output_contract_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+        event_type = str(payload.get("event") or "").lower()
+        if event_type != "subagent.complete" and str(payload.get("status") or "").lower() not in {"completed", "complete", "done", "success", "succeeded"}:
+            return payload
+        if payload.get("output_contract_status"):
+            return payload
+        text_parts = [
+            str(payload.get("summary") or ""),
+            str(payload.get("message") or ""),
+            str(payload.get("preview") or ""),
+        ]
+        output_tail = payload.get("output_tail")
+        if isinstance(output_tail, list):
+            text_parts.extend(str(item.get("text") if isinstance(item, dict) else item) for item in output_tail)
+        elif output_tail:
+            text_parts.append(str(output_tail))
+        parsed = parse_worker_output_contract("\n".join(text_parts))
+        marker = parsed.get("final_marker")
+        parsed["output_contract_score"] = worker_output_contract_score(parsed, required_marker=marker)
+        merged = dict(payload)
+        for key, value in parsed.items():
+            if key == "files_read" and merged.get("files_read"):
+                continue
+            if key == "files_changed":
+                merged.setdefault("files_changed", value)
+                merged.setdefault("files_written", value)
+                continue
+            if key == "verification_evidence" and merged.get("verification_evidence"):
+                continue
+            merged.setdefault(key, value)
+        if parsed.get("structured_summary") and not merged.get("summary"):
+            merged["summary"] = parsed["structured_summary"]
+        return merged
 
 
 def events_response(events: Iterable[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:

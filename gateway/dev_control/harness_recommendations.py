@@ -255,6 +255,9 @@ def _build_recommendations(report: Dict[str, Any], *, benchmark: Optional[Dict[s
     runtime_warning_rec = _recommend_runtime_warning_rate(report, benchmark=benchmark)
     if runtime_warning_rec:
         recommendations.append(runtime_warning_rec)
+    output_contract_rec = _recommend_output_contract_from_benchmark(report, benchmark)
+    if output_contract_rec:
+        recommendations.append(output_contract_rec)
     supervisor_rec = _recommend_supervisor_policy(report)
     if supervisor_rec:
         recommendations.append(supervisor_rec)
@@ -345,6 +348,42 @@ def _recommend_weak_summary(
             "Only propose runbook limit changes when repeated production weak summaries exceed the current follow-up budget."
         ),
         non_goals=["Do not recommend disabling OpenHands or AO from weak fixture summaries.", "Do not increase follow-up limits from fixture-only evidence."],
+    )
+
+
+def _recommend_output_contract_from_benchmark(
+    report: Dict[str, Any],
+    benchmark: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not benchmark:
+        return None
+    summary = benchmark.get("summary") or {}
+    score = _metric(summary, "median_output_contract_score")
+    if score >= 0.8:
+        return None
+    runtime_results = benchmark.get("runtime_results") or []
+    if not runtime_results:
+        return None
+    return _recommendation(
+        report=report,
+        category="prompt_template",
+        title="Improve Worker Output Contract v2 compliance before increasing automation",
+        priority="low" if score > 0 else "medium",
+        confidence=0.72,
+        impact="Structured evidence gives Hermes stronger review, supervisor, benchmark, and release-readiness inputs.",
+        risk="Low. This recommends prompt/parser hardening only and does not change routing policy.",
+        affected_components=["worker-contract-template", "summary-quality-classifier", "supervisor-review"],
+        evidence_refs=[],
+        reason=(
+            f"Benchmark {benchmark.get('benchmark_run_id')} reported median output contract score {score}. "
+            "Workers should return DEV_WORKER_EVIDENCE JSON consistently before Dev relies on higher automation."
+        ),
+        suggested_change="Tune worker prompts and parser tests until benchmark output_contract_score is consistently high.",
+        implementation_brief=(
+            "Run controlled AO/OpenHands read-only benchmarks and inspect malformed or missing DEV_WORKER_EVIDENCE blocks. "
+            "Keep this as evidence for prompt improvements, not runtime disabling."
+        ),
+        non_goals=["Do not mutate runtime policy from output-contract evidence alone.", "Do not auto-retry affected plans in this phase."],
     )
 
 
@@ -474,6 +513,7 @@ def _benchmark_runtime_reason(benchmark: Dict[str, Any], runtime_results: list[D
             f"{item.get('runtime')}: median score {item.get('median_score')}, "
             f"task quality {item.get('median_task_quality_score')}, "
             f"contract compliance {item.get('median_contract_compliance_score')}, "
+            f"output contract {item.get('median_output_contract_score')}, "
             f"marker pass rate {item.get('marker_pass_rate')}, "
             f"required evidence pass rate {item.get('required_evidence_pass_rate')}, "
             f"delivery failure rate {item.get('delivery_failure_rate')}, "

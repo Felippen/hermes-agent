@@ -46,6 +46,125 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
     return adapter
 
 
+def _fake_text_response(content: str):
+    message = type("Message", (), {"content": content})()
+    choice = type("Choice", (), {"message": message})()
+    return type("Response", (), {"choices": [choice]})()
+
+
+def _fake_clarification_response():
+    payload = {
+        "questions": [
+            {
+                "question_id": "q1",
+                "prompt": "What planning flow should this prioritize first?",
+                "recommended_option_id": "a",
+                "allow_freeform": True,
+                "reason": "Scope controls implementation risk.",
+                "options": [
+                    {"option_id": "a", "label": "Guided planning", "description": "Use it to turn vague briefs into structured plans."},
+                    {"option_id": "b", "label": "Dev questions", "description": "Use it mainly when Dev needs clarification."},
+                ],
+            },
+            {
+                "question_id": "q2",
+                "prompt": "Where should the first version appear?",
+                "recommended_option_id": "a",
+                "allow_freeform": True,
+                "reason": "The entry point affects state and UI scope.",
+                "options": [
+                    {"option_id": "a", "label": "Composer chip", "description": "Start from the main composer in Plan mode."},
+                    {"option_id": "b", "label": "Separate panel", "description": "Keep planning separate from chat."},
+                ],
+            },
+            {
+                "question_id": "q3",
+                "prompt": "What should completion produce?",
+                "recommended_option_id": "a",
+                "allow_freeform": True,
+                "reason": "Output scope prevents accidental execution.",
+                "options": [
+                    {"option_id": "a", "label": "Clarified brief", "description": "Produce a structured brief only."},
+                    {"option_id": "b", "label": "Execution plan", "description": "Draft a plan immediately."},
+                ],
+            },
+        ]
+    }
+    return _fake_text_response(json.dumps(payload))
+
+
+def _fake_plan_artifact_response(title: str = "Planning Mode Artifact"):
+    payload = {
+        "title": title,
+        "overview": "Create a durable planning artifact from the clarified vision.",
+        "product_intent": "Give Felipe a reviewable plan before build work starts.",
+        "scope": ["Render the artifact in the planning panel."],
+        "non_goals": ["Do not create or launch Dev execution plans."],
+        "assumptions": ["The clarification answers are the source of truth."],
+        "user_workflow": ["Felipe answers questions, reviews the artifact, then approves when ready."],
+        "implementation_slices": [
+            {"title": "Artifact storage", "description": "Persist generated plan artifacts and versions."},
+            {"title": "Planning panel", "description": "Show the latest artifact in the right-side panel."},
+        ],
+        "validation_slices": [
+            {"title": "No execution", "description": "Confirm no workers or Dev plans are created."},
+        ],
+        "acceptance_criteria": ["Artifact can be retrieved and approved without execution."],
+        "risks": ["The first artifact may still need human revision."],
+        "open_questions": [],
+        "recommended_next_action": "Review, revise if needed, then approve for Phase 29.",
+    }
+    return _fake_text_response(json.dumps(payload))
+
+
+def _fake_artifact_execution_tasks_response():
+    payload = {
+        "tasks": [
+            {
+                "goal": "Implement artifact storage",
+                "prompt": "Implement the approved artifact storage slice with validation evidence.",
+                "profile_id": "workspace.implement",
+                "project_id": "OrynWorkspace",
+                "permissions": "edit",
+                "dependencies": [],
+                "acceptance_criteria": ["Artifact storage works."],
+            },
+            {
+                "goal": "Validate planning panel",
+                "prompt": "Inspect the planning panel and report whether the artifact appears.",
+                "profile_id": "workspace.inspect",
+                "project_id": "OrynWorkspace",
+                "permissions": "read_only",
+                "dependencies": ["Implement artifact storage"],
+                "acceptance_criteria": ["Panel evidence is reported."],
+            },
+        ]
+    }
+    return _fake_text_response(json.dumps(payload))
+
+
+class _FakeRuntimeRouter:
+    def __init__(self):
+        self.spawned = []
+
+    def spawn(self, runtime: str, **kwargs):
+        index = len(self.spawned) + 1
+        session = AOSession(
+            id=f"oryn-workspace-test-{index}",
+            project_id=kwargs.get("project_id"),
+            status="running",
+            branch=f"session/oryn-workspace-test-{index}",
+            workspace_path=f"/tmp/oryn-workspace-test-{index}",
+            tmux_name=f"tmux-oryn-workspace-test-{index}",
+            agent=kwargs.get("agent") or "codex",
+            model=kwargs.get("model") or "gpt-5.5",
+            reasoning_effort=kwargs.get("reasoning_effort"),
+            open_command=f"tmux attach -t tmux-oryn-workspace-test-{index}",
+        )
+        self.spawned.append({"runtime": runtime, "kwargs": kwargs, "session": session})
+        return session
+
+
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -68,6 +187,20 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_post("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", adapter._handle_dev_harness_benchmark_detail)
+    app.router.add_get("/v1/dev/clarifications", adapter._handle_dev_clarifications)
+    app.router.add_post("/v1/dev/clarifications", adapter._handle_dev_clarifications)
+    app.router.add_get("/v1/dev/clarifications/{clarification_id}", adapter._handle_dev_clarification_detail)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/answer", adapter._handle_dev_clarification_answer)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/complete", adapter._handle_dev_clarification_complete)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/cancel", adapter._handle_dev_clarification_cancel)
+    app.router.add_get("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
+    app.router.add_post("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
+    app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}", adapter._handle_dev_plan_artifact_detail)
+    app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/revise", adapter._handle_dev_plan_artifact_revise)
+    app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/approve", adapter._handle_dev_plan_artifact_approve)
+    app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/cancel", adapter._handle_dev_plan_artifact_cancel)
+    app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan", adapter._handle_dev_plan_artifact_create_execution_plan)
+    app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}/builds", adapter._handle_dev_plan_artifact_builds)
     app.router.add_get("/v1/dev/runtimes/openhands/server", adapter._handle_dev_openhands_server_status)
     app.router.add_post("/v1/dev/runtimes/openhands/server/start", adapter._handle_dev_openhands_server_start)
     app.router.add_post("/v1/dev/runtimes/openhands/server/stop", adapter._handle_dev_openhands_server_stop)
@@ -85,6 +218,10 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/approve", adapter._handle_dev_supervisor_approval_approve)
     app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/deny", adapter._handle_dev_supervisor_approval_deny)
     app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/apply", adapter._handle_dev_supervisor_approval_apply)
+    app.router.add_get("/v1/dev/execution-plans/{plan_id}/draft-review", adapter._handle_dev_execution_plan_draft_review)
+    app.router.add_post("/v1/dev/execution-plans/{plan_id}/revise-draft", adapter._handle_dev_execution_plan_revise_draft)
+    app.router.add_post("/v1/dev/execution-plans/{plan_id}/approve-draft", adapter._handle_dev_execution_plan_approve_draft)
+    app.router.add_post("/v1/dev/execution-plans/{plan_id}/cancel-draft", adapter._handle_dev_execution_plan_cancel_draft)
     app.router.add_get("/v1/dev/execution-plans/{plan_id}", adapter._handle_dev_execution_plan_detail)
     app.router.add_get("/v1/dev/execution-plans/{plan_id}/status", adapter._handle_dev_execution_plan_status)
     app.router.add_post("/v1/dev/execution-plans/{plan_id}/synthesize", adapter._handle_dev_execution_plan_synthesize)
@@ -823,6 +960,578 @@ class TestRunEvents:
         assert data["runtime_policy_evidence"]["runtimes"]["openhands"]["sample_count"] == 6
 
     @pytest.mark.asyncio
+    async def test_dev_clarification_lifecycle_persists_answers_and_brief(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build an interactive planning mode for vague feature ideas.",
+                    "project_id": "OrynWorkspace",
+                    "session_id": "session-1",
+                })
+            assert start.status == 200
+            data = await start.json()
+
+            assert data["object"] == "hermes.dev_clarification"
+            assert data["status"] == "active"
+            assert len(data["questions"]) == 3
+            assert data["current_question"]["question_id"] == "q1"
+
+            first = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/answer", json={
+                "question_id": "q1",
+                "option_id": "a",
+            })
+            assert first.status == 200
+            first_data = await first.json()
+            assert first_data["current_question_index"] == 1
+            assert first_data["answers"][0]["option_label"] == "Guided planning"
+
+            second = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/answer", json={
+                "question_id": "q2",
+                "answer_text": "Use it for Dev planning first, then general agent questions.",
+            })
+            assert second.status == 200
+
+            complete = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/complete", json={})
+            assert complete.status == 200
+            completed = await complete.json()
+
+            assert completed["status"] == "completed"
+            assert completed["clarified_brief"]["refined_vision"].startswith("Build an interactive")
+            assert "Do not create or launch a Dev execution plan" in completed["clarified_brief"]["non_goals"][0]
+            assert adapter._dev_execution_store.list_plans(limit=10) == []
+
+            listed = await cli.get("/v1/dev/clarifications?status=completed")
+            assert listed.status == 200
+            listed_data = await listed.json()
+            assert listed_data["total"] == 1
+            assert listed_data["data"][0]["clarification_id"] == data["clarification_id"]
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_lifecycle_versions_and_approves_without_execution_plan(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build a durable planning artifact review flow.",
+                })
+            assert start.status == 200
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                answer = await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+                assert answer.status == 200
+
+            complete = await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            assert complete.status == 200
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                created_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            assert created_resp.status == 200
+            created = await created_resp.json()
+
+            assert created["object"] == "hermes.dev_plan_artifact"
+            assert created["status"] == "draft"
+            assert created["version"] == 1
+            assert created["source"] == "llm"
+            assert created["payload"]["implementation_slices"]
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response("Revised Planning Artifact")):
+                revised_resp = await cli.post(f"/v1/dev/plan-artifacts/{created['plan_artifact_id']}/revise", json={
+                    "feedback_instruction": "Make the panel workflow more explicit.",
+                })
+            assert revised_resp.status == 200
+            revised = await revised_resp.json()
+            assert revised["version"] == 2
+            assert revised["title"] == "Revised Planning Artifact"
+
+            old_resp = await cli.get(f"/v1/dev/plan-artifacts/{created['plan_artifact_id']}")
+            assert old_resp.status == 200
+            old = await old_resp.json()
+            assert old["status"] == "superseded"
+            assert old["superseded_by"] == revised["plan_artifact_id"]
+
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{revised['plan_artifact_id']}/approve", json={})
+            assert approved_resp.status == 200
+            approved = await approved_resp.json()
+            assert approved["status"] == "approved"
+            assert approved["approved_at"] is not None
+            assert adapter._dev_execution_store.list_plans(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_create_execution_plan_requires_approval(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact to Dev plan conversion.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+
+            build_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/create-execution-plan", json={})
+
+        assert build_resp.status == 400
+        assert adapter._dev_execution_store.list_plans(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_create_execution_plan_creates_planned_plan_and_build_record(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact to Dev plan conversion.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
+            approved = await approved_resp.json()
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response()):
+                build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
+            assert build_resp.status == 200
+            build = await build_resp.json()
+
+            builds_resp = await cli.get(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/builds")
+            assert builds_resp.status == 200
+            builds = await builds_resp.json()
+            draft_resp = await cli.get(f"/v1/dev/execution-plans/{build['plan_id']}/draft-review")
+            assert draft_resp.status == 200
+            draft = await draft_resp.json()
+            launch_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/launch", json={})
+            draft_approve_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/approve-draft", json={})
+            assert draft_approve_resp.status == 200
+            fake_router = _FakeRuntimeRouter()
+            with patch("gateway.dev_execution._ensure_runtime_router", return_value=fake_router):
+                approved_launch_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/launch", json={})
+            assert approved_launch_resp.status == 200
+            approved_launch = await approved_launch_resp.json()
+            launched_draft_resp = await cli.get(f"/v1/dev/execution-plans/{build['plan_id']}/draft-review")
+            assert launched_draft_resp.status == 200
+            launched_draft = await launched_draft_resp.json()
+
+        assert build["object"] == "hermes.dev_plan_artifact_build"
+        assert build["plan_artifact_id"] == approved["plan_artifact_id"]
+        assert build["status"] == "created"
+        assert build["source"] == "llm"
+        assert build["task_count"] == 2
+        assert build["plan"]["status"] == "planned"
+        assert build["plan"]["plan_id"] == build["plan_id"]
+        assert len(build["plan"]["tasks"]) == 2
+        assert build["plan"]["tasks"][0]["status"] == "planned"
+        assert build["plan"]["tasks"][0]["profile_id"] == "workspace.implement"
+        assert build["plan"]["tasks"][1]["profile_id"] == "workspace.inspect"
+        assert build["plan"]["tasks"][0].get("ao_session_id") is None
+        assert build["plan"]["tasks"][0].get("runtime_session_id") is None
+        assert "DEV_WORKER_EVIDENCE" in build["plan"]["tasks"][0]["prompt"]
+        assert builds["total"] == 1
+        assert builds["data"][0]["plan_id"] == build["plan_id"]
+        assert draft["draft_status"] == "draft"
+        assert draft["version"] == 1
+        assert draft["plan_artifact_id"] == approved["plan_artifact_id"]
+        assert draft["build_id"] == build["build_id"]
+        assert launch_resp.status == 400
+        assert approved_launch["ok"] is True
+        assert len(approved_launch["launched"]) == 2
+        assert approved_launch["launched"][0]["runtime"] == "ao"
+        assert approved_launch["launched"][0]["runtime_session_id"] == "oryn-workspace-test-1"
+        assert approved_launch["launch_record"]["plan_id"] == build["plan_id"]
+        assert approved_launch["launch_record"]["launch_scope"] == "all"
+        assert approved_launch["launch_record"]["requested_task_ids"] == []
+        assert approved_launch["launch_record"]["launched_count"] == 2
+        assert approved_launch["launch_record"]["failure_count"] == 0
+        assert approved_launch["plan"]["status"] == "launched"
+        assert approved_launch["plan"]["tasks"][0]["status"] == "launched"
+        assert launched_draft["launch_records"][0]["launch_id"] == approved_launch["launch_record"]["launch_id"]
+        events = SubagentEventStore(db_path).list_events(limit=10)
+        assert [event["event"] for event in events].count("subagent.start") == 2
+
+    @pytest.mark.asyncio
+    async def test_dev_execution_plan_draft_launch_records_smoke_subset(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact smoke launch record.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
+            approved = await approved_resp.json()
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response()):
+                build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
+            build = await build_resp.json()
+            task_id = build["plan"]["tasks"][0]["task_id"]
+
+            approve_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/approve-draft", json={})
+            assert approve_resp.status == 200
+            fake_router = _FakeRuntimeRouter()
+            with patch("gateway.dev_execution._ensure_runtime_router", return_value=fake_router):
+                launch_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/launch", json={
+                    "task_ids": [task_id],
+                })
+            assert launch_resp.status == 200
+            launch = await launch_resp.json()
+            draft_resp = await cli.get(f"/v1/dev/execution-plans/{build['plan_id']}/draft-review")
+            draft = await draft_resp.json()
+
+        assert launch["launch_record"]["launch_scope"] == "smoke"
+        assert launch["launch_record"]["requested_task_ids"] == [task_id]
+        assert launch["launch_record"]["launched_task_ids"] == [task_id]
+        assert launch["launch_record"]["failed_task_ids"] == []
+        assert launch["launch_record"]["launched_count"] == 1
+        assert launch["launch_record"]["failure_count"] == 0
+        assert draft["launch_records"][0]["launch_id"] == launch["launch_record"]["launch_id"]
+        assert draft["plan"]["tasks"][0]["status"] == "launched"
+        assert draft["plan"]["tasks"][1]["status"] == "planned"
+
+    @pytest.mark.asyncio
+    async def test_dev_execution_plan_draft_can_revise_and_approve_without_launch(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact draft review.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
+            approved = await approved_resp.json()
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response()):
+                build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
+            build = await build_resp.json()
+
+            revised_payload = {
+                "tasks": [
+                    {
+                        "goal": "Implement only the review gate",
+                        "prompt": "Reduce the draft to the review gate only.",
+                        "profile_id": "workspace.implement",
+                        "project_id": "OrynWorkspace",
+                        "permissions": "edit",
+                        "dependencies": [],
+                        "acceptance_criteria": ["Review gate is visible."],
+                    }
+                ]
+            }
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_text_response(json.dumps(revised_payload))):
+                revise_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/revise-draft", json={
+                    "feedback_instruction": "Reduce to one task focused on the review gate.",
+                })
+            assert revise_resp.status == 200
+            revised = await revise_resp.json()
+            approve_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/approve-draft", json={})
+            assert approve_resp.status == 200
+            draft_approved = await approve_resp.json()
+
+        assert revised["draft_status"] == "revision_requested"
+        assert revised["version"] == 2
+        assert len(revised["revision_history"]) == 1
+        assert len(revised["plan"]["tasks"]) == 1
+        assert revised["plan"]["tasks"][0]["goal"] == "Implement only the review gate"
+        assert "DEV_WORKER_EVIDENCE" in revised["plan"]["tasks"][0]["prompt"]
+        assert draft_approved["draft_status"] == "approved_for_launch"
+        assert draft_approved["approved_at"] is not None
+        assert SubagentEventStore(db_path).list_events(limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_dev_execution_plan_draft_revise_falls_back_when_llm_invalid(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact draft review fallback.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
+            approved = await approved_resp.json()
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response()):
+                build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
+            build = await build_resp.json()
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", side_effect=[
+                _fake_text_response("not json"),
+                _fake_text_response('{"tasks":[{"goal":"broken"'),
+            ]):
+                revise_resp = await cli.post(f"/v1/dev/execution-plans/{build['plan_id']}/revise-draft", json={
+                    "feedback": "Make fallback deterministic.",
+                })
+            assert revise_resp.status == 200
+            revised = await revise_resp.json()
+
+        assert revised["source"] == "fallback"
+        assert revised["version"] == 2
+        assert "LLM task drafting failed" in revised["payload"]["draft_warning"]
+        assert len(revised["plan"]["tasks"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_create_execution_plan_falls_back_when_task_llm_invalid(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build artifact to Dev plan conversion with fallback.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
+                artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            artifact = await artifact_resp.json()
+            approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
+            approved = await approved_resp.json()
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", side_effect=[
+                _fake_text_response("not json"),
+                _fake_text_response('{"tasks":[{"goal":"broken"'),
+            ]):
+                build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
+            assert build_resp.status == 200
+            build = await build_resp.json()
+
+        assert build["source"] == "fallback"
+        assert "LLM task drafting failed" in build["payload"]["draft_warning"]
+        assert build["task_count"] == 3
+        assert [task["profile_id"] for task in build["plan"]["tasks"]] == [
+            "workspace.implement",
+            "workspace.implement",
+            "workspace.inspect",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_rejects_incomplete_clarification(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build a planning artifact.",
+                })
+            clarification = await start.json()
+            created_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                "clarification_id": clarification["clarification_id"],
+            })
+
+        assert created_resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_falls_back_when_llm_output_invalid(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build a planning artifact fallback.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            with patch("gateway.dev_control.plan_artifacts.call_llm", side_effect=[
+                _fake_text_response("not json"),
+                _fake_text_response('{"title":"broken"'),
+            ]):
+                created_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            assert created_resp.status == 200
+            created = await created_resp.json()
+
+        assert created["source"] == "fallback"
+        assert "LLM plan artifact generation failed" in created["warning"]
+        assert created["payload"]["implementation_slices"]
+
+    @pytest.mark.asyncio
+    async def test_dev_plan_artifact_derives_missing_llm_title(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Build a planning artifact with a recovered title.",
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+
+            payload = json.loads(_fake_plan_artifact_response("Ignored").choices[0].message.content)
+            payload.pop("title", None)
+            payload["overview"] = "Create a release gate that only offers publish when checks pass."
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_text_response(json.dumps(payload))):
+                created_resp = await cli.post("/v1/dev/plan-artifacts", json={
+                    "clarification_id": clarification["clarification_id"],
+                })
+            assert created_resp.status == 200
+            created = await created_resp.json()
+
+        assert created["source"] == "llm"
+        assert created.get("warning") is None
+        assert created["title"] == "a release gate that only offers publish when checks pass"
+        assert created["payload"]["title"] == created["title"]
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_invalid_llm_json_retries_once(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", side_effect=[
+                _fake_text_response("not json"),
+                _fake_clarification_response(),
+            ]) as call_mock:
+                resp = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Clarify a benchmark improvement idea.",
+                })
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["status"] == "active"
+        assert len(data["questions"]) == 3
+        assert call_mock.call_args_list[0].kwargs["extra_body"]["response_format"]["type"] == "json_schema"
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_retries_without_schema_mode_when_provider_rejects_it(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", side_effect=[
+                RuntimeError("unsupported response_format json_schema"),
+                _fake_clarification_response(),
+            ]) as call_mock:
+                resp = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Clarify a planning-mode improvement idea.",
+                })
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["status"] == "active"
+        assert data["generation_mode"] == "llm"
+        assert call_mock.call_count == 2
+        assert "extra_body" in call_mock.call_args_list[0].kwargs
+        assert "extra_body" not in call_mock.call_args_list[1].kwargs
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_uses_fallback_questions_when_llm_json_remains_invalid(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", side_effect=[
+                _fake_text_response("not json"),
+                _fake_text_response('{"questions":[{"question_id":"q1","prompt":"broken"'),
+            ]):
+                resp = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Clarify a planning-mode improvement idea.",
+                })
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["status"] == "active"
+        assert data["generation_mode"] == "fallback"
+        assert "LLM question generation failed" in data["warning"]
+        assert len(data["questions"]) == 5
+        assert data["current_question"]["question_id"] == "q1"
+
+    @pytest.mark.asyncio
     async def test_dev_runtime_selection_falls_back_when_openhands_benchmark_degraded(self, adapter, tmp_path):
         db_path = tmp_path / "state.db"
         adapter._dev_execution_store = DevExecutionStore(db_path)
@@ -1267,7 +1976,8 @@ class TestRunEvents:
         assert ao["status"] == "completed"
         assert ao["marker_score"] == 1.0
         assert ao["delivery_score"] == 1.0
-        assert ao["contract_compliance_score"] == 0.5
+        assert ao["contract_compliance_score"] == 0.333
+        assert ao["output_contract_score"] == 0.0
         assert "WorkspaceAgentBoardView" in ao["evidence_terms_matched"]
         assert "WorkspaceAgentBoardView" in ao["required_evidence_terms_matched"]
         assert ao["required_evidence_score"] == 1.0
@@ -1371,7 +2081,8 @@ class TestRunEvents:
         assert structured_without_marker["strong_evidence_terms_matched"] == []
         assert structured_without_marker["required_evidence_score"] == 0.0
         assert structured_without_marker["specificity_score"] <= 0.55
-        assert structured_without_marker["contract_compliance_score"] == 0.5
+        assert structured_without_marker["contract_compliance_score"] == 0.333
+        assert structured_without_marker["output_contract_score"] == 0.0
         assert specific_without_marker["specificity_score"] > structured_without_marker["specificity_score"]
         assert specific_without_marker["required_evidence_score"] == 1.0
         assert "WorkspaceAgentBoardView" in specific_without_marker["required_evidence_terms_matched"]
@@ -1618,6 +2329,14 @@ class TestRunEvents:
         assert "Keep AO preferred for read-only inspection" in runtime_recs[0]["suggested_change"]
         assert "Require more benchmark samples" in runtime_recs[0]["implementation_brief"]
         assert "Do not mutate runtime policy" in runtime_recs[0]["non_goals"][0]
+        output_contract_recs = [
+            item for item in rec["recommendations"]
+            if item["category"] == "prompt_template"
+            and "Worker Output Contract v2" in item["title"]
+        ]
+        assert output_contract_recs
+        assert "median output contract score" in output_contract_recs[0]["reason"]
+        assert "Do not mutate runtime policy" in output_contract_recs[0]["non_goals"][0]
 
     def test_benchmark_policy_posture_can_recommend_read_only_openhands_watch(self):
         from gateway.dev_control.harness_recommendations import _benchmark_runtime_policy_posture

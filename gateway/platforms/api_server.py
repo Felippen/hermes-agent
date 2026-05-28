@@ -94,6 +94,30 @@ from gateway.dev_control.harness_recommendations import (
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
 )
+from gateway.dev_control.clarifications import (
+    DevClarificationStore,
+    answer_clarification,
+    cancel_clarification,
+    complete_clarification,
+    get_clarification,
+    list_clarifications,
+    start_clarification,
+)
+from gateway.dev_control.plan_artifacts import (
+    DevPlanArtifactStore,
+    approve_execution_plan_draft,
+    approve_plan_artifact,
+    cancel_execution_plan_draft,
+    cancel_plan_artifact,
+    create_execution_plan_from_artifact,
+    create_plan_artifact,
+    get_execution_plan_draft_review,
+    get_plan_artifact,
+    list_plan_artifact_builds,
+    list_plan_artifacts,
+    revise_execution_plan_draft,
+    revise_plan_artifact,
+)
 from gateway.dev_control.read_models import (
     build_agent_board_response,
     build_agent_board_rows,
@@ -867,6 +891,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._subagent_event_store: Optional[SubagentEventStore] = None
         self._dev_execution_store: Optional[DevExecutionStore] = None
+        self._dev_clarification_store: Optional[DevClarificationStore] = None
+        self._dev_plan_artifact_store: Optional[DevPlanArtifactStore] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
 
@@ -1871,6 +1897,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 "dev_harness_recommendation_runs": {"method": "GET", "path": "/v1/dev/harness/recommendations"},
                 "dev_harness_benchmark": {"method": "POST", "path": "/v1/dev/harness/benchmarks"},
                 "dev_harness_benchmark_runs": {"method": "GET", "path": "/v1/dev/harness/benchmarks"},
+                "dev_clarifications": {"method": "GET", "path": "/v1/dev/clarifications"},
+                "dev_start_clarification": {"method": "POST", "path": "/v1/dev/clarifications"},
+                "dev_answer_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/answer"},
+                "dev_complete_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/complete"},
+                "dev_cancel_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/cancel"},
+                "dev_plan_artifacts": {"method": "GET", "path": "/v1/dev/plan-artifacts"},
+                "dev_create_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts"},
+                "dev_revise_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/revise"},
+                "dev_approve_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/approve"},
+                "dev_cancel_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/cancel"},
+                "dev_create_execution_plan_from_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan"},
+                "dev_plan_artifact_builds": {"method": "GET", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/builds"},
+                "dev_execution_plan_draft_review": {"method": "GET", "path": "/v1/dev/execution-plans/{plan_id}/draft-review"},
+                "dev_revise_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/revise-draft"},
+                "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
+                "dev_cancel_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/cancel-draft"},
                 "kanban_board": {"method": "GET", "path": "/v1/kanban/board"},
                 "kanban_events": {"method": "GET", "path": "/v1/kanban/events"},
             },
@@ -6175,6 +6217,398 @@ class APIServerAdapter(BasePlatformAdapter):
             **result,
         })
 
+    def _ensure_dev_clarification_store(self) -> Optional[DevClarificationStore]:
+        """Create the Dev clarification store on the same state.db as execution plans."""
+        if self._dev_clarification_store is not None:
+            return self._dev_clarification_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_clarification_store = DevClarificationStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev clarification store unavailable: %s", exc)
+            return None
+        return self._dev_clarification_store
+
+    def _ensure_dev_plan_artifact_store(self) -> Optional[DevPlanArtifactStore]:
+        """Create the Dev plan artifact store on the same state.db as execution plans."""
+        if self._dev_plan_artifact_store is not None:
+            return self._dev_plan_artifact_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_plan_artifact_store = DevPlanArtifactStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev plan artifact store unavailable: %s", exc)
+            return None
+        return self._dev_plan_artifact_store
+
+    async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        if request.method == "GET":
+            result = list_clarifications(
+                store=store,
+                project_id=request.rel_url.query.get("project_id") or None,
+                session_id=request.rel_url.query.get("session_id") or None,
+                status=request.rel_url.query.get("status") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = start_clarification(
+                store=store,
+                vision_brief=body.get("vision_brief") or body.get("brief") or "",
+                project_id=body.get("project_id") or "OrynWorkspace",
+                session_id=body.get("session_id"),
+                max_questions=body.get("max_questions") or 5,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev clarification start failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/clarifications/{clarification_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            result = get_clarification(store=store, clarification_id=request.match_info["clarification_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_answer(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/answer."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = answer_clarification(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+                question_id=body.get("question_id"),
+                option_id=body.get("option_id"),
+                answer_text=body.get("answer_text"),
+                skipped=_coerce_request_bool(body.get("skipped"), default=False),
+                back=_coerce_request_bool(body.get("back"), default=False),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_complete(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/complete."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            result = complete_clarification(store=store, clarification_id=request.match_info["clarification_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_cancel(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/cancel."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = cancel_clarification(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+                reason=body.get("reason"),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifacts(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/plan-artifacts — list or create durable planning artifacts."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        clarification_store = self._ensure_dev_clarification_store()
+        if store is None or clarification_store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        if request.method == "GET":
+            result = list_plan_artifacts(
+                store=store,
+                clarification_id=request.rel_url.query.get("clarification_id") or None,
+                project_id=request.rel_url.query.get("project_id") or None,
+                status=request.rel_url.query.get("status") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = create_plan_artifact(
+                store=store,
+                clarification_store=clarification_store,
+                clarification_id=body.get("clarification_id") or "",
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev plan artifact creation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/plan-artifacts/{plan_artifact_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            result = get_plan_artifact(store=store, plan_artifact_id=request.match_info["plan_artifact_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_revise(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/plan-artifacts/{plan_artifact_id}/revise."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        clarification_store = self._ensure_dev_clarification_store()
+        if store is None or clarification_store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = revise_plan_artifact(
+                store=store,
+                clarification_store=clarification_store,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+                feedback=body.get("feedback_instruction") or body.get("feedback") or "",
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev plan artifact revision failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_approve(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/plan-artifacts/{plan_artifact_id}/approve."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            result = approve_plan_artifact(store=store, plan_artifact_id=request.match_info["plan_artifact_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_cancel(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/plan-artifacts/{plan_artifact_id}/cancel."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = cancel_plan_artifact(
+                store=store,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+                reason=body.get("reason"),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_create_execution_plan(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        artifact_store = self._ensure_dev_plan_artifact_store()
+        execution_store = self._ensure_dev_execution_store()
+        if artifact_store is None or execution_store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            result = create_execution_plan_from_artifact(
+                artifact_store=artifact_store,
+                execution_store=execution_store,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev plan artifact build failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_plan_artifact_builds(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/plan-artifacts/{plan_artifact_id}/builds."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_plan_artifact_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        try:
+            result = list_plan_artifact_builds(
+                store=store,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+                limit=request.rel_url.query.get("limit") or 25,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_draft_review(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/execution-plans/{plan_id}/draft-review."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev execution store unavailable"}}, status=503)
+        try:
+            result = get_execution_plan_draft_review(
+                execution_store=store,
+                plan_id=request.match_info["plan_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_revise_draft(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/revise-draft."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        artifact_store = self._ensure_dev_plan_artifact_store()
+        execution_store = self._ensure_dev_execution_store()
+        if artifact_store is None or execution_store is None:
+            return web.json_response({"error": {"message": "Dev draft review store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = revise_execution_plan_draft(
+                artifact_store=artifact_store,
+                execution_store=execution_store,
+                plan_id=request.match_info["plan_id"],
+                feedback=body.get("feedback_instruction") or body.get("feedback") or "",
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev draft revision failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_approve_draft(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/approve-draft."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev execution store unavailable"}}, status=503)
+        try:
+            result = approve_execution_plan_draft(
+                execution_store=store,
+                plan_id=request.match_info["plan_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_execution_plan_cancel_draft(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/execution-plans/{plan_id}/cancel-draft."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_execution_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev execution store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = cancel_execution_plan_draft(
+                execution_store=store,
+                plan_id=request.match_info["plan_id"],
+                reason=body.get("reason"),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
     async def _handle_dev_harness_components(self, request: "web.Request") -> "web.Response":
         """GET /v1/dev/harness/components — list active Dev harness components."""
         auth_err = self._check_auth(request)
@@ -6441,6 +6875,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -6462,6 +6898,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -6494,6 +6932,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -6898,6 +7338,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -7660,6 +8102,20 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/dev/harness/benchmarks", self._handle_dev_harness_benchmarks)
             self._app.router.add_post("/v1/dev/harness/benchmarks", self._handle_dev_harness_benchmarks)
             self._app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", self._handle_dev_harness_benchmark_detail)
+            self._app.router.add_get("/v1/dev/clarifications", self._handle_dev_clarifications)
+            self._app.router.add_post("/v1/dev/clarifications", self._handle_dev_clarifications)
+            self._app.router.add_get("/v1/dev/clarifications/{clarification_id}", self._handle_dev_clarification_detail)
+            self._app.router.add_post("/v1/dev/clarifications/{clarification_id}/answer", self._handle_dev_clarification_answer)
+            self._app.router.add_post("/v1/dev/clarifications/{clarification_id}/complete", self._handle_dev_clarification_complete)
+            self._app.router.add_post("/v1/dev/clarifications/{clarification_id}/cancel", self._handle_dev_clarification_cancel)
+            self._app.router.add_get("/v1/dev/plan-artifacts", self._handle_dev_plan_artifacts)
+            self._app.router.add_post("/v1/dev/plan-artifacts", self._handle_dev_plan_artifacts)
+            self._app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}", self._handle_dev_plan_artifact_detail)
+            self._app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/revise", self._handle_dev_plan_artifact_revise)
+            self._app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/approve", self._handle_dev_plan_artifact_approve)
+            self._app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/cancel", self._handle_dev_plan_artifact_cancel)
+            self._app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan", self._handle_dev_plan_artifact_create_execution_plan)
+            self._app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}/builds", self._handle_dev_plan_artifact_builds)
             self._app.router.add_get("/v1/dev/runtimes/openhands/server", self._handle_dev_openhands_server_status)
             self._app.router.add_post("/v1/dev/runtimes/openhands/server/start", self._handle_dev_openhands_server_start)
             self._app.router.add_post("/v1/dev/runtimes/openhands/server/stop", self._handle_dev_openhands_server_stop)
@@ -7677,6 +8133,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/approve", self._handle_dev_supervisor_approval_approve)
             self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/deny", self._handle_dev_supervisor_approval_deny)
             self._app.router.add_post("/v1/dev/supervisor/approvals/{approval_id}/apply", self._handle_dev_supervisor_approval_apply)
+            self._app.router.add_get("/v1/dev/execution-plans/{plan_id}/draft-review", self._handle_dev_execution_plan_draft_review)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/revise-draft", self._handle_dev_execution_plan_revise_draft)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/approve-draft", self._handle_dev_execution_plan_approve_draft)
+            self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/cancel-draft", self._handle_dev_execution_plan_cancel_draft)
             self._app.router.add_get("/v1/dev/execution-plans/{plan_id}", self._handle_dev_execution_plan_detail)
             self._app.router.add_get("/v1/dev/execution-plans/{plan_id}/status", self._handle_dev_execution_plan_status)
             self._app.router.add_post("/v1/dev/execution-plans/{plan_id}/synthesize", self._handle_dev_execution_plan_synthesize)
