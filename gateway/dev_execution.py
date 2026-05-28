@@ -822,16 +822,30 @@ class DevExecutionStore:
                 )
         return self.get_plan(plan_id) or {"plan_id": plan_id, "title": title, "tasks": normalized_tasks}
 
-    def list_plans(self, *, limit: int = 50) -> list[Dict[str, Any]]:
-        rows = self._conn.execute(
-            """
-            SELECT plan_id
-            FROM dev_execution_plans
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (max(1, min(int(limit or 50), 200)),),
-        ).fetchall()
+    def list_plans(self, *, limit: int = 50, project_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        project_id = str(project_id or "").strip()
+        if project_id:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT p.plan_id, p.updated_at
+                FROM dev_execution_plans p
+                JOIN dev_execution_plan_tasks t ON t.plan_id = p.plan_id
+                WHERE t.project_id = ?
+                ORDER BY p.updated_at DESC
+                LIMIT ?
+                """,
+                (project_id, max(1, min(int(limit or 50), 200))),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT plan_id
+                FROM dev_execution_plans
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit or 50), 200)),),
+            ).fetchall()
         return [plan for row in rows if (plan := self.get_plan(row["plan_id"]))]
 
     def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:

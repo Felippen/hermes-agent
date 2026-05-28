@@ -117,14 +117,14 @@ def _fake_plan_artifact_response(title: str = "Planning Mode Artifact"):
     return _fake_text_response(json.dumps(payload))
 
 
-def _fake_artifact_execution_tasks_response():
+def _fake_artifact_execution_tasks_response(project_id: str = "OrynWorkspace"):
     payload = {
         "tasks": [
             {
                 "goal": "Implement artifact storage",
                 "prompt": "Implement the approved artifact storage slice with validation evidence.",
                 "profile_id": "workspace.implement",
-                "project_id": "OrynWorkspace",
+                "project_id": project_id,
                 "permissions": "edit",
                 "dependencies": [],
                 "acceptance_criteria": ["Artifact storage works."],
@@ -133,7 +133,7 @@ def _fake_artifact_execution_tasks_response():
                 "goal": "Validate planning panel",
                 "prompt": "Inspect the planning panel and report whether the artifact appears.",
                 "profile_id": "workspace.inspect",
-                "project_id": "OrynWorkspace",
+                "project_id": project_id,
                 "permissions": "read_only",
                 "dependencies": ["Implement artifact storage"],
                 "acceptance_criteria": ["Panel evidence is reported."],
@@ -965,19 +965,32 @@ class TestRunEvents:
         app = _create_runs_app(adapter)
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+            project_context = {
+                "project_id": "OrynWorkspace",
+                "project_name": "Oryn Workspace",
+                "vision": "Make Oryn a self-running development system.",
+                "coordinator_profile": "dev",
+                "repositories": [{"label": "Workspace", "path": "/Users/felipe/projects/Oryn"}],
+                "work_items": ["Thread project planning context"],
+            }
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()) as call_mock:
                 start = await cli.post("/v1/dev/clarifications", json={
                     "vision_brief": "Build an interactive planning mode for vague feature ideas.",
                     "project_id": "OrynWorkspace",
                     "session_id": "session-1",
+                    "project_context": project_context,
                 })
             assert start.status == 200
             data = await start.json()
 
             assert data["object"] == "hermes.dev_clarification"
             assert data["status"] == "active"
+            assert data["project_id"] == "OrynWorkspace"
+            assert data["project_context"]["project_name"] == "Oryn Workspace"
+            assert data["project_context"]["repositories"][0]["path"] == "/Users/felipe/projects/Oryn"
             assert len(data["questions"]) == 3
             assert data["current_question"]["question_id"] == "q1"
+            assert "Oryn Workspace" in call_mock.call_args.kwargs["messages"][1]["content"]
 
             first = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/answer", json={
                 "question_id": "q1",
@@ -1001,6 +1014,7 @@ class TestRunEvents:
             assert completed["status"] == "completed"
             assert completed["clarified_brief"]["refined_vision"].startswith("Build an interactive")
             assert "Do not create or launch a Dev execution plan" in completed["clarified_brief"]["non_goals"][0]
+            assert "Project: Oryn Workspace" in completed["clarified_brief"]["assumptions"]
             assert adapter._dev_execution_store.list_plans(limit=10) == []
 
             listed = await cli.get("/v1/dev/clarifications?status=completed")
@@ -1008,6 +1022,12 @@ class TestRunEvents:
             listed_data = await listed.json()
             assert listed_data["total"] == 1
             assert listed_data["data"][0]["clarification_id"] == data["clarification_id"]
+            project_listed = await cli.get("/v1/dev/clarifications?project_id=OrynWorkspace")
+            other_project_listed = await cli.get("/v1/dev/clarifications?project_id=OtherProject")
+            assert project_listed.status == 200
+            assert other_project_listed.status == 200
+            assert (await project_listed.json())["total"] == 1
+            assert (await other_project_listed.json())["total"] == 0
 
     @pytest.mark.asyncio
     async def test_dev_plan_artifact_lifecycle_versions_and_approves_without_execution_plan(self, adapter, tmp_path):
@@ -1106,6 +1126,12 @@ class TestRunEvents:
             with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
                 start = await cli.post("/v1/dev/clarifications", json={
                     "vision_brief": "Build artifact to Dev plan conversion.",
+                    "project_id": "OrynPlatform",
+                    "project_context": {
+                        "project_id": "OrynPlatform",
+                        "project_name": "Oryn Platform",
+                        "vision": "Keep platform work isolated from workspace work.",
+                    },
                 })
             clarification = await start.json()
             for question in clarification["questions"]:
@@ -1123,7 +1149,7 @@ class TestRunEvents:
             approved_resp = await cli.post(f"/v1/dev/plan-artifacts/{artifact['plan_artifact_id']}/approve", json={})
             approved = await approved_resp.json()
 
-            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response()):
+            with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_artifact_execution_tasks_response("OrynPlatform")):
                 build_resp = await cli.post(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/create-execution-plan", json={})
             assert build_resp.status == 200
             build = await build_resp.json()
@@ -1131,6 +1157,14 @@ class TestRunEvents:
             builds_resp = await cli.get(f"/v1/dev/plan-artifacts/{approved['plan_artifact_id']}/builds")
             assert builds_resp.status == 200
             builds = await builds_resp.json()
+            artifact_list_resp = await cli.get("/v1/dev/plan-artifacts?project_id=OrynPlatform")
+            other_artifact_list_resp = await cli.get("/v1/dev/plan-artifacts?project_id=OrynWorkspace")
+            plans_for_project_resp = await cli.get("/v1/dev/execution-plans?project_id=OrynPlatform")
+            plans_for_other_project_resp = await cli.get("/v1/dev/execution-plans?project_id=OrynWorkspace")
+            artifact_list = await artifact_list_resp.json()
+            other_artifact_list = await other_artifact_list_resp.json()
+            plans_for_project = await plans_for_project_resp.json()
+            plans_for_other_project = await plans_for_other_project_resp.json()
             draft_resp = await cli.get(f"/v1/dev/execution-plans/{build['plan_id']}/draft-review")
             assert draft_resp.status == 200
             draft = await draft_resp.json()
@@ -1151,9 +1185,11 @@ class TestRunEvents:
         assert build["status"] == "created"
         assert build["source"] == "llm"
         assert build["task_count"] == 2
+        assert approved["project_id"] == "OrynPlatform"
         assert build["plan"]["status"] == "planned"
         assert build["plan"]["plan_id"] == build["plan_id"]
         assert len(build["plan"]["tasks"]) == 2
+        assert {task["project_id"] for task in build["plan"]["tasks"]} == {"OrynPlatform"}
         assert build["plan"]["tasks"][0]["status"] == "planned"
         assert build["plan"]["tasks"][0]["profile_id"] == "workspace.implement"
         assert build["plan"]["tasks"][1]["profile_id"] == "workspace.inspect"
@@ -1162,6 +1198,10 @@ class TestRunEvents:
         assert "DEV_WORKER_EVIDENCE" in build["plan"]["tasks"][0]["prompt"]
         assert builds["total"] == 1
         assert builds["data"][0]["plan_id"] == build["plan_id"]
+        assert artifact_list["total"] == 1
+        assert other_artifact_list["total"] == 0
+        assert plans_for_project["total"] == 1
+        assert plans_for_other_project["total"] == 0
         assert draft["draft_status"] == "draft"
         assert draft["version"] == 1
         assert draft["plan_artifact_id"] == approved["plan_artifact_id"]

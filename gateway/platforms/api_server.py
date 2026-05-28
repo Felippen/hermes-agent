@@ -6098,7 +6098,7 @@ class APIServerAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 return False
         project_id = params.get("project_id")
-        if project_id and item.get("ao_project_id") != project_id:
+        if project_id and project_id not in {item.get("ao_project_id"), item.get("runtime_project_id")}:
             return False
         session_id = params.get("session_id")
         if session_id and item.get("session_id") != session_id:
@@ -6272,6 +6272,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 vision_brief=body.get("vision_brief") or body.get("brief") or "",
                 project_id=body.get("project_id") or "OrynWorkspace",
                 session_id=body.get("session_id"),
+                project_context=body.get("project_context"),
                 max_questions=body.get("max_questions") or 5,
             )
         except ValueError as exc:
@@ -6798,8 +6799,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Dev execution store unavailable"), status=503)
         if request.method == "GET":
             limit = self._bounded_query_limit(request, default=50)
+            project_id = request.rel_url.query.get("project_id") or None
             event_store = self._ensure_subagent_event_store()
-            raw_plans = store.list_plans(limit=limit)
+            raw_plans = store.list_plans(limit=limit, project_id=project_id)
             plans = []
             try:
                 from tools.ao_bridge import AOBridge

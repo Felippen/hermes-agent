@@ -211,6 +211,7 @@ DEV_START_CLARIFICATION_SCHEMA = {
             "vision_brief": {"type": "string", "description": "Rough vision or feature brief to clarify."},
             "project_id": {"type": "string", "description": "Project id. Defaults to OrynWorkspace."},
             "session_id": {"type": "string", "description": "Optional Oryn/Hermes chat session id to associate."},
+            "project_context": {"type": "object", "description": "Optional project context such as name, vision, repositories, and work items."},
             "max_questions": {"type": "integer", "description": "Maximum questions, capped at 5."},
         },
         "required": ["vision_brief"],
@@ -960,6 +961,7 @@ def _handle_dev_start_clarification(args: Dict[str, Any], **kwargs) -> str:
             vision_brief=args.get("vision_brief") or "",
             project_id=args.get("project_id") or "OrynWorkspace",
             session_id=args.get("session_id"),
+            project_context=args.get("project_context"),
             max_questions=args.get("max_questions") or 5,
         )
     except Exception as exc:

@@ -931,6 +931,8 @@ def _clarification_context(clarification: Dict[str, Any]) -> Dict[str, Any]:
             "skipped": bool(item.get("skipped")),
         })
     return {
+        "project_id": clarification.get("project_id"),
+        "project_context": clarification.get("project_context") or {},
         "vision_brief": clarification.get("vision_brief"),
         "clarified_brief": clarification.get("clarified_brief"),
         "answers": answers,
@@ -997,24 +999,31 @@ def _fallback_artifact_payload(
     answers = [item for item in context["answers"] if not item.get("skipped")]
     skipped = [item for item in context["answers"] if item.get("skipped")]
     title = _title_from_vision(str(context.get("vision_brief") or "Planning artifact"))
+    project_context = context.get("project_context") or {}
     scope = [
         f"{item.get('question')}: {item.get('answer')}"
         for item in answers
         if item.get("question") and item.get("answer")
     ]
+    if project_context.get("vision"):
+        scope.insert(0, f"Project vision: {project_context.get('vision')}")
     if feedback:
         scope.append(f"Revision feedback to incorporate: {feedback}")
+    assumptions = []
+    if project_context.get("project_name"):
+        assumptions.append(f"Project: {project_context.get('project_name')}")
+    assumptions.extend(
+        f"Felipe selected: {item.get('answer')}"
+        for item in answers
+        if item.get("answer")
+    )
     return {
         "title": title,
         "overview": str(context.get("vision_brief") or "").strip() or title,
         "product_intent": "Turn the clarified vision into a reviewable plan artifact before any implementation starts.",
         "scope": scope[:8] or ["Create a bounded v1 plan from the clarification answers."],
         "non_goals": ["Do not create or launch a Dev execution plan in Phase 28."],
-        "assumptions": [
-            f"Felipe selected: {item.get('answer')}"
-            for item in answers
-            if item.get("answer")
-        ][:8],
+        "assumptions": assumptions[:8],
         "user_workflow": [
             "Felipe reviews the generated plan artifact in the right-side planning panel.",
             "Felipe can provide feedback to create a revised artifact version.",

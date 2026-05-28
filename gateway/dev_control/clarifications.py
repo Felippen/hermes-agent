@@ -202,6 +202,7 @@ def start_clarification(
     vision_brief: str,
     project_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    project_context: Optional[Dict[str, Any]] = None,
     max_questions: int = DEFAULT_MAX_QUESTIONS,
 ) -> Dict[str, Any]:
     brief = str(vision_brief or "").strip()
@@ -210,8 +211,9 @@ def start_clarification(
     question_count = max(MIN_TARGET_QUESTIONS, min(int(max_questions or DEFAULT_MAX_QUESTIONS), MAX_QUESTION_LIMIT))
     generation_mode = "llm"
     warning = None
+    normalized_project_context = _normalize_project_context(project_context, project_id=project_id)
     try:
-        questions = _generate_questions(brief, max_questions=question_count)
+        questions = _generate_questions(brief, max_questions=question_count, project_context=normalized_project_context)
     except Exception as exc:
         generation_mode = "fallback"
         warning = f"LLM question generation failed; using deterministic fallback questions: {exc}"
@@ -223,6 +225,7 @@ def start_clarification(
         "session_id": session_id,
         "status": "active",
         "vision_brief": brief,
+        "project_context": normalized_project_context,
         "current_question_index": 0,
         "questions": questions,
         "answers": [],
@@ -388,7 +391,12 @@ def _with_current_question(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _generate_questions(vision_brief: str, *, max_questions: int) -> list[Dict[str, Any]]:
+def _generate_questions(
+    vision_brief: str,
+    *,
+    max_questions: int,
+    project_context: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
     messages = [
         {
             "role": "system",
@@ -407,7 +415,11 @@ def _generate_questions(vision_brief: str, *, max_questions: int) -> list[Dict[s
         },
         {
             "role": "user",
-            "content": f"Vision brief:\n{vision_brief}\n\nMax questions: {max_questions}",
+            "content": (
+                f"Vision brief:\n{vision_brief}\n\n"
+                f"Project context:\n{json.dumps(project_context or {}, ensure_ascii=False)}\n\n"
+                f"Max questions: {max_questions}"
+            ),
         },
     ]
     content = _call_question_llm(messages)
@@ -597,11 +609,16 @@ def _find_option(question: Dict[str, Any], option_id: Optional[str]) -> Optional
 
 def _build_clarified_brief(payload: Dict[str, Any]) -> Dict[str, Any]:
     answers = payload.get("answers") or []
+    project_context = payload.get("project_context") or {}
     answered = [item for item in answers if not item.get("skipped")]
     skipped = [item for item in answers if item.get("skipped")]
     goals = []
     constraints = []
     assumptions = []
+    if project_context.get("project_name"):
+        assumptions.append(f"Project: {project_context.get('project_name')}")
+    if project_context.get("vision"):
+        assumptions.append(f"Project vision: {project_context.get('vision')}")
     for item in answered:
         text = item.get("answer_text") or item.get("option_label")
         if text:
@@ -623,3 +640,37 @@ def _build_clarified_brief(payload: Dict[str, Any]) -> Dict[str, Any]:
         "open_questions": [item.get("question_prompt") for item in skipped],
         "suggested_next_action": "Review the clarified brief, then draft a Dev execution plan if the direction is correct.",
     }
+
+
+def _normalize_project_context(
+    value: Optional[Dict[str, Any]],
+    *,
+    project_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    repositories = []
+    for item in value.get("repositories") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        repositories.append({
+            "label": str(item.get("label") or "").strip() or None,
+            "path": path,
+        })
+    work_items = [
+        str(item).strip()
+        for item in (value.get("work_items") or [])
+        if str(item).strip()
+    ]
+    context = {
+        "project_id": str(value.get("project_id") or project_id or "").strip() or None,
+        "project_name": str(value.get("project_name") or "").strip() or None,
+        "vision": str(value.get("vision") or "").strip() or None,
+        "coordinator_profile": str(value.get("coordinator_profile") or "").strip() or None,
+        "repositories": repositories[:10],
+        "work_items": work_items[:20],
+    }
+    return context if any(context.get(key) for key in ("project_id", "project_name", "vision", "coordinator_profile")) or repositories or work_items else None
