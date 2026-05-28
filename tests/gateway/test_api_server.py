@@ -483,7 +483,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/model/current", adapter._handle_current_model)
     app.router.add_get("/v1/providers/openrouter/models", adapter._handle_openrouter_models)
     app.router.add_post("/v1/sessions/{session_id}/model", adapter._handle_set_session_model)
-    app.router.add_delete("/v1/sessions/{session_id}", adapter._handle_delete_session)
+    app.router.add_delete("/v1/sessions/{session_id}", adapter._handle_v1_delete_session)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/commands", adapter._handle_commands)

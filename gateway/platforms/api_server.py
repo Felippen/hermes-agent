@@ -1387,7 +1387,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return str(content)
 
-    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+    async def _handle_v1_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /v1/sessions — paginated session list for remote clients."""
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1438,7 +1438,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("GET /v1/sessions failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
-    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+    async def _handle_v1_get_session(self, request: "web.Request") -> "web.Response":
         """GET /v1/sessions/{session_id} — session metadata."""
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1477,7 +1477,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("GET /v1/sessions/{id} failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
-    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
+    async def _handle_v1_get_session_messages(self, request: "web.Request") -> "web.Response":
         """GET /v1/sessions/{session_id}/messages — message history for resume/display."""
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1535,7 +1535,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("GET /v1/sessions/{id}/messages failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
-    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+    async def _handle_v1_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/sessions/{session_id} — remove a stored session and its messages."""
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1910,16 +1910,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "platform": "api_server",
             "data": data,
-=======
-                "ao_sessions": {"method": "GET", "path": "/v1/ao/sessions"},
-                "ao_session_detail": {"method": "GET", "path": "/v1/ao/sessions/{session_id}"},
-                "ao_session_follow_up": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/follow-up"},
-                "ao_session_retry": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/retry"},
-                "ao_session_reassign": {"method": "POST", "path": "/v1/ao/sessions/{session_id}/reassign"},
-                "session_subagent_events": {"method": "GET", "path": "/v1/sessions/{session_id}/subagents/events"},
-                "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
-            },
->>>>>>> 69c75216f (feat: persist AO-visible subagent history)
         })
 
     # ------------------------------------------------------------------
@@ -5473,17 +5463,36 @@ class APIServerAdapter(BasePlatformAdapter):
             return default
 
     def _ao_session_payload(self, session: Any, *, include_events: bool = False) -> Dict[str, Any]:
-        payload = session.event_fields()
+        def _scalar(value: Any) -> Any:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return None
+
+        event_fields = {}
+        raw_event_fields = getattr(session, "event_fields", None)
+        if callable(raw_event_fields):
+            try:
+                candidate = raw_event_fields()
+            except Exception:
+                candidate = {}
+            if isinstance(candidate, dict):
+                event_fields = candidate
+
+        session_id = _scalar(getattr(session, "id", None))
+        if not session_id:
+            session_id = _scalar(getattr(session, "ao_session_id", None))
+
+        payload = dict(event_fields)
         payload.update({
-            "id": session.id,
-            "status": session.display_status,
-            "activity": session.activity,
-            "agent": session.agent,
-            "pr": session.pr,
-            "summary": session.summary,
+            "id": session_id,
+            "status": _scalar(getattr(session, "display_status", None)),
+            "activity": _scalar(getattr(session, "activity", None)),
+            "agent": _scalar(getattr(session, "agent", None)),
+            "pr": _scalar(getattr(session, "pr", None)),
+            "summary": _scalar(getattr(session, "summary", None)),
         })
         store = self._ensure_subagent_event_store()
-        prompt_meta = store.get_ao_prompt(session.id) if store else None
+        prompt_meta = store.get_ao_prompt(session_id) if store and isinstance(session_id, str) else None
         payload["can_retry"] = bool(prompt_meta)
         payload["can_reassign"] = bool(prompt_meta)
         if prompt_meta:
@@ -5491,8 +5500,8 @@ class APIServerAdapter(BasePlatformAdapter):
             payload["prompt_available"] = True
         else:
             payload["prompt_available"] = False
-        if include_events and store:
-            payload["events"] = store.list_events(ao_session_id=session.id)
+        if include_events and store and isinstance(session_id, str):
+            payload["events"] = store.list_events(ao_session_id=session_id)
         return payload
 
     async def _handle_ao_sessions(self, request: "web.Request") -> "web.Response":
@@ -5939,11 +5948,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._handle_openrouter_models,
             )
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
-            self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
-            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
-            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/v1/sessions", self._handle_v1_list_sessions)
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_v1_get_session)
+            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_v1_get_session_messages)
             self._app.router.add_get("/v1/sessions/{session_id}/subagents/events", self._handle_session_subagent_events)
-            self._app.router.add_delete("/v1/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_delete("/v1/sessions/{session_id}", self._handle_v1_delete_session)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/commands", self._handle_commands)
