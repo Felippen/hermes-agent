@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Protocol
 
 from gateway.dev_control.product_events import DevProductEventStore
+from gateway.dev_control.reliability import DevReliabilityStore, scorecard, weakest_categories
 
 
 DEFAULT_WINDOW_DAYS = 7
@@ -182,6 +183,40 @@ class ProductSignalSource:
         }
 
 
+class ReliabilitySignalSource:
+    """Clusters weak Dev reliability categories into advisory improvement signals."""
+
+    def __init__(self, reliability_store: DevReliabilityStore, *, thresholds: Optional[Dict[str, Any]] = None):
+        self.reliability_store = reliability_store
+        self.thresholds = {**default_thresholds(), **(thresholds or {})}
+
+    def fetch_clusters(self, window: SignalWindow, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        filters = filters or {}
+        outcomes = self.reliability_store.list_outcomes(
+            start=window.start,
+            end=window.end,
+            limit=int(filters.get("limit") or 5000),
+        )
+        card = scorecard(outcomes, now=window.end)
+        target_success_rate = float(
+            filters.get("target_success_rate") or self.thresholds["reliability_target_success_rate"]
+        )
+        rows = [
+            row for row in weakest_categories(card.get("categories") or [], limit=int(filters.get("category_limit") or 25))
+            if _reliability_category_needs_work(row, target_success_rate=target_success_rate)
+        ]
+        clusters = [
+            _reliability_cluster(row, outcomes, window, target_success_rate=target_success_rate)
+            for row in rows
+        ]
+        return {
+            "source": "reliability",
+            "clusters": [cluster for cluster in clusters if cluster],
+            "warnings": [],
+            "analyzed_event_count": len(outcomes),
+        }
+
+
 def default_thresholds() -> Dict[str, Any]:
     return {
         "status_min_count": _env_int("HERMES_DEV_SIGNAL_STATUS_MIN_COUNT", 2),
@@ -194,6 +229,7 @@ def default_thresholds() -> Dict[str, Any]:
         "outlier_ratio": _env_float("HERMES_DEV_SIGNAL_OUTLIER_RATIO", 2.0),
         "proposal_aging_days": _env_int("HERMES_DEV_SIGNAL_PROPOSAL_AGING_DAYS", 14),
         "product_error_min_count": _env_int("HERMES_PRODUCT_SIGNAL_MIN_COUNT", 1),
+        "reliability_target_success_rate": _env_float("HERMES_DEV_RELIABILITY_SIGNAL_TARGET_SUCCESS_RATE", 0.95),
     }
 
 
@@ -389,6 +425,96 @@ def _product_event_ref(event: Dict[str, Any]) -> Dict[str, Any]:
         "received_at": event.get("received_at"),
         "count": event.get("count"),
     }
+
+
+def _reliability_category_needs_work(category: Dict[str, Any], *, target_success_rate: float) -> bool:
+    tier = str(category.get("tier") or "unproven").lower()
+    if tier == "trusted":
+        return False
+    if int(category.get("escape_count") or 0) > 0:
+        return True
+    success_rate = category.get("success_rate")
+    return success_rate is None or float(success_rate) < target_success_rate
+
+
+def _reliability_cluster(
+    category: Dict[str, Any],
+    outcomes: list[Dict[str, Any]],
+    window: SignalWindow,
+    *,
+    target_success_rate: float,
+) -> Dict[str, Any]:
+    key_category = str(category.get("category") or "").strip()
+    if not key_category:
+        return {}
+    related = [outcome for outcome in outcomes if outcome.get("category") == key_category]
+    evidence_outcomes = [
+        outcome for outcome in related
+        if outcome.get("escaped") or not bool(outcome.get("success"))
+    ]
+    dominant_failure_mode = _dominant_reliability_failure_mode(evidence_outcomes)
+    evidence_refs = [
+        {
+            "kind": "reliability_outcome",
+            "outcome_id": outcome.get("outcome_id"),
+            "uri": f"hermes://dev-reliability/outcomes/{outcome.get('outcome_id')}" if outcome.get("outcome_id") else None,
+            "plan_id": outcome.get("plan_id"),
+            "task_id": outcome.get("task_id"),
+            "category": key_category,
+            "reason": _reliability_failure_reason(outcome),
+        }
+        for outcome in evidence_outcomes[:10]
+    ]
+    count = int(category.get("failure_count") or 0) + int(category.get("escape_count") or 0)
+    count = max(count, len(evidence_refs), 1)
+    return {
+        "key": f"reliability:{key_category}",
+        "title": f"Low reliability: {key_category}",
+        "count": count,
+        "rate_per_day": cluster_rate({"count": count}, window),
+        "evidence_refs": evidence_refs,
+        "sample_summaries": [
+            f"{key_category}: tier={category.get('tier')}, success_rate={category.get('success_rate')}, escapes={category.get('escape_count')}"
+        ],
+        "metrics": {
+            "success_rate": category.get("success_rate"),
+            "target_success_rate": target_success_rate,
+            "escape_rate": category.get("escape_rate"),
+            "escape_count": category.get("escape_count"),
+            "tier": category.get("tier"),
+            "sample_count": category.get("sample_count"),
+            "dominant_failure_mode": dominant_failure_mode,
+        },
+        "query_descriptor": {
+            "source": "reliability",
+            "category": key_category,
+            "target_success_rate": target_success_rate,
+        },
+    }
+
+
+def _dominant_reliability_failure_mode(outcomes: list[Dict[str, Any]]) -> str:
+    counts: Dict[str, int] = {}
+    for outcome in outcomes:
+        reason = _reliability_failure_reason(outcome)
+        counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return "insufficient evidence"
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _reliability_failure_reason(outcome: Dict[str, Any]) -> str:
+    if outcome.get("escaped"):
+        return "escaped incident/product signal"
+    if str(outcome.get("verification_verdict") or "").lower() not in {"verified", "passed"}:
+        return "verification not passing"
+    if str(outcome.get("ci_state") or "").lower() != "success":
+        return "ci not green"
+    if str(outcome.get("code_review_verdict") or "").lower() != "approved":
+        return "code review not approved"
+    if int(outcome.get("rework_count") or 0) > 0:
+        return "rework required"
+    return "task did not meet success definition"
 
 
 def _event_ref(event: Dict[str, Any]) -> Dict[str, Any]:

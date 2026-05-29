@@ -17,10 +17,12 @@ from gateway.dev_control.signal_source import (
     DeterministicSignalSource,
     LaminarSignalSource,
     ProductSignalSource,
+    ReliabilitySignalSource,
     SignalWindow,
     cluster_rate,
     default_thresholds,
 )
+from gateway.dev_control.reliability import DevReliabilityStore, measure_category_improvement
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -242,6 +244,8 @@ def run_signal_digest(
     signal_store: DevProductionSignalStore,
     event_store: Any,
     product_event_store: Any = None,
+    reliability_store: Any = None,
+    execution_store: Any = None,
     source: str = "deterministic",
     window_days: Optional[float] = None,
     filters: Optional[Dict[str, Any]] = None,
@@ -251,6 +255,7 @@ def run_signal_digest(
         signal_store=signal_store,
         event_store=event_store,
         product_event_store=product_event_store,
+        reliability_store=reliability_store,
         source=source,
         window_days=window_days,
         filters=filters,
@@ -259,11 +264,88 @@ def run_signal_digest(
     )
 
 
+def run_signal_digest_sources(
+    *,
+    signal_store: DevProductionSignalStore,
+    event_store: Any,
+    product_event_store: Any = None,
+    reliability_store: Any = None,
+    execution_store: Any = None,
+    sources: Optional[list[str]] = None,
+    window_days: Optional[float] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    persist: bool = True,
+) -> Dict[str, Any]:
+    selected_sources = [
+        source.strip().lower()
+        for source in (sources or ["deterministic", "product", "reliability"])
+        if str(source or "").strip()
+    ]
+    reports = [
+        run_signal_digest(
+            signal_store=signal_store,
+            event_store=event_store,
+            product_event_store=product_event_store,
+            reliability_store=reliability_store,
+            execution_store=execution_store,
+            source=source,
+            window_days=window_days,
+            filters=filters,
+            persist=persist,
+        )
+        for source in selected_sources
+    ]
+    measurement_sweep = sweep_reliability_proposal_outcomes(
+        signal_store=signal_store,
+        reliability_store=reliability_store,
+        execution_store=execution_store,
+        window_days=window_days,
+    )
+    reliability_reports = [report for report in reports if report.get("source") == "reliability"]
+    reliability_proposals = [
+        proposal
+        for report in reliability_reports
+        for proposal in report.get("proposals") or []
+    ]
+    return {
+        "ok": all(report.get("ok", False) for report in reports) and bool(measurement_sweep.get("ok")),
+        "object": "hermes.dev_signal_digest_summary",
+        "sources": selected_sources,
+        "reports": reports,
+        "measurement_sweep": measurement_sweep,
+        "summary": {
+            "report_count": len(reports),
+            "cluster_count": sum(int((report.get("counts") or {}).get("cluster_count") or 0) for report in reports),
+            "proposal_count": sum(int((report.get("counts") or {}).get("proposal_count") or 0) for report in reports),
+            "reliability_proposal_count": len(reliability_proposals),
+            "weakest_categories_targeted": [
+                _reliability_category_from_proposal(proposal)
+                for proposal in reliability_proposals
+                if _reliability_category_from_proposal(proposal)
+            ],
+            "reliability_measurements": [
+                {
+                    "proposal_id": proposal.get("proposal_id"),
+                    "category": (proposal.get("outcome") or {}).get("category"),
+                    "before_score": (proposal.get("outcome") or {}).get("before_score"),
+                    "after_score": (proposal.get("outcome") or {}).get("after_score"),
+                    "status": (proposal.get("outcome") or {}).get("status"),
+                    "before_sample_count": (proposal.get("outcome") or {}).get("before_sample_count"),
+                    "after_sample_count": (proposal.get("outcome") or {}).get("after_sample_count"),
+                }
+                for proposal in measurement_sweep.get("measured") or []
+            ],
+        },
+        "advisory_only": True,
+    }
+
+
 def generate_signal_report(
     *,
     signal_store: DevProductionSignalStore,
     event_store: Any,
     product_event_store: Any = None,
+    reliability_store: Any = None,
     source: str = "deterministic",
     window_days: Optional[float] = None,
     filters: Optional[Dict[str, Any]] = None,
@@ -275,7 +357,12 @@ def generate_signal_report(
     filters = filters or {}
     warnings: list[str] = []
     try:
-        source_impl = _source_impl(source, event_store=event_store, product_event_store=product_event_store)
+        source_impl = _source_impl(
+            source,
+            event_store=event_store,
+            product_event_store=product_event_store,
+            reliability_store=reliability_store,
+        )
         source_result = source_impl.fetch_clusters(window, filters=filters)
         clusters = source_result.get("clusters") or []
         warnings.extend(source_result.get("warnings") or [])
@@ -386,6 +473,7 @@ def measure_proposal_outcome(
     signal_store: DevProductionSignalStore,
     event_store: Any,
     product_event_store: Any = None,
+    reliability_store: Any = None,
     proposal_id: str,
     window_days: Optional[float] = None,
     source: str = "deterministic",
@@ -393,9 +481,21 @@ def measure_proposal_outcome(
     proposal = signal_store.get_proposal(proposal_id)
     if not proposal:
         raise KeyError(f"Dev backlog proposal not found: {proposal_id}")
+    if _proposal_source(proposal) == "reliability" or str(source or "").lower() == "reliability":
+        return measure_reliability_proposal_outcome(
+            signal_store=signal_store,
+            reliability_store=reliability_store,
+            proposal_id=proposal_id,
+            window_days=window_days,
+        )
     now = time.time()
     after_window = SignalWindow.last_days(window_days or (proposal.get("source_window") or {}).get("days") or DEFAULT_WINDOW_DAYS, now=now)
-    source_result = _source_impl(source, event_store=event_store, product_event_store=product_event_store).fetch_clusters(after_window, filters={})
+    source_result = _source_impl(
+        source,
+        event_store=event_store,
+        product_event_store=product_event_store,
+        reliability_store=reliability_store,
+    ).fetch_clusters(after_window, filters={})
     cluster_key = proposal.get("cluster_key")
     after_cluster = next((item for item in source_result.get("clusters") or [] if item.get("key") == cluster_key), None)
     source_window = proposal.get("source_window") or {}
@@ -418,6 +518,114 @@ def measure_proposal_outcome(
         "outcome": outcome,
         "measured_at": now,
     })
+
+
+def measure_reliability_proposal_outcome(
+    *,
+    signal_store: DevProductionSignalStore,
+    reliability_store: Any = None,
+    proposal_id: str,
+    window_days: Optional[float] = None,
+) -> Dict[str, Any]:
+    proposal = signal_store.get_proposal(proposal_id)
+    if not proposal:
+        raise KeyError(f"Dev backlog proposal not found: {proposal_id}")
+    reliability_store = reliability_store or DevReliabilityStore(signal_store.db_path)
+    category = _reliability_category_from_proposal(proposal)
+    if not category:
+        raise ValueError("Reliability proposal does not include a category.")
+    now = time.time()
+    source_window = proposal.get("source_window") or {}
+    before_start = float(source_window.get("start") or now - (window_days or DEFAULT_WINDOW_DAYS) * 86400)
+    before_end = float(source_window.get("end") or now)
+    days = float(window_days or source_window.get("days") or DEFAULT_WINDOW_DAYS)
+    after_end = now
+    after_start = after_end - max(days, 0.1) * 86400
+    measurement = measure_category_improvement(
+        store=reliability_store,
+        category=category,
+        before_start=before_start,
+        before_end=before_end,
+        after_start=after_start,
+        after_end=after_end,
+        proposal_id=proposal_id,
+        plan_id=proposal.get("linked_plan_id"),
+    )
+    before_score = measurement.get("before_score")
+    after_score = measurement.get("after_score")
+    outcome = {
+        "before_rate": before_score,
+        "after_rate": after_score,
+        "before_score": before_score,
+        "after_score": after_score,
+        "before_count": int(measurement.get("before_sample_count") or 0),
+        "after_count": int(measurement.get("after_sample_count") or 0),
+        "before_sample_count": int(measurement.get("before_sample_count") or 0),
+        "after_sample_count": int(measurement.get("after_sample_count") or 0),
+        "window": measurement.get("after_window") or {},
+        "before_window": measurement.get("before_window") or {},
+        "after_window": measurement.get("after_window") or {},
+        "warnings": [
+            *(measurement.get("warnings") or []),
+            "Before/after score movement is correlation evidence, not causal proof.",
+        ],
+        "status": _score_outcome_status(before_score, after_score),
+        "measured_at": measurement.get("measured_at") or now,
+        "measurement_id": measurement.get("measurement_id"),
+        "category": category,
+    }
+    return signal_store.update_proposal(proposal_id, {
+        "outcome": outcome,
+        "measured_at": outcome["measured_at"],
+    })
+
+
+def sweep_reliability_proposal_outcomes(
+    *,
+    signal_store: DevProductionSignalStore,
+    reliability_store: Any = None,
+    execution_store: Any = None,
+    window_days: Optional[float] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    reliability_store = reliability_store or DevReliabilityStore(signal_store.db_path)
+    proposals = [
+        proposal for proposal in signal_store.list_proposals(limit=limit)
+        if proposal.get("status") == "promoted"
+        and _proposal_source(proposal) == "reliability"
+        and not (proposal.get("outcome") or {}).get("measured_at")
+    ]
+    measured: list[Dict[str, Any]] = []
+    skipped: list[Dict[str, Any]] = []
+    for proposal in proposals:
+        linked_plan_id = proposal.get("linked_plan_id")
+        if linked_plan_id and execution_store is not None and not _linked_plan_is_terminal(execution_store, linked_plan_id):
+            skipped.append({
+                "proposal_id": proposal.get("proposal_id"),
+                "reason": "linked plan is not terminal",
+                "linked_plan_id": linked_plan_id,
+            })
+            continue
+        if not linked_plan_id:
+            skipped.append({
+                "proposal_id": proposal.get("proposal_id"),
+                "reason": "missing linked_plan_id",
+            })
+            continue
+        measured.append(measure_reliability_proposal_outcome(
+            signal_store=signal_store,
+            reliability_store=reliability_store,
+            proposal_id=proposal["proposal_id"],
+            window_days=window_days,
+        ))
+    return {
+        "ok": True,
+        "object": "hermes.dev_reliability_outcome_sweep",
+        "measured": measured,
+        "skipped": skipped,
+        "measured_count": len(measured),
+        "skipped_count": len(skipped),
+    }
 
 
 def signal_health(*, signal_store: DevProductionSignalStore, event_store: Any = None) -> Dict[str, Any]:
@@ -469,7 +677,7 @@ def signal_health(*, signal_store: DevProductionSignalStore, event_store: Any = 
     }
 
 
-def _source_impl(source: str, *, event_store: Any, product_event_store: Any = None) -> Any:
+def _source_impl(source: str, *, event_store: Any, product_event_store: Any = None, reliability_store: Any = None) -> Any:
     normalized = str(source or "").lower()
     if normalized == "laminar":
         return LaminarSignalSource()
@@ -479,6 +687,11 @@ def _source_impl(source: str, *, event_store: Any, product_event_store: Any = No
             db_path = getattr(event_store, "db_path", None)
             product_event_store = DevProductEventStore(db_path)
         return ProductSignalSource(product_event_store)
+    if normalized == "reliability":
+        if reliability_store is None:
+            db_path = getattr(event_store, "db_path", None)
+            reliability_store = DevReliabilityStore(db_path)
+        return ReliabilitySignalSource(reliability_store)
     return DeterministicSignalSource(event_store)
 
 
@@ -516,6 +729,8 @@ def _create_or_reuse_proposal(signal_store: DevProductionSignalStore, report: Di
 
 def _proposal_payload(cluster: Dict[str, Any]) -> Dict[str, Any]:
     title = cluster.get("title") or cluster.get("key") or "Production signal"
+    if str((cluster.get("query_descriptor") or {}).get("source") or "") == "reliability":
+        return _reliability_proposal_payload(cluster, title)
     return {
         "title": title,
         "category": "production_signal",
@@ -529,6 +744,41 @@ def _proposal_payload(cluster: Dict[str, Any]) -> Dict[str, Any]:
         "non_goals": ["Do not mutate runtime policy or auto-create execution work from this proposal."],
         "source": "production_signal",
         "status": "proposed",
+    }
+
+
+def _reliability_proposal_payload(cluster: Dict[str, Any], title: str) -> Dict[str, Any]:
+    metrics = cluster.get("metrics") if isinstance(cluster.get("metrics"), dict) else {}
+    descriptor = cluster.get("query_descriptor") if isinstance(cluster.get("query_descriptor"), dict) else {}
+    category = str(descriptor.get("category") or str(cluster.get("key") or "").removeprefix("reliability:"))
+    dominant = str(metrics.get("dominant_failure_mode") or "low reliability")
+    guardrail_touching = _is_guardrail_touching_category(category)
+    return {
+        "title": title,
+        "category": "reliability_improvement",
+        "priority": "high" if int(metrics.get("escape_count") or 0) > 0 else "medium",
+        "impact": (
+            f"{category} is {metrics.get('tier') or 'unproven'} with "
+            f"success_rate={metrics.get('success_rate')} across {metrics.get('sample_count') or 0} sample(s)."
+        ),
+        "risk": (
+            "Guardrail-touching proposal; extra human scrutiny required."
+            if guardrail_touching
+            else "Proposal is advisory; review evidence before creating work."
+        ),
+        "affected_components": [category],
+        "evidence_refs": cluster.get("evidence_refs") or [],
+        "reason": f"Reliability scorecard identified {dominant} in {category}.",
+        "suggested_change": _reliability_suggested_change(category, dominant),
+        "non_goals": [
+            "Do not auto-implement this proposal.",
+            "Do not grant autonomy or mutate guardrails based on this tier.",
+        ],
+        "source": "reliability",
+        "status": "proposed",
+        "guardrail_touching": guardrail_touching,
+        "target_category": category,
+        "dominant_failure_mode": dominant,
     }
 
 
@@ -565,6 +815,68 @@ def _outcome_status(before_rate: float, after_rate: float) -> str:
     if after_rate > before_rate:
         return "regressed"
     return "no_change"
+
+
+def _score_outcome_status(before_score: Any, after_score: Any) -> str:
+    if before_score is None or after_score is None:
+        return "needs_more_data"
+    before = float(before_score)
+    after = float(after_score)
+    if after > before:
+        return "improved"
+    if after < before:
+        return "regressed"
+    return "no_change"
+
+
+def _proposal_source(proposal: Dict[str, Any]) -> str:
+    payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+    return str(payload.get("source") or "").strip().lower()
+
+
+def _reliability_category_from_proposal(proposal: Dict[str, Any]) -> str:
+    payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+    descriptor = proposal.get("query_descriptor") if isinstance(proposal.get("query_descriptor"), dict) else {}
+    cluster_key = str(proposal.get("cluster_key") or "")
+    return str(
+        payload.get("target_category")
+        or descriptor.get("category")
+        or (cluster_key.removeprefix("reliability:") if cluster_key.startswith("reliability:") else "")
+    ).strip()
+
+
+def _linked_plan_is_terminal(execution_store: Any, plan_id: str) -> bool:
+    try:
+        plan = execution_store.get_plan(plan_id)
+    except Exception:
+        plan = None
+    if not plan:
+        return False
+    status = str(plan.get("status") or "").lower()
+    if status in {"completed", "merged", "shipped", "failed", "cancelled", "needs_attention"}:
+        return True
+    tasks = plan.get("tasks") or []
+    if tasks:
+        return all(str(task.get("status") or "").lower() in {"completed", "failed", "cancelled", "needs_attention"} for task in tasks)
+    return False
+
+
+def _is_guardrail_touching_category(category: str) -> bool:
+    lowered = category.lower()
+    guardrail_terms = ("verify", "verification", "test", "ci", "review", "merge", "gate", "policy")
+    return any(term in lowered for term in guardrail_terms)
+
+
+def _reliability_suggested_change(category: str, dominant_failure_mode: str) -> str:
+    if "verification" in dominant_failure_mode:
+        return f"Improve the verification path for {category}: tighten emitted acceptance criteria, remove flaky checks, or fix the failing verifier setup."
+    if "ci" in dominant_failure_mode:
+        return f"Improve CI readiness for {category}: identify recurring red checks and fix the underlying build/test instability."
+    if "review" in dominant_failure_mode:
+        return f"Improve review readiness for {category}: address recurring code-review findings before merge readiness."
+    if "escaped" in dominant_failure_mode:
+        return f"Analyze escaped incidents for {category} and add a prevention check before similar work ships again."
+    return f"Clarify and implement a reliability improvement for {category}, using the attached failing outcomes as evidence."
 
 
 def _count_by(items: list[Dict[str, Any]], key: str) -> Dict[str, int]:
