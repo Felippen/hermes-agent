@@ -19,6 +19,7 @@ from gateway.dev_control.acceptance_verification import (
     launch_verification_run,
     refresh_verification_run,
 )
+from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.dogfood_backlog import (
     dogfood_scope_check,
     is_guardrail_touching,
@@ -553,7 +554,13 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         draft_artifact=draft_artifact,
     )
     verification_verdict = verification.get("verdict") or "unknown"
-    ci_state = str(verification.get("ci_state") or "unknown")
+    ci_status = _measure_ci_r3(
+        candidate=candidate,
+        draft_artifact=draft_artifact,
+        head_sha=implementation.get("head_sha"),
+        fetcher=context.get("ci_status_fetcher"),
+    )
+    ci_state = str(ci_status.get("state") or verification.get("ci_state") or "unknown")
     code_review_verdict = str(verification.get("code_review_verdict") or "unknown")
     output_contract_score = verification.get("output_contract_score")
     draft_pr_ready = bool(draft_artifact and draft_artifact.get("ready"))
@@ -596,10 +603,11 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
                 "quarantined": quarantined,
                 "empty_diff": empty_diff,
                 "draft_artifact": draft_artifact,
+                "ci_status": ci_status,
                 "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
                 "gates": {
                     "verification": verification.get("status") or "unknown",
-                    "ci": "not_measured" if ci_state == "unknown" else ci_state,
+                    "ci": ci_status.get("status") or ("not_measured" if ci_state == "unknown" else ci_state),
                     "review": "not_measured" if code_review_verdict == "unknown" else code_review_verdict,
                 },
                 "verification_run_id": verification.get("verification_run_id"),
@@ -609,7 +617,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
             "completed_at": now,
             "merged_at": None,
         })
-    failed = terminal_status == "failed" or verification_verdict in {"failed", "partial", "needs_review"}
+    failed = terminal_status == "failed" or verification_verdict in {"failed", "partial", "needs_review"} or ci_state == "failure"
     result = {
         "status": "failed" if failed else "completed",
         "plan_id": plan["plan_id"],
@@ -630,6 +638,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         "draft_artifact": draft_artifact,
         "verification": verification,
         "verification_verdict": verification_verdict,
+        "ci_status": ci_status,
         "ci_state": ci_state,
         "code_review_verdict": code_review_verdict,
         "output_contract_score": output_contract_score,
@@ -1298,6 +1307,73 @@ def _measure_verification_r1(
         "score": run.get("acceptance_verification_score"),
         "measured": run.get("status") in {"completed", "skipped", "needs_attention"},
         "warnings": run.get("warnings") or [],
+    }
+
+
+def _measure_ci_r3(
+    *,
+    candidate: dict[str, Any],
+    draft_artifact: Optional[dict[str, Any]],
+    head_sha: Any,
+    fetcher: Optional[Callable[..., dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    fixture = payload.get("ci_status")
+    if isinstance(fixture, dict):
+        state = str(fixture.get("state") or "unknown").strip().lower()
+        return {
+            "status": state if state != "unknown" else "not_measured",
+            "state": state,
+            "measured": state != "unknown",
+            "source": "fixture",
+            "repo": fixture.get("repo"),
+            "ref": fixture.get("ref") or head_sha,
+            "raw": fixture,
+            "warnings": fixture.get("warnings") or [],
+        }
+    repo = str(payload.get("ci_repo") or os.getenv("HERMES_DEV_LAB_CI_REPO") or "").strip()
+    ref = str(payload.get("ci_ref") or head_sha or (draft_artifact or {}).get("head_sha") or "").strip()
+    if not draft_artifact:
+        return {
+            "status": "not_measured",
+            "state": "unknown",
+            "measured": False,
+            "repo": repo,
+            "ref": ref,
+            "warnings": ["CI was not measured because no draft branch artifact exists."],
+        }
+    if not repo:
+        return {
+            "status": "not_measured",
+            "state": "unknown",
+            "measured": False,
+            "repo": None,
+            "ref": ref,
+            "warnings": ["CI was not measured because HERMES_DEV_LAB_CI_REPO is not configured."],
+        }
+    if not ref:
+        return {
+            "status": "not_measured",
+            "state": "unknown",
+            "measured": False,
+            "repo": repo,
+            "ref": None,
+            "warnings": ["CI was not measured because the draft artifact has no head SHA."],
+        }
+    try:
+        payload = (fetcher or fetch_ci_status)(repo=repo, ref=ref)
+    except Exception as exc:  # noqa: BLE001 - CI is advisory in the lab loop.
+        payload = {"state": "unknown", "warnings": [f"CI status unavailable: {exc}"]}
+    state = str((payload or {}).get("state") or "unknown").strip().lower()
+    return {
+        "status": state if state != "unknown" else "not_measured",
+        "state": state,
+        "measured": state != "unknown",
+        "source": "github",
+        "repo": repo,
+        "ref": ref,
+        "raw": payload,
+        "warnings": (payload or {}).get("warnings") or [],
     }
 
 

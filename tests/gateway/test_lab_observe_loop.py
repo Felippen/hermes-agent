@@ -290,6 +290,86 @@ def test_lab_executor_derives_verified_outcome_from_measured_verification(monkey
     assert ready["success"] is True
 
 
+def test_lab_executor_derives_ci_state_from_draft_head_sha(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_fetch_ci_status(*, repo, ref):
+        calls.append({"repo": repo, "ref": ref})
+        return {"state": "success", "repo": repo, "ref": ref, "warnings": []}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop.fetch_ci_status", fake_fetch_ci_status)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure CI after a passing verification fixture.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["gateway/dev_control/lab_loop.py"],
+        "source": "todo",
+        "payload": {
+            "ci_repo": "Felippen/Oryn",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["gateway/dev_control/lab_loop.py"]),
+    )
+
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert report["status"] == "completed"
+    assert report["execution"]["ci_state"] == "success"
+    assert report["execution"]["ci_status"]["measured"] is True
+    assert outcome["ci_state"] == "success"
+    assert outcome["source_refs"]["gates"]["ci"] == "success"
+    assert outcome["success"] is True
+    assert calls == [{"repo": "Felippen/Oryn", "ref": report["execution"]["head_sha"]}]
+
+
+def test_lab_executor_ci_failure_is_real_failed_outcome(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure failing CI after a passing verification fixture.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["gateway/dev_control/lab_loop.py"],
+        "source": "todo",
+        "payload": {
+            "ci_status": {"state": "failure", "repo": "Felippen/Oryn"},
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        max_consecutive_failures=10,
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["gateway/dev_control/lab_loop.py"]),
+    )
+
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert report["status"] == "failed"
+    assert report["execution"]["ci_state"] == "failure"
+    assert outcome["verification_verdict"] == "verified"
+    assert outcome["ci_state"] == "failure"
+    assert outcome["success"] is False
+
+
 def test_lab_executor_can_produce_bad_score_from_failed_verification(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     DevLabLoopStore(db_path).upsert_candidate({
