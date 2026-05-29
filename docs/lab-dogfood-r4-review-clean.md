@@ -1,0 +1,1 @@
+2026-05-29: Lab R4 clean pass verification command: `scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q`.
