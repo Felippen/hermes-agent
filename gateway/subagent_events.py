@@ -111,6 +111,12 @@ class SubagentEventStore:
             event_id = int(cur.lastrowid)
 
         event["event_id"] = event_id
+        try:
+            from gateway.dev_control.laminar_exporter import export_subagent_event
+
+            export_subagent_event(event)
+        except Exception:
+            pass
         return event
 
     def list_events(

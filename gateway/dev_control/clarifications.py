@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.auxiliary_client import call_llm
+from gateway.dev_control.acceptance_criteria import (
+    ACCEPTANCE_CRITERION_JSON_SCHEMA,
+    ALLOWED_VERIFICATION_COMMAND_SHAPES,
+    normalize_acceptance_criteria,
+    validate_and_downgrade_criteria,
+)
+from gateway.dev_control.repo_grounding import collect_repo_grounding
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -92,6 +99,37 @@ QUESTION_JSON_SCHEMA: Dict[str, Any] = {
                 },
             },
         },
+    },
+}
+
+CLARIFIED_BRIEF_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "refined_vision",
+        "goals",
+        "non_goals",
+        "constraints",
+        "assumptions",
+        "acceptance_criteria",
+        "risk_notes",
+        "open_questions",
+        "suggested_next_action",
+    ],
+    "properties": {
+        "refined_vision": {"type": "string"},
+        "goals": {"type": "array", "items": {"type": "string"}},
+        "non_goals": {"type": "array", "items": {"type": "string"}},
+        "constraints": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "acceptance_criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": ACCEPTANCE_CRITERION_JSON_SCHEMA,
+        },
+        "risk_notes": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "suggested_next_action": {"type": "string"},
     },
 }
 
@@ -212,8 +250,20 @@ def start_clarification(
     generation_mode = "llm"
     warning = None
     normalized_project_context = _normalize_project_context(project_context, project_id=project_id)
+    grounding_result = collect_repo_grounding(
+        repositories=(normalized_project_context or {}).get("repositories") or [],
+        vision_brief=brief,
+    )
+    grounding = grounding_result.get("grounding") or {}
+    grounding_provenance = grounding_result.get("provenance") or []
+    grounding_warnings = grounding_result.get("warnings") or []
     try:
-        questions = _generate_questions(brief, max_questions=question_count, project_context=normalized_project_context)
+        questions = _generate_questions(
+            brief,
+            max_questions=question_count,
+            project_context=normalized_project_context,
+            grounding=grounding,
+        )
     except Exception as exc:
         generation_mode = "fallback"
         warning = f"LLM question generation failed; using deterministic fallback questions: {exc}"
@@ -230,6 +280,9 @@ def start_clarification(
         "questions": questions,
         "answers": [],
         "clarified_brief": None,
+        "grounding": grounding,
+        "grounding_provenance": grounding_provenance,
+        "grounding_warnings": grounding_warnings,
         "completed_at": None,
         "generation_mode": generation_mode,
         "warning": warning,
@@ -313,10 +366,12 @@ def complete_clarification(*, store: DevClarificationStore, clarification_id: st
     if payload["status"] not in {"active", "completed"}:
         raise ValueError(f"Clarification session is {payload['status']} and cannot be completed")
     clarified = _build_clarified_brief(payload)
+    warning = _combine_warning(payload.get("warning"), clarified.get("warning"))
     return _with_current_question(store.update(clarification_id, {
         "status": "completed",
         "current_question_index": len(payload.get("questions") or []),
         "clarified_brief": clarified,
+        "warning": warning,
         "completed_at": time.time(),
     }))
 
@@ -396,6 +451,7 @@ def _generate_questions(
     *,
     max_questions: int,
     project_context: Optional[Dict[str, Any]] = None,
+    grounding: Optional[Dict[str, Any]] = None,
 ) -> list[Dict[str, Any]]:
     messages = [
         {
@@ -418,6 +474,7 @@ def _generate_questions(
             "content": (
                 f"Vision brief:\n{vision_brief}\n\n"
                 f"Project context:\n{json.dumps(project_context or {}, ensure_ascii=False)}\n\n"
+                f"Read-only repository grounding:\n{json.dumps(grounding or {}, ensure_ascii=False)}\n\n"
                 f"Max questions: {max_questions}"
             ),
         },
@@ -608,6 +665,122 @@ def _find_option(question: Dict[str, Any], option_id: Optional[str]) -> Optional
 
 
 def _build_clarified_brief(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        brief = _validate_clarified_brief(_generate_clarified_brief_with_llm(payload))
+        return _validate_clarified_brief_criteria(brief, payload)
+    except Exception as exc:
+        fallback = _fallback_clarified_brief(payload)
+        fallback["warning"] = f"LLM clarified brief synthesis failed; using deterministic fallback brief: {exc}"
+        return fallback
+
+
+def _generate_clarified_brief_with_llm(payload: Dict[str, Any]) -> Dict[str, Any]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Synthesize a clarified software/product spec brief from the user's vision, "
+                "clarification answers, project context, and read-only repository grounding. "
+                "Return only valid JSON matching the provided schema. "
+                "Make acceptance criteria concrete and verifiable. verification_detail for any "
+                "machine_checkable: true criterion MUST match one of these exact command shapes: "
+                f"{'; '.join(ALLOWED_VERIFICATION_COMMAND_SHAPES)}. "
+                "Reference only files/paths present in the provided repository grounding; do not invent file paths. "
+                "Prefer a whole-suite or directory-level command when unsure of an exact file. "
+                "If no allowlisted command fits, set machine_checkable: false and describe a manual check instead. "
+                "Do not create worker tasks, launch work, approve execution, or claim implementation has started."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps({
+                "vision_brief": payload.get("vision_brief"),
+                "project_context": payload.get("project_context") or {},
+                "answers": _answers_context(payload),
+                "grounding": payload.get("grounding") or {},
+                "grounding_provenance": payload.get("grounding_provenance") or [],
+                "grounding_warnings": payload.get("grounding_warnings") or [],
+                "repository_grounding_paths": _grounding_paths(payload.get("grounding_provenance")),
+            }, ensure_ascii=False),
+        },
+    ]
+    content = _call_brief_llm(messages)
+    try:
+        return _extract_json(content)
+    except Exception:
+        repair_messages = [
+            messages[0],
+            {"role": "user", "content": f"Repair this into valid clarified brief schema JSON only:\n{content}"},
+        ]
+        repaired = _call_brief_llm(repair_messages)
+        return _extract_json(repaired)
+
+
+def _call_brief_llm(messages: list[Dict[str, str]]) -> str:
+    kwargs = {
+        "task": "dev_clarification_synthesis",
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 3200,
+        "timeout": 55,
+    }
+    try:
+        response = call_llm(
+            **kwargs,
+            extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "dev_clarified_brief",
+                        "schema": CLARIFIED_BRIEF_JSON_SCHEMA,
+                        "strict": True,
+                    },
+                },
+            },
+        )
+    except Exception as exc:
+        error_text = str(exc).lower()
+        if "response_format" not in error_text and "json_schema" not in error_text and "unsupported" not in error_text:
+            raise
+        response = call_llm(**kwargs)
+    return str(response.choices[0].message.content or "").strip()
+
+
+def _validate_clarified_brief(value: Dict[str, Any]) -> Dict[str, Any]:
+    criteria = normalize_acceptance_criteria(value.get("acceptance_criteria"))
+    if not criteria:
+        raise ValueError("Clarified brief requires acceptance_criteria")
+    return {
+        "refined_vision": str(value.get("refined_vision") or "").strip(),
+        "goals": _string_list(value.get("goals"))[:8],
+        "non_goals": _string_list(value.get("non_goals"))[:8],
+        "constraints": _string_list(value.get("constraints"))[:8],
+        "assumptions": _string_list(value.get("assumptions"))[:8],
+        "acceptance_criteria": criteria[:8],
+        "risk_notes": _string_list(value.get("risk_notes"))[:8],
+        "open_questions": _string_list(value.get("open_questions"))[:8],
+        "suggested_next_action": str(value.get("suggested_next_action") or "").strip()
+        or "Review the clarified brief, then draft a Dev execution plan if the direction is correct.",
+    }
+
+
+def _validate_clarified_brief_criteria(brief: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    criteria, warnings = validate_and_downgrade_criteria(
+        brief.get("acceptance_criteria"),
+        repo_roots=_repo_roots_from_project_context(payload.get("project_context") or {}),
+    )
+    if not warnings:
+        return brief
+    brief = dict(brief)
+    brief["acceptance_criteria"] = criteria[:8]
+    brief["warning"] = _combine_warning(
+        brief.get("warning"),
+        "Acceptance criteria downgraded: " + " ".join(warnings),
+    )
+    return brief
+
+
+def _fallback_clarified_brief(payload: Dict[str, Any]) -> Dict[str, Any]:
     answers = payload.get("answers") or []
     project_context = payload.get("project_context") or {}
     answered = [item for item in answers if not item.get("skipped")]
@@ -633,13 +806,81 @@ def _build_clarified_brief(payload: Dict[str, Any]) -> Dict[str, Any]:
         "constraints": constraints,
         "assumptions": assumptions[:8],
         "acceptance_criteria": [
-            "A human can turn this clarified brief into an implementation plan.",
-            "Open questions are explicit before any worker execution begins.",
+            {
+                "statement": "A human can turn this clarified brief into an implementation plan.",
+                "verification_method": "manual",
+                "verification_detail": "Review the clarified brief before creating a plan artifact.",
+                "machine_checkable": False,
+            },
+            {
+                "statement": "Open questions are explicit before any worker execution begins.",
+                "verification_method": "manual",
+                "verification_detail": "Confirm skipped questions are listed in open_questions.",
+                "machine_checkable": False,
+            },
         ],
         "risk_notes": ["This is planning guidance only; technical feasibility still needs codebase validation."],
         "open_questions": [item.get("question_prompt") for item in skipped],
         "suggested_next_action": "Review the clarified brief, then draft a Dev execution plan if the direction is correct.",
     }
+
+
+def _answers_context(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+    questions_by_id = {
+        item.get("question_id"): item
+        for item in payload.get("questions") or []
+    }
+    answers = []
+    for item in payload.get("answers") or []:
+        question = questions_by_id.get(item.get("question_id")) or {}
+        answers.append({
+            "question_id": item.get("question_id"),
+            "question": item.get("question_prompt") or question.get("prompt"),
+            "answer": item.get("answer_text") or item.get("option_label"),
+            "skipped": bool(item.get("skipped")),
+        })
+    return answers
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _combine_warning(*values: Any) -> Optional[str]:
+    parts = [str(value).strip() for value in values if str(value or "").strip()]
+    return " ".join(parts) if parts else None
+
+
+def _repo_roots_from_project_context(project_context: Dict[str, Any]) -> list[str]:
+    roots: list[str] = []
+    repositories = project_context.get("repositories")
+    if isinstance(repositories, list):
+        for repo in repositories:
+            if isinstance(repo, dict):
+                path = str(repo.get("path") or "").strip()
+                if path:
+                    roots.append(path)
+    return roots
+
+
+def _grounding_paths(provenance: Any) -> list[str]:
+    paths: list[str] = []
+    if not isinstance(provenance, list):
+        return paths
+    for item in provenance:
+        if isinstance(item, str):
+            path = item.strip()
+            if path:
+                paths.append(path)
+            continue
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("repo_path") or "").strip()
+        if path:
+            paths.append(path)
+    return paths
 
 
 def _normalize_project_context(

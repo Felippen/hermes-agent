@@ -118,6 +118,39 @@ from gateway.dev_control.plan_artifacts import (
     revise_execution_plan_draft,
     revise_plan_artifact,
 )
+from gateway.dev_control.acceptance_verification import (
+    DevVerificationStore,
+    launch_verification_run,
+    list_verification_runs,
+    refresh_verification_run,
+)
+from gateway.dev_control.ci_status import fetch_ci_status
+from gateway.dev_control.incidents import (
+    DevIncidentStore,
+    acknowledge_incident,
+    detect_incidents,
+    resolve_incident,
+)
+from gateway.dev_control.product_events import DevProductEventStore
+from gateway.dev_control.production_signals import (
+    DevProductionSignalStore,
+    generate_signal_report,
+    list_backlog_proposals,
+    list_signal_reports,
+    measure_proposal_outcome,
+    run_signal_digest,
+    signal_health,
+    transition_backlog_proposal,
+)
+from gateway.dev_control.scm_lifecycle import (
+    DevSCMLifecycleStore,
+    build_code_review_prompt,
+    compose_merge_readiness,
+    execute_merge,
+    fetch_pr_state,
+    parse_code_review_result,
+    request_merge_approval,
+)
 from gateway.dev_control.read_models import (
     build_agent_board_response,
     build_agent_board_rows,
@@ -895,6 +928,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._dev_execution_store: Optional[DevExecutionStore] = None
         self._dev_clarification_store: Optional[DevClarificationStore] = None
         self._dev_plan_artifact_store: Optional[DevPlanArtifactStore] = None
+        self._dev_verification_store: Optional[DevVerificationStore] = None
+        self._dev_signal_store: Optional[DevProductionSignalStore] = None
+        self._dev_product_event_store: Optional[DevProductEventStore] = None
+        self._dev_incident_store: Optional[DevIncidentStore] = None
+        self._dev_scm_store: Optional[DevSCMLifecycleStore] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
         self._read_model_cache = ReadModelCache()
@@ -1270,6 +1308,12 @@ class APIServerAdapter(BasePlatformAdapter):
             (self._dev_plan_artifact_store, "dev_plan_artifact_builds", "created_at"),
             (self._dev_execution_store, "dev_execution_plans", "updated_at"),
             (self._dev_execution_store, "dev_execution_plan_tasks", "updated_at"),
+            (self._dev_verification_store, "dev_verification_runs", "updated_at"),
+            (self._dev_signal_store, "dev_signal_reports", "updated_at"),
+            (self._dev_signal_store, "dev_backlog_proposals", "updated_at"),
+            (self._dev_incident_store, "dev_incidents", "updated_at"),
+            (self._dev_scm_store, "dev_merge_readiness", "created_at"),
+            (self._dev_scm_store, "dev_merge_approvals", "created_at"),
             (self._subagent_event_store, "subagent_events", "event_id"),
         ):
             if store is None:
@@ -2102,6 +2146,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 "dev_revise_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/revise-draft"},
                 "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
                 "dev_cancel_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/cancel-draft"},
+                "dev_verification_runs": {"method": "GET", "path": "/v1/dev/verification-runs"},
+                "dev_start_verification_run": {"method": "POST", "path": "/v1/dev/verification-runs"},
+                "dev_verification_run_detail": {"method": "GET", "path": "/v1/dev/verification-runs/{verification_run_id}"},
+                "dev_signal_reports": {"method": "GET", "path": "/v1/dev/signal-reports"},
+                "dev_create_signal_report": {"method": "POST", "path": "/v1/dev/signal-reports"},
+                "dev_signal_report_detail": {"method": "GET", "path": "/v1/dev/signal-reports/{report_id}"},
+                "dev_ci_status": {"method": "GET", "path": "/v1/dev/ci-status"},
+                "dev_product_events": {"method": "GET", "path": "/v1/dev/product-events"},
+                "dev_ingest_product_events": {"method": "POST", "path": "/v1/dev/product-events"},
+                "dev_detect_incidents": {"method": "POST", "path": "/v1/dev/incidents/detect"},
+                "dev_incidents": {"method": "GET", "path": "/v1/dev/incidents"},
+                "dev_incident_detail": {"method": "GET", "path": "/v1/dev/incidents/{incident_id}"},
+                "dev_incident_action": {"method": "POST", "path": "/v1/dev/incidents/{incident_id}/{action}"},
+                "dev_pr_state": {"method": "GET", "path": "/v1/dev/pr-state"},
+                "dev_code_review_runs": {"method": "GET", "path": "/v1/dev/code-review-runs"},
+                "dev_start_code_review_run": {"method": "POST", "path": "/v1/dev/code-review-runs"},
+                "dev_merge_readiness": {"method": "GET", "path": "/v1/dev/merge-readiness"},
+                "dev_merge_approval_request": {"method": "POST", "path": "/v1/dev/merge-approvals"},
+                "dev_merge_approval_approve": {"method": "POST", "path": "/v1/dev/merge-approvals/{approval_id}/approve"},
+                "dev_merge_execute": {"method": "POST", "path": "/v1/dev/merge"},
+                "dev_backlog_proposals": {"method": "GET", "path": "/v1/dev/backlog-proposals"},
+                "dev_backlog_proposal_action": {"method": "POST", "path": "/v1/dev/backlog-proposals/{proposal_id}/{action}"},
+                "dev_signal_health": {"method": "GET", "path": "/v1/dev/signal-health"},
                 "kanban_board": {"method": "GET", "path": "/v1/kanban/board"},
                 "kanban_events": {"method": "GET", "path": "/v1/kanban/events"},
             },
@@ -5896,6 +5963,10 @@ class APIServerAdapter(BasePlatformAdapter):
         clarification_store = self._ensure_dev_clarification_store()
         artifact_store = self._ensure_dev_plan_artifact_store()
         execution_store = self._ensure_dev_execution_store()
+        verification_store = self._ensure_dev_verification_store()
+        signal_store = self._ensure_dev_signal_store()
+        incident_store = self._ensure_dev_incident_store()
+        scm_store = self._ensure_dev_scm_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
@@ -5939,6 +6010,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 plan_id=plan["plan_id"],
                                 bridge=bridge,
                                 event_store=event_store,
+                                verification_store=verification_store,
                             )["plan"])
                         except Exception:
                             derived_plans.append(plan)
@@ -5988,6 +6060,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "dev_plans": plans,
                 "latest_plan_artifact_build": latest_build,
                 "latest_draft_review": latest_draft_review,
+                "dev_signal_health": signal_health(signal_store=signal_store, event_store=event_store) if signal_store else None,
+                "dev_backlog_proposals": (list_backlog_proposals(signal_store=signal_store, limit=10).get("data", []) if signal_store else []),
+                "dev_incidents": (incident_store.list_incidents(limit=5) if incident_store else []),
+                "dev_merge_readiness": (scm_store.latest_readiness(limit=5) if scm_store else []),
             }
 
         cached = await self._read_model_cache.get_or_compute(
@@ -6583,6 +6659,76 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         return self._dev_plan_artifact_store
 
+    def _ensure_dev_verification_store(self) -> Optional[DevVerificationStore]:
+        """Create the Dev verification store on the same state.db as execution plans."""
+        if self._dev_verification_store is not None:
+            return self._dev_verification_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_verification_store = DevVerificationStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev verification store unavailable: %s", exc)
+            return None
+        return self._dev_verification_store
+
+    def _ensure_dev_signal_store(self) -> Optional[DevProductionSignalStore]:
+        """Create the Dev production signal store on the same state.db as execution plans."""
+        if self._dev_signal_store is not None:
+            return self._dev_signal_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_signal_store = DevProductionSignalStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev production signal store unavailable: %s", exc)
+            return None
+        return self._dev_signal_store
+
+    def _ensure_dev_product_event_store(self) -> Optional[DevProductEventStore]:
+        """Create the product-event store on the same state.db as execution plans."""
+        if self._dev_product_event_store is not None:
+            return self._dev_product_event_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_product_event_store = DevProductEventStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev product event store unavailable: %s", exc)
+            return None
+        return self._dev_product_event_store
+
+    def _ensure_dev_incident_store(self) -> Optional[DevIncidentStore]:
+        """Create the Dev incident store on the same state.db as execution plans."""
+        if self._dev_incident_store is not None:
+            return self._dev_incident_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_incident_store = DevIncidentStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev incident store unavailable: %s", exc)
+            return None
+        return self._dev_incident_store
+
+    def _ensure_dev_scm_store(self) -> Optional[DevSCMLifecycleStore]:
+        """Create the SCM lifecycle store on the same state.db as execution plans."""
+        if self._dev_scm_store is not None:
+            return self._dev_scm_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_scm_store = DevSCMLifecycleStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev SCM lifecycle store unavailable: %s", exc)
+            return None
+        return self._dev_scm_store
+
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
         auth_err = self._check_auth(request)
@@ -7157,6 +7303,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         plan_id=plan["plan_id"],
                         bridge=bridge,
                         event_store=event_store,
+                        verification_store=self._ensure_dev_verification_store(),
                     )["plan"])
                 except Exception:
                     plans.append(plan)
@@ -7191,6 +7338,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 plan_id=plan_id,
                 event_store=self._ensure_subagent_event_store(),
+                verification_store=self._ensure_dev_verification_store(),
             )
         except KeyError:
             return web.json_response(_openai_error(f"Dev execution plan not found: {plan_id}"), status=404)
@@ -7212,6 +7360,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 plan_id=plan_id,
                 event_store=self._ensure_subagent_event_store(),
+                verification_store=self._ensure_dev_verification_store(),
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
@@ -7683,6 +7832,575 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
+
+    async def _handle_dev_verification_runs(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/verification-runs — list or launch advisory verification."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        execution_store = self._ensure_dev_execution_store()
+        verification_store = self._ensure_dev_verification_store()
+        event_store = self._ensure_subagent_event_store()
+        if execution_store is None or verification_store is None:
+            return web.json_response(_openai_error("Dev verification store unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                result = list_verification_runs(
+                    verification_store=verification_store,
+                    plan_id=request.query.get("plan_id") or None,
+                    task_id=request.query.get("task_id") or None,
+                    limit=self._bounded_query_limit(request, default=50),
+                    event_store=event_store,
+                )
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        plan_id = str(body.get("plan_id") or "").strip()
+        task_id = str(body.get("task_id") or "").strip() or None
+        if not plan_id:
+            return web.json_response(_openai_error("plan_id is required"), status=400)
+        try:
+            result = launch_verification_run(
+                execution_store=execution_store,
+                verification_store=verification_store,
+                plan_id=plan_id,
+                task_id=task_id,
+                event_store=event_store,
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_verification_run_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/verification-runs/{verification_run_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        verification_store = self._ensure_dev_verification_store()
+        if verification_store is None:
+            return web.json_response(_openai_error("Dev verification store unavailable"), status=503)
+        run_id = str(request.match_info.get("verification_run_id") or "").strip()
+        try:
+            result = refresh_verification_run(
+                verification_store=verification_store,
+                verification_run_id=run_id,
+                event_store=self._ensure_subagent_event_store(),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_signal_reports(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/signal-reports — list or run production-signal digest."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        signal_store = self._ensure_dev_signal_store()
+        event_store = self._ensure_subagent_event_store()
+        if signal_store is None or event_store is None:
+            return web.json_response(_openai_error("Dev signal stores unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                return web.json_response(list_signal_reports(
+                    signal_store=signal_store,
+                    limit=self._bounded_query_limit(request, default=50),
+                ))
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            if _coerce_request_bool(body.get("digest"), default=False):
+                result = run_signal_digest(
+                    signal_store=signal_store,
+                    event_store=event_store,
+                    product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    source=body.get("source") or "deterministic",
+                    window_days=body.get("window_days"),
+                    filters=body.get("filters") if isinstance(body.get("filters"), dict) else {},
+                    persist=_coerce_request_bool(body.get("persist"), default=True),
+                )
+            else:
+                result = generate_signal_report(
+                    signal_store=signal_store,
+                    event_store=event_store,
+                    product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    source=body.get("source") or "deterministic",
+                    window_days=body.get("window_days"),
+                    filters=body.get("filters") if isinstance(body.get("filters"), dict) else {},
+                    persist=_coerce_request_bool(body.get("persist"), default=True),
+                    create_proposals=_coerce_request_bool(body.get("create_proposals"), default=True),
+                )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_ci_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/ci-status — fail-open GitHub CI state for a repo/ref."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        repo = request.rel_url.query.get("repo") or ""
+        ref = request.rel_url.query.get("ref") or ""
+        result = fetch_ci_status(repo=repo, ref=ref)
+        return web.json_response(result)
+
+    def _dev_merge_readiness_snapshot(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        plan_id: Optional[str],
+        task_id: Optional[str],
+    ) -> Dict[str, Any]:
+        scm_store = self._ensure_dev_scm_store()
+        execution_store = self._ensure_dev_execution_store()
+        verification_store = self._ensure_dev_verification_store()
+        if scm_store is None:
+            raise RuntimeError("Dev SCM lifecycle store unavailable")
+        pr_state = fetch_pr_state(repo=repo, pr_number=pr_number, plan_id=plan_id, task_id=task_id)
+        if pr_state.get("head_sha") or pr_state.get("warnings"):
+            try:
+                scm_store.upsert_pr_state(pr_state)
+            except Exception as exc:
+                pr_state.setdefault("warnings", []).append(f"PR state was not persisted: {exc}")
+        plan = execution_store.get_plan(plan_id) if execution_store is not None and plan_id else None
+        draft_status = (plan or {}).get("draft_status")
+        verification = {}
+        if verification_store is not None and plan_id and task_id:
+            try:
+                verification = verification_store.latest_for_task(plan_id=plan_id, task_id=task_id) or {}
+            except Exception:
+                verification = {}
+        code_review = scm_store.latest_code_review(
+            repo=repo,
+            pr_number=int(pr_number),
+            head_sha=pr_state.get("head_sha"),
+        ) or scm_store.latest_code_review(repo=repo, pr_number=int(pr_number)) or {}
+        readiness = compose_merge_readiness(
+            repo=repo,
+            pr_number=int(pr_number),
+            pr_state=pr_state,
+            draft_status=draft_status,
+            verification=verification,
+            code_review=code_review,
+            plan_id=plan_id,
+            task_id=task_id,
+        )
+        return scm_store.record_readiness(readiness)
+
+    async def _handle_dev_pr_state(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/pr-state — fetch and persist fail-open PR state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        scm_store = self._ensure_dev_scm_store()
+        if scm_store is None:
+            return web.json_response(_openai_error("Dev SCM lifecycle store unavailable"), status=503)
+        try:
+            result = fetch_pr_state(
+                repo=request.rel_url.query.get("repo") or "",
+                pr_number=int(request.rel_url.query.get("pr_number") or "0"),
+                plan_id=request.rel_url.query.get("plan_id") or None,
+                task_id=request.rel_url.query.get("task_id") or None,
+            )
+            if result.get("pr_number"):
+                result = scm_store.upsert_pr_state(result)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_code_review_runs(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/code-review-runs — list or record an independent PR review."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        scm_store = self._ensure_dev_scm_store()
+        execution_store = self._ensure_dev_execution_store()
+        if scm_store is None:
+            return web.json_response(_openai_error("Dev SCM lifecycle store unavailable"), status=503)
+        if request.method == "GET":
+            pr_number = request.rel_url.query.get("pr_number")
+            try:
+                return web.json_response({
+                    "ok": True,
+                    "object": "list",
+                    "data": scm_store.list_code_reviews(
+                        repo=request.rel_url.query.get("repo") or None,
+                        pr_number=int(pr_number) if pr_number else None,
+                        limit=self._bounded_query_limit(request, default=50),
+                    ),
+                })
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            repo = str(body.get("repo") or "").strip()
+            pr_number = int(body.get("pr_number") or 0)
+            plan_id = str(body.get("plan_id") or "").strip() or None
+            task_id = str(body.get("task_id") or "").strip() or None
+            pr_state = body.get("pr_state") if isinstance(body.get("pr_state"), dict) else None
+            if pr_state is None:
+                pr_state = fetch_pr_state(repo=repo, pr_number=pr_number, plan_id=plan_id, task_id=task_id)
+            plan = execution_store.get_plan(plan_id) if execution_store is not None and plan_id else {}
+            parsed = parse_code_review_result(body.get("result") if body.get("result") is not None else body)
+            prompt = build_code_review_prompt(plan=plan or {}, pr_state=pr_state)
+            review = scm_store.record_code_review({
+                **parsed,
+                "repo": repo,
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "pr_number": pr_number,
+                "head_sha": pr_state.get("head_sha"),
+                "status": "completed" if body.get("result") is not None or parsed.get("verdict") != "unknown" else "requested",
+                "profile_id": "review",
+                "permissions": "review_only",
+                "prompt": prompt,
+            })
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(review)
+
+    async def _handle_dev_merge_readiness(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/merge-readiness — compose draft, CI, verification, review, and mergeability gates."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            result = self._dev_merge_readiness_snapshot(
+                repo=request.rel_url.query.get("repo") or "",
+                pr_number=int(request.rel_url.query.get("pr_number") or "0"),
+                plan_id=request.rel_url.query.get("plan_id") or None,
+                task_id=request.rel_url.query.get("task_id") or None,
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_merge_approvals(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/merge-approvals — request a single-use head_sha-bound merge approval."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        scm_store = self._ensure_dev_scm_store()
+        if scm_store is None:
+            return web.json_response(_openai_error("Dev SCM lifecycle store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            readiness = body.get("readiness") if isinstance(body.get("readiness"), dict) else None
+            if readiness is None:
+                readiness = self._dev_merge_readiness_snapshot(
+                    repo=str(body.get("repo") or ""),
+                    pr_number=int(body.get("pr_number") or 0),
+                    plan_id=body.get("plan_id"),
+                    task_id=body.get("task_id"),
+                )
+            result = request_merge_approval(
+                store=scm_store,
+                readiness=readiness,
+                requested_by=body.get("requested_by") or "felipe",
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_merge_approval_approve(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/merge-approvals/{approval_id}/approve — approve a requested merge."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        scm_store = self._ensure_dev_scm_store()
+        if scm_store is None:
+            return web.json_response(_openai_error("Dev SCM lifecycle store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            approval = scm_store.approve_merge_approval(
+                request.match_info["approval_id"],
+                approved_by=body.get("approved_by") or "felipe",
+                message=body.get("message"),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response({"ok": True, "object": "hermes.dev_merge_approval_resolution", "approval": approval})
+
+    async def _handle_dev_merge_execute(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/merge — execute only with a live single-use approval and green gates."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        scm_store = self._ensure_dev_scm_store()
+        if scm_store is None:
+            return web.json_response(_openai_error("Dev SCM lifecycle store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            approval_id = str(body.get("approval_id") or "").strip()
+            approval = scm_store.get_merge_approval(approval_id)
+            if not approval:
+                return web.json_response(_openai_error("Merge approval not found"), status=404)
+            live_readiness = body.get("live_readiness") if isinstance(body.get("live_readiness"), dict) else None
+            if live_readiness is None:
+                live_readiness = self._dev_merge_readiness_snapshot(
+                    repo=approval["repo"],
+                    pr_number=int(approval["pr_number"]),
+                    plan_id=approval.get("plan_id"),
+                    task_id=approval.get("task_id"),
+                )
+            result = execute_merge(
+                store=scm_store,
+                approval_id=approval_id,
+                live_readiness=live_readiness,
+                merge_method=str(body.get("merge_method") or "squash"),
+            )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_product_events(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/product-events — inspect or ingest shipped-product error events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_event_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev product event store unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                return web.json_response({
+                    "ok": True,
+                    "object": "list",
+                    "data": product_store.list_events(
+                        event_type=request.rel_url.query.get("type") or None,
+                        limit=self._bounded_query_limit(request, default=100),
+                    ),
+                })
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        try:
+            return web.json_response(product_store.ingest_batch(body))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_dev_incident_detect(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/incidents/detect — classify advisory incidents."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        incident_store = self._ensure_dev_incident_store()
+        product_store = self._ensure_dev_product_event_store()
+        signal_store = self._ensure_dev_signal_store()
+        if incident_store is None or product_store is None:
+            return web.json_response(_openai_error("Dev incident stores unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = detect_incidents(
+                incident_store=incident_store,
+                product_event_store=product_store,
+                signal_store=signal_store,
+                current_release=body.get("current_release") if isinstance(body.get("current_release"), dict) else None,
+                releases=body.get("releases") if isinstance(body.get("releases"), list) else [],
+                repo=str(body.get("repo") or ""),
+                window_days=body.get("window_days"),
+                filters=body.get("filters") if isinstance(body.get("filters"), dict) else {},
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_incidents(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/incidents."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        incident_store = self._ensure_dev_incident_store()
+        if incident_store is None:
+            return web.json_response(_openai_error("Dev incident store unavailable"), status=503)
+        data = incident_store.list_incidents(
+            status=request.rel_url.query.get("status") or None,
+            limit=self._bounded_query_limit(request, default=50),
+        )
+        return web.json_response({"ok": True, "object": "list", "data": data, "total": len(data)})
+
+    async def _handle_dev_incident_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/incidents/{incident_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        incident_store = self._ensure_dev_incident_store()
+        if incident_store is None:
+            return web.json_response(_openai_error("Dev incident store unavailable"), status=503)
+        incident = incident_store.get_incident(request.match_info["incident_id"])
+        if not incident:
+            return web.json_response(_openai_error("Dev incident not found"), status=404)
+        return web.json_response(incident)
+
+    async def _handle_dev_incident_action(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/incidents/{incident_id}/{action}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        incident_store = self._ensure_dev_incident_store()
+        signal_store = self._ensure_dev_signal_store()
+        if incident_store is None:
+            return web.json_response(_openai_error("Dev incident store unavailable"), status=503)
+        action = str(request.match_info.get("action") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            if action == "acknowledge":
+                result = acknowledge_incident(
+                    incident_store=incident_store,
+                    incident_id=request.match_info["incident_id"],
+                )
+            elif action == "resolve":
+                if signal_store is None:
+                    return web.json_response(_openai_error("Dev signal store unavailable"), status=503)
+                result = resolve_incident(
+                    incident_store=incident_store,
+                    signal_store=signal_store,
+                    incident_id=request.match_info["incident_id"],
+                    postmortem=body.get("postmortem") if isinstance(body.get("postmortem"), dict) else body,
+                )
+            else:
+                return web.json_response(_openai_error(f"Unsupported incident action: {action}"), status=400)
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_signal_report_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/signal-reports/{report_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        signal_store = self._ensure_dev_signal_store()
+        if signal_store is None:
+            return web.json_response(_openai_error("Dev signal store unavailable"), status=503)
+        report = signal_store.get_report(request.match_info["report_id"])
+        if not report:
+            return web.json_response(_openai_error("Dev signal report not found"), status=404)
+        return web.json_response(report)
+
+    async def _handle_dev_backlog_proposals(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/backlog-proposals."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        signal_store = self._ensure_dev_signal_store()
+        if signal_store is None:
+            return web.json_response(_openai_error("Dev signal store unavailable"), status=503)
+        try:
+            return web.json_response(list_backlog_proposals(
+                signal_store=signal_store,
+                status=request.rel_url.query.get("status") or None,
+                limit=self._bounded_query_limit(request, default=50),
+            ))
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_dev_backlog_proposal_action(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/backlog-proposals/{proposal_id}/{action}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        signal_store = self._ensure_dev_signal_store()
+        event_store = self._ensure_subagent_event_store()
+        if signal_store is None:
+            return web.json_response(_openai_error("Dev signal store unavailable"), status=503)
+        action = str(request.match_info.get("action") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            if action == "measure-outcome":
+                if event_store is None:
+                    return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
+                result = measure_proposal_outcome(
+                    signal_store=signal_store,
+                    event_store=event_store,
+                    product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    proposal_id=request.match_info["proposal_id"],
+                    window_days=body.get("window_days"),
+                    source=body.get("source") or "deterministic",
+                )
+            else:
+                result = transition_backlog_proposal(
+                    signal_store=signal_store,
+                    clarification_store=self._ensure_dev_clarification_store(),
+                    proposal_id=request.match_info["proposal_id"],
+                    action=action,
+                    project_id=body.get("project_id"),
+                )
+        except KeyError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_signal_health(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/signal-health."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        signal_store = self._ensure_dev_signal_store()
+        if signal_store is None:
+            return web.json_response(_openai_error("Dev signal store unavailable"), status=503)
+        return web.json_response(signal_health(
+            signal_store=signal_store,
+            event_store=self._ensure_subagent_event_store(),
+        ))
 
     async def _handle_ao_sessions(self, request: "web.Request") -> "web.Response":
         """GET /v1/ao/sessions — list AO sessions known to AO/Hermes."""
@@ -8466,6 +9184,29 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/dev/runtimes/openhands/server/stop", self._handle_dev_openhands_server_stop)
             self._app.router.add_get("/v1/dev/execution-plans", self._handle_dev_execution_plans)
             self._app.router.add_post("/v1/dev/execution-plans", self._handle_dev_execution_plans)
+            self._app.router.add_get("/v1/dev/verification-runs", self._handle_dev_verification_runs)
+            self._app.router.add_post("/v1/dev/verification-runs", self._handle_dev_verification_runs)
+            self._app.router.add_get("/v1/dev/verification-runs/{verification_run_id}", self._handle_dev_verification_run_detail)
+            self._app.router.add_get("/v1/dev/signal-reports", self._handle_dev_signal_reports)
+            self._app.router.add_post("/v1/dev/signal-reports", self._handle_dev_signal_reports)
+            self._app.router.add_get("/v1/dev/signal-reports/{report_id}", self._handle_dev_signal_report_detail)
+            self._app.router.add_get("/v1/dev/ci-status", self._handle_dev_ci_status)
+            self._app.router.add_get("/v1/dev/pr-state", self._handle_dev_pr_state)
+            self._app.router.add_get("/v1/dev/code-review-runs", self._handle_dev_code_review_runs)
+            self._app.router.add_post("/v1/dev/code-review-runs", self._handle_dev_code_review_runs)
+            self._app.router.add_get("/v1/dev/merge-readiness", self._handle_dev_merge_readiness)
+            self._app.router.add_post("/v1/dev/merge-approvals", self._handle_dev_merge_approvals)
+            self._app.router.add_post("/v1/dev/merge-approvals/{approval_id}/approve", self._handle_dev_merge_approval_approve)
+            self._app.router.add_post("/v1/dev/merge", self._handle_dev_merge_execute)
+            self._app.router.add_get("/v1/dev/product-events", self._handle_dev_product_events)
+            self._app.router.add_post("/v1/dev/product-events", self._handle_dev_product_events)
+            self._app.router.add_post("/v1/dev/incidents/detect", self._handle_dev_incident_detect)
+            self._app.router.add_get("/v1/dev/incidents", self._handle_dev_incidents)
+            self._app.router.add_get("/v1/dev/incidents/{incident_id}", self._handle_dev_incident_detail)
+            self._app.router.add_post("/v1/dev/incidents/{incident_id}/{action}", self._handle_dev_incident_action)
+            self._app.router.add_get("/v1/dev/backlog-proposals", self._handle_dev_backlog_proposals)
+            self._app.router.add_post("/v1/dev/backlog-proposals/{proposal_id}/{action}", self._handle_dev_backlog_proposal_action)
+            self._app.router.add_get("/v1/dev/signal-health", self._handle_dev_signal_health)
             self._app.router.add_post("/v1/dev/execution-plans/supervise", self._handle_dev_execution_plans_supervise)
             self._app.router.add_get("/v1/dev/supervisor/loop", self._handle_dev_supervisor_loop)
             self._app.router.add_post("/v1/dev/supervisor/loop", self._handle_dev_supervisor_loop)

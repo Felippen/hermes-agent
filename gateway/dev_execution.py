@@ -2140,6 +2140,7 @@ def derive_execution_plan_status(
     plan_id: str,
     bridge: Any = None,
     event_store: Any = None,
+    verification_store: Any = None,
 ) -> Dict[str, Any]:
     """Derive truthful Dev plan/task status from linked AO sessions and events."""
     plan = store.get_plan(plan_id)
@@ -2178,6 +2179,14 @@ def derive_execution_plan_status(
         "next_step": next_step,
         "next_step_reason": next_step_reason,
     })
+    if verification_store is not None:
+        try:
+            from gateway.dev_control.acceptance_verification import annotate_plan_with_verification
+
+            plan = annotate_plan_with_verification(plan, verification_store)
+            tasks = plan.get("tasks") or tasks
+        except Exception:
+            pass
     return {
         "ok": True,
         "object": "hermes.dev_execution_plan_status",
