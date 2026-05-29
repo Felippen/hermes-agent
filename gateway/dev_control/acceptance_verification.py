@@ -332,6 +332,37 @@ def parse_transcript_verification_results(text: Optional[str], executable_comman
     }
 
 
+def _parse_worker_verification_output(
+    text: str,
+    executable_commands: Iterable[Dict[str, Any]],
+) -> tuple[Dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    parsed = parse_verification_results(text)
+    if parsed.get("warning"):
+        warnings.append(parsed["warning"])
+    if parsed.get("results") and not _parsed_results_are_prompt_template(parsed):
+        return parsed, warnings
+    recovered = parse_transcript_verification_results(text, executable_commands)
+    if recovered.get("results"):
+        if recovered.get("warning"):
+            warnings.append(recovered["warning"])
+        return recovered, warnings
+    if _parsed_results_are_prompt_template(parsed):
+        parsed = _empty_parse("invalid", "Worker output only contained the prompt's DEV_VERIFICATION_RESULTS template.")
+        warnings.append(parsed["warning"])
+    elif recovered.get("warning"):
+        warnings.append(recovered["warning"])
+    return parsed, warnings
+
+
+def _parsed_results_are_prompt_template(parsed: Dict[str, Any]) -> bool:
+    for item in parsed.get("results") or []:
+        excerpt = str(item.get("output_excerpt") or "").lower()
+        if "include the real test/build summary line" in excerpt:
+            return True
+    return False
+
+
 def reconcile_results(seed_results: list[Dict[str, Any]], worker_results: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[str]]:
     by_id = {str(item.get("criterion_id") or ""): item for item in worker_results}
     warnings: list[str] = []
@@ -455,30 +486,21 @@ def refresh_verification_run(
     latest_event = event_store.latest_event_for_ao_session(session_id)
     session = _verification_session(run, bridge=bridge)
     transcript = _verification_transcript(run, session=session, bridge=bridge)
-    if not latest_event and not _session_is_terminal(session):
-        return run
     status = str((latest_event or {}).get("status") or "").lower()
     event_type = str((latest_event or {}).get("event") or "").lower()
     event_terminal = event_type == "subagent.complete" or status in TERMINAL_SESSION_STATUSES
-    if not event_terminal and not _session_is_terminal(session):
-        return run
     event_text = _event_text(latest_event or {})
     combined_text = "\n".join(part for part in (event_text, transcript) if str(part or "").strip())
-    parsed = parse_verification_results(combined_text)
     warnings = list(run.get("warnings") or [])
-    if parsed.get("warning"):
-        warnings.append(parsed["warning"])
-    if parsed.get("status") in {"missing", "invalid"}:
-        recovered = parse_transcript_verification_results(combined_text, run.get("executable_commands") or [])
-        if recovered.get("results"):
-            parsed = recovered
-            if parsed.get("warning"):
-                warnings.append(parsed["warning"])
-        else:
-            return verification_store.update_run(verification_run_id, {
-                "status": "needs_attention",
-                "warnings": _unique([*warnings, recovered.get("warning") or parsed.get("warning") or "Verification worker output could not be parsed."]),
-            })
+    parsed, parse_warnings = _parse_worker_verification_output(combined_text, run.get("executable_commands") or [])
+    warnings.extend(parse_warnings)
+    if not event_terminal and not _session_is_terminal(session) and not parsed.get("results"):
+        return run
+    if not parsed.get("results"):
+        return verification_store.update_run(verification_run_id, {
+            "status": "needs_attention",
+            "warnings": _unique([*warnings, parsed.get("warning") or "Verification worker output could not be parsed."]),
+        })
     results, reconcile_warnings = reconcile_results(run.get("results") or [], parsed.get("results") or [])
     return verification_store.update_run(verification_run_id, {
         "status": "completed",

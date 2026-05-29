@@ -3,6 +3,17 @@ set -euo pipefail
 
 real_codex="${CODEX_REAL_BIN:-/opt/homebrew/bin/codex}"
 
+if [[ "${HOME:-}" == *"/.oryn-lab" && "${PWD:-}" == "$HOME"* ]]; then
+  config="$HOME/.codex/config.toml"
+  mkdir -p "$(dirname "$config")"
+  if ! grep -Fq "[projects.\"$PWD\"]" "$config" 2>/dev/null; then
+    {
+      [[ -s "$config" ]] && printf '\n'
+      printf '[projects."%s"]\ntrust_level = "trusted"\n' "$PWD"
+    } >> "$config"
+  fi
+fi
+
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -60,6 +60,8 @@ from gateway.dev_control.read_models import (
     build_agent_board_rows,
 )
 from gateway.dev_control.ci_status import fetch_ci_status
+from gateway.dev_control.project_scope import resolve_project_id
+from gateway.dev_control.chat_project_context import build_chat_project_context_overlay
 from gateway.dev_control.routes import (
     DevControlRouteMixin,
     dev_control_capabilities,
@@ -672,7 +674,7 @@ def _derive_chat_session_id(
 # Slash commands serviceable via POST /v1/slash on the API server.
 API_SERVER_SLASH_COMMANDS = frozenset({
     "help", "commands", "status", "profile", "yolo", "restart",
-    "new", "reset", "clear", "stop", "steer", "queue",
+    "new", "reset", "clear", "stop", "steer", "queue", "background",
 })
 
 # Commands the Oryn Workspace app may handle natively (still listed in catalog).
@@ -1999,6 +2001,11 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "background_task_follow_up": {
+                    "method": "POST",
+                    "path": "/v1/background/tasks/{task_id}/follow-up",
+                },
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -2579,8 +2586,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         """Return the run/completion id for an in-flight agent turn on a session."""
         if not session_id:
             return None
+        normalized = session_id.casefold()
         for run_id, status in self._run_statuses.items():
-            if status.get("session_id") != session_id:
+            active_session = str(status.get("session_id") or "").casefold()
+            if active_session != normalized:
                 continue
             if status.get("status") in {"running", "waiting_for_approval", "stopping"}:
                 return run_id
@@ -2782,6 +2791,15 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     logger.debug("steer failed: %s", exc)
             return {"type": "send", "message": cmd_arg}
 
+        if canonical == "background" or cmd_name in {"bg", "btw"}:
+            if not cmd_arg.strip():
+                return {"type": "error", "message": "usage: /background <prompt>"}
+            return self._dispatch_api_background_command(
+                session_id,
+                cmd_arg.strip(),
+                gateway_session_key=gateway_session_key,
+            )
+
         if canonical == "stop":
             run_id = self._find_active_run_id_for_session(session_id)
             if not run_id:
@@ -2918,6 +2936,268 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "commands."
             ),
         }
+
+    def _dispatch_api_background_command(
+        self,
+        parent_session_id: str,
+        prompt: str,
+        gateway_session_key: str = None,
+    ) -> dict:
+        """Start a Hermes-native /background task for an API session."""
+        from datetime import datetime
+
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+
+        self._persist_subagent_event(
+            {
+                "event": "subagent.start",
+                "subagent_id": task_id,
+                "run_id": task_id,
+                "depth": 0,
+                "goal": prompt,
+                "status": "running",
+                "runtime": "background",
+                "preview": preview,
+                "timestamp": time.time(),
+            },
+            session_id=parent_session_id,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return {
+                "type": "error",
+                "message": "Background tasks require an active API server loop.",
+            }
+
+        task = loop.create_task(
+            self._run_api_background_task(
+                parent_session_id=parent_session_id,
+                prompt=prompt,
+                task_id=task_id,
+                gateway_session_key=gateway_session_key,
+            )
+        )
+        try:
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except Exception:  # noqa: BLE001
+            pass
+
+        content = (
+            f'🔄 Background task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            f"You can keep chatting — results will appear when done."
+        )
+        return {"type": "text", "content": content}
+
+    async def _run_api_background_task(
+        self,
+        *,
+        parent_session_id: str,
+        prompt: str,
+        task_id: str,
+        gateway_session_key: str = None,
+        is_follow_up: bool = False,
+    ) -> None:
+        """Execute a background prompt in an isolated session and mirror progress to the parent."""
+        started = time.time()
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+
+        def _persist(event: Dict[str, Any]) -> None:
+            payload = dict(event)
+            payload.setdefault("subagent_id", task_id)
+            payload.setdefault("run_id", task_id)
+            payload.setdefault("goal", prompt)
+            payload.setdefault("runtime", "background")
+            payload.setdefault("depth", 0)
+            payload.setdefault("timestamp", time.time())
+            self._persist_subagent_event(payload, session_id=parent_session_id)
+
+        if is_follow_up:
+            _persist({
+                "event": "subagent.progress",
+                "subagent_id": task_id,
+                "status": "running",
+                "message": "Follow-up sent",
+                "preview": preview,
+            })
+
+        def _tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            if str(event_type).startswith("subagent."):
+                event = self._subagent_event_payload(
+                    event_type,
+                    task_id,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    extra={
+                        **kwargs,
+                        "subagent_id": task_id,
+                        "goal": prompt,
+                        "runtime": "background",
+                        "depth": 0,
+                    },
+                )
+                event["subagent_id"] = task_id
+                _persist(event)
+                return
+            if not tool_name or str(tool_name).startswith("_"):
+                return
+            if event_type == "tool.started":
+                _persist({
+                    "event": "subagent.tool",
+                    "subagent_id": task_id,
+                    "tool": tool_name,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                    "status": "running",
+                })
+            elif event_type == "tool.completed":
+                _persist({
+                    "event": "subagent.tool",
+                    "subagent_id": task_id,
+                    "tool": tool_name,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                    "status": "failed" if kwargs.get("is_error") else "completed",
+                })
+
+        status = "completed"
+        summary = ""
+        usage: Dict[str, Any] = {}
+        try:
+            result, usage = await self._run_agent(
+                user_message=prompt,
+                conversation_history=[],
+                session_id=task_id,
+                tool_progress_callback=_tool_progress,
+                gateway_session_key=gateway_session_key,
+                run_id=task_id,
+            )
+            if isinstance(result, dict) and result.get("failed"):
+                status = "failed"
+                summary = str(result.get("error") or "Background task failed.")
+            else:
+                summary = (
+                    str(result.get("final_response") or "")
+                    if isinstance(result, dict)
+                    else str(result or "")
+                )
+                if not summary.strip():
+                    summary = "Background task completed."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_server background task %s failed: %s", task_id, exc)
+            status = "failed"
+            summary = str(exc)
+        finally:
+            self._active_run_agents.pop(task_id, None)
+
+        complete_payload: Dict[str, Any] = {
+            "event": "subagent.complete",
+            "subagent_id": task_id,
+            "status": status,
+            "summary": summary[:4000],
+            "preview": preview,
+            "duration_seconds": round(time.time() - started, 2),
+        }
+        if status == "completed" and usage:
+            complete_payload["input_tokens"] = usage.get("input_tokens")
+            complete_payload["output_tokens"] = usage.get("output_tokens")
+        _persist(complete_payload)
+
+    async def _handle_background_task_follow_up(self, request: "web.Request") -> "web.Response":
+        """POST /v1/background/tasks/{task_id}/follow-up — reply to a background agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = str(request.match_info.get("task_id") or "").strip()
+        if not task_id.startswith("bg_"):
+            return web.json_response(_openai_error("Invalid background task id"), status=400)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        message = str(body.get("message") or "").strip()
+        if not message:
+            return web.json_response(_openai_error("Follow-up message required"), status=400)
+
+        parent_session_id = str(body.get("session_id") or "").strip()
+        if not parent_session_id:
+            parent_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not parent_session_id:
+            return web.json_response(_openai_error("session_id is required"), status=400)
+
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        preview = message[:80] + ("..." if len(message) > 80 else "")
+        agent = self._active_run_agents.get(task_id)
+        if agent is not None and hasattr(agent, "steer"):
+            try:
+                if agent.steer(message):
+                    event = self._persist_subagent_event(
+                        {
+                            "event": "subagent.progress",
+                            "subagent_id": task_id,
+                            "run_id": task_id,
+                            "runtime": "background",
+                            "status": "running",
+                            "message": "Follow-up steered",
+                            "preview": preview,
+                            "timestamp": time.time(),
+                        },
+                        session_id=parent_session_id,
+                    )
+                    return web.json_response({
+                        "ok": True,
+                        "task_id": task_id,
+                        "mode": "steer",
+                        "message": "Follow-up queued for the running background agent.",
+                        "event": event,
+                    })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("background follow-up steer failed for %s: %s", task_id, exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return web.json_response(
+                _openai_error("Background follow-up requires an active API server loop."),
+                status=503,
+            )
+
+        task = loop.create_task(
+            self._run_api_background_task(
+                parent_session_id=parent_session_id,
+                prompt=message,
+                task_id=task_id,
+                gateway_session_key=gateway_session_key,
+                is_follow_up=True,
+            )
+        )
+        try:
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except Exception:  # noqa: BLE001
+            pass
+
+        return web.json_response({
+            "ok": True,
+            "task_id": task_id,
+            "mode": "continue",
+            "message": "Follow-up sent to the background agent.",
+        })
 
     def _execute_api_slash_command(
         self, command_text: str, session_id: str, gateway_session_key: str = None
@@ -3060,6 +3340,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 status=400,
             )
 
+        project_overlay = build_chat_project_context_overlay(body)
+        if project_overlay:
+            system_prompt = (
+                f"{system_prompt}\n\n{project_overlay}"
+                if system_prompt
+                else project_overlay
+            )
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -3170,16 +3458,13 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             # (e.g. internal/filtered tools) is silently dropped instead of
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
-            _legacy_started_tools: set[str] = set()
-            _legacy_completed_tools: set[str] = set()
-
             def _on_tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
-                """Bridge legacy tool progress into chat-completions SSE.
+                """Bridge non-tool progress into chat-completions SSE.
 
-                Hermes still emits some user-visible tool activity through the
-                legacy progress callback before structured tool callbacks fire.
-                Prefer this path for display labels, then suppress the later
-                structured duplicate for the same tool name.
+                Tool start/complete use structured callbacks so clients receive
+                correlated ``toolCallId`` payloads (and todo arguments/results).
+                Legacy ``tool.started`` / ``tool.completed`` events must not be
+                mirrored here — they previously suppressed the structured pair.
                 """
                 if str(event_type).startswith("subagent."):
                     event = self._subagent_event_payload(
@@ -3196,23 +3481,6 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if event_type == "reasoning.available" and preview:
                     _stream_q.put(("__reasoning_delta__", {"text": preview}))
                     return
-                if not tool_name or str(tool_name).startswith("_"):
-                    return
-                if event_type == "tool.started":
-                    _legacy_started_tools.add(tool_name)
-                    from agent.display import get_tool_emoji
-                    _stream_q.put(("__tool_progress__", {
-                        "tool": tool_name,
-                        "emoji": get_tool_emoji(tool_name),
-                        "label": preview or tool_name,
-                        "status": "running",
-                    }))
-                elif event_type == "tool.completed":
-                    _legacy_completed_tools.add(tool_name)
-                    _stream_q.put(("__tool_progress__", {
-                        "tool": tool_name,
-                        "status": "failed" if kwargs.get("is_error") else "completed",
-                    }))
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Emit ``hermes.tool.progress`` with ``status: running``.
@@ -3230,17 +3498,21 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
-                if function_name in _legacy_started_tools:
-                    return
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                progress_payload = {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                }
+                if function_name == "todo" and function_args:
+                    try:
+                        progress_payload["arguments"] = json.dumps(function_args)
+                    except Exception:
+                        pass
+                _stream_q.put(("__tool_progress__", progress_payload))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -3252,13 +3524,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                if function_name in _legacy_completed_tools:
-                    return
-                _stream_q.put(("__tool_progress__", {
+                progress_payload = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
+                }
+                if function_name == "todo" and function_result:
+                    progress_payload["result"] = function_result
+                _stream_q.put(("__tool_progress__", progress_payload))
 
             def _on_context_usage(payload: Dict[str, Any]) -> None:
                 if payload:
@@ -6575,7 +6848,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         latest = store.latest_event_for_ao_session(source_session_id) if store else None
         prior_summary = (latest or {}).get("summary") or (latest or {}).get("message") or (latest or {}).get("preview")
         instruction = str(body.get("instruction") or "").strip()
-        project_id = str(body.get("project_id") or prompt_meta.get("project_id") or "OrynWorkspace")
+        project_id = resolve_project_id(body.get("project_id"), prompt_meta.get("project_id"))
         agent = body.get("agent") or prompt_meta.get("agent")
         model = body.get("model") or prompt_meta.get("model")
         reasoning_effort = body.get("reasoning_effort") or prompt_meta.get("reasoning_effort")
@@ -6837,6 +7110,63 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject guidance into a live run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            body = {}
+
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return web.json_response(_openai_error("'text' is required"), status=400)
+
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(
+                _openai_error(
+                    f"Run not found or not steerable: {run_id}",
+                    code="run_not_found",
+                ),
+                status=404,
+            )
+
+        if not hasattr(agent, "steer"):
+            return web.json_response(
+                _openai_error(
+                    "Active run does not support steer",
+                    code="steer_unsupported",
+                ),
+                status=409,
+            )
+
+        try:
+            accepted = bool(agent.steer(text))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("steer failed for run %s: %s", run_id, exc)
+            return web.json_response(
+                _openai_error(f"Steer failed: {exc}", code="steer_failed"),
+                status=500,
+            )
+
+        preview = text[:80] + ("..." if len(text) > 80 else "")
+        return web.json_response({
+            "object": "hermes.run.steer_result",
+            "run_id": run_id,
+            "status": "queued" if accepted else "rejected",
+            "text": text,
+            "message": (
+                f"Steer queued — arrives after the next tool call: {preview}"
+                if accepted
+                else "Steer rejected"
+            ),
+        })
+
     async def _handle_ao_session_stop(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/stop — stop an AO worker session."""
         auth_err = self._check_auth(request)
@@ -7044,6 +7374,11 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             register_dev_control_routes(self._app, self)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/steer", self._handle_steer_run)
+            self._app.router.add_post(
+                "/v1/background/tasks/{task_id}/follow-up",
+                self._handle_background_task_follow_up,
+            )
             self._app.router.add_get("/v1/ao/sessions", self._handle_ao_sessions)
             self._app.router.add_get("/v1/ao/sessions/{session_id}", self._handle_ao_session_detail)
             # Store the adapter after native routes are registered. Local Hermes-Relay

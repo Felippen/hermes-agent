@@ -31,6 +31,7 @@ from gateway.dev_control.plan_artifacts import DevPlanArtifactStore
 from gateway.dev_control.acceptance_verification import DevVerificationStore
 from gateway.dev_control.production_signals import DevProductionSignalStore
 from gateway.dev_control.reliability import DevReliabilityStore
+from gateway.dev_control.lab_loop import DevLabLoopStore
 from gateway.dev_control.repo_grounding import collect_repo_grounding
 from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
@@ -256,6 +257,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/dev/reliability/recompute", adapter._handle_dev_reliability_recompute)
     app.router.add_get("/v1/dev/reliability/weakest", adapter._handle_dev_reliability_weakest)
     app.router.add_get("/v1/dev/reliability/{category:.+}", adapter._handle_dev_reliability_category)
+    app.router.add_get("/v1/dev/lab-loop/health", adapter._handle_dev_lab_loop_health)
     app.router.add_post("/v1/dev/execution-plans/supervise", adapter._handle_dev_execution_plans_supervise)
     app.router.add_get("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
     app.router.add_post("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
@@ -1081,6 +1083,31 @@ class TestRunEvents:
             assert other_project_listed.status == 200
             assert (await project_listed.json())["total"] == 1
             assert (await other_project_listed.json())["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_resolves_project_id_from_project_context_only(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Scope planning to a custom Hermes project id.",
+                    "project_context": {
+                        "project_id": "FelipeSideProject",
+                        "project_name": "Felipe Side Project",
+                        "vision": "Keep this work isolated from OrynWorkspace defaults.",
+                    },
+                })
+            assert start.status == 200
+            data = await start.json()
+            assert data["project_id"] == "FelipeSideProject"
+            assert data["project_context"]["project_id"] == "FelipeSideProject"
+
+            listed = await cli.get("/v1/dev/clarifications?project_id=FelipeSideProject")
+            other = await cli.get("/v1/dev/clarifications?project_id=OrynWorkspace")
+            assert (await listed.json())["total"] == 1
+            assert (await other.json())["total"] == 0
 
     @pytest.mark.asyncio
     async def test_dev_clarification_persists_bounded_repo_grounding(self, adapter, tmp_path, monkeypatch):
@@ -6016,3 +6043,17 @@ class TestDevReliabilityAPI:
             detail = await detail_resp.json()
             assert detail["category"] == "workspace.implement/high"
             assert detail["outcomes"][0]["task_id"] == "task-api"
+
+    @pytest.mark.asyncio
+    async def test_lab_loop_health_route_is_empty_safe(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_lab_loop_store = DevLabLoopStore(db_path)
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/dev/lab-loop/health")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "hermes.dev_lab_loop_health"
+            assert data["state"]["status"] == "idle"
+            assert data["real_outcome_count"] == 0

@@ -72,6 +72,7 @@ SUCCESS_REVIEW_VERDICTS = {"approved"}
 MERGED_STATUSES = {"merged", "shipped", "completed"}
 TERMINAL_STATUSES = MERGED_STATUSES | {"failed", "cancelled", "needs_attention", "needs_review"}
 TIER_RANK = {"unproven": 0, "observed": 1, "trusted": 2}
+DEFAULT_EXCLUDED_OUTCOME_IDS = {"devrel-out-042c159df0"}
 
 
 @dataclass(frozen=True)
@@ -408,7 +409,7 @@ def scorecard(
     window_seconds = max(1.0, config.window_days * 86400)
     current_start = now_value - window_seconds
     previous_start = current_start - window_seconds
-    normalized = [normalize_outcome(item) for item in outcomes]
+    normalized = [normalize_outcome(item) for item in outcomes if not outcome_excluded(item)]
     categories = sorted({item["category"] for item in normalized})
     category_rows = []
     for category in categories:
@@ -641,6 +642,16 @@ def recompute_reliability_outcomes(
 
 
 def outcome_success(outcome: Dict[str, Any]) -> bool:
+    source_refs = outcome.get("source_refs") if isinstance(outcome.get("source_refs"), dict) else {}
+    if bool(source_refs.get("draft_pr_only")):
+        return (
+            str(outcome.get("terminal_status") or "").lower() in {"completed", "ready", "draft_pr_ready"}
+            and bool(source_refs.get("draft_pr_ready"))
+            and str(outcome.get("verification_verdict") or "").lower() in SUCCESS_VERIFICATION_VERDICTS
+            and str(outcome.get("ci_state") or "").lower() in SUCCESS_CI_STATES
+            and str(outcome.get("code_review_verdict") or "").lower() in SUCCESS_REVIEW_VERDICTS
+            and not bool(outcome.get("escaped"))
+        )
     return (
         bool(outcome.get("merged"))
         and str(outcome.get("terminal_status") or "").lower() in MERGED_STATUSES
@@ -649,6 +660,26 @@ def outcome_success(outcome: Dict[str, Any]) -> bool:
         and str(outcome.get("code_review_verdict") or "").lower() in SUCCESS_REVIEW_VERDICTS
         and not bool(outcome.get("escaped"))
     )
+
+
+def outcome_excluded(outcome: Dict[str, Any]) -> bool:
+    """Return true for outcomes that must not count as reliability evidence."""
+
+    source_refs = outcome.get("source_refs") if isinstance(outcome.get("source_refs"), dict) else {}
+    if bool(source_refs.get("exclude_from_scorecard") or source_refs.get("invalid")):
+        return True
+    outcome_id = str(outcome.get("outcome_id") or "").strip()
+    if outcome_id and outcome_id in _excluded_outcome_ids():
+        return True
+    return False
+
+
+def _excluded_outcome_ids() -> set[str]:
+    configured = os.getenv("HERMES_DEV_RELIABILITY_EXCLUDED_OUTCOME_IDS")
+    values = set(DEFAULT_EXCLUDED_OUTCOME_IDS)
+    if configured:
+        values.update(part.strip() for part in configured.split(",") if part.strip())
+    return values
 
 
 def normalize_risk_level(value: Any) -> str:

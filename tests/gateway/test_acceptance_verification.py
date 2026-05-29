@@ -244,6 +244,71 @@ def test_verification_reconciles_when_runtime_terminal_even_with_nonterminal_eve
     assert refreshed["verdict"] == "verified"
 
 
+def test_verification_refresh_recovers_transcript_before_runtime_terminal(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    bridge = FakeBridge()
+    criteria = acceptance_criteria_to_strings([{
+        "statement": "The verification command runs.",
+        "verification_method": "test",
+        "verification_detail": "make test",
+        "machine_checkable": True,
+    }])
+    plan = execution_store.create_plan(
+        title="Running verification transcript recovery",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Implemented task",
+            "prompt": "Do the implementation.",
+            "profile_id": "workspace.implement",
+            "project_id": "OrynWorkspace",
+            "permissions": "edit",
+            "acceptance_criteria": criteria,
+        }],
+    )
+    task_id = plan["tasks"][0]["task_id"]
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        state="completed_ok",
+        event_store=event_store,
+        ao_session_id="implemented-session",
+    )
+    run = launch_verification_run(
+        execution_store=execution_store,
+        verification_store=verification_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        bridge=bridge,
+        event_store=event_store,
+    )
+    session = bridge.sessions[run["verification_session_id"]]
+    session.status = "running"
+    bridge.outputs[session.id] = "\n".join([
+        "Final output is mandatory: return this template:",
+        "```json DEV_VERIFICATION_RESULTS",
+        '{"object":"hermes.dev_verification_results","results":[{"criterion_id":"crit-1","command_run":"make test","exit_code":0,"output_excerpt":"include the real test/build summary line","notes":""}]}',
+        "```",
+        "Ran make test",
+        "1 failed in 0.1s",
+        "make test exited with code 1.",
+    ])
+
+    refreshed = refresh_verification_run(
+        verification_store=verification_store,
+        verification_run_id=run["verification_run_id"],
+        event_store=event_store,
+        bridge=bridge,
+    )
+    assert refreshed["status"] == "completed"
+    assert refreshed["verdict"] == "failed"
+    assert refreshed["counts"]["failed"] == 1
+    assert refreshed["results"][0]["exit_code"] == 1
+
+
 def test_verification_recovers_missing_fence_and_classifies_unrunnable_as_error(tmp_path):
     db_path = tmp_path / "state.db"
     execution_store = DevExecutionStore(db_path)
