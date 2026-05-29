@@ -9,10 +9,10 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
-import copy
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.message_sanitization import sanitize_chat_completion_messages_for_wire
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
@@ -137,53 +137,7 @@ class ChatCompletionsTransport(ProviderTransport):
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
         """
-        needs_sanitize = False
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if (
-                "codex_reasoning_items" in msg
-                or "codex_message_items" in msg
-                or "tool_name" in msg
-            ):
-                needs_sanitize = True
-                break
-            if any(isinstance(k, str) and k.startswith("_") for k in msg):
-                needs_sanitize = True
-                break
-            tool_calls = msg.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if isinstance(tc, dict) and (
-                        "call_id" in tc or "response_item_id" in tc
-                    ):
-                        needs_sanitize = True
-                        break
-                if needs_sanitize:
-                    break
-
-        if not needs_sanitize:
-            return messages
-
-        sanitized = copy.deepcopy(messages)
-        for msg in sanitized:
-            if not isinstance(msg, dict):
-                continue
-            msg.pop("codex_reasoning_items", None)
-            msg.pop("codex_message_items", None)
-            msg.pop("tool_name", None)
-            # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
-            # OpenAI's message schema has no ``_``-prefixed fields, so this
-            # is safe and future-proofs against new markers being added.
-            for key in [k for k in msg if isinstance(k, str) and k.startswith("_")]:
-                msg.pop(key, None)
-            tool_calls = msg.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        tc.pop("call_id", None)
-                        tc.pop("response_item_id", None)
-        return sanitized
+        return sanitize_chat_completion_messages_for_wire(messages)
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""
