@@ -341,6 +341,93 @@ def test_lab_executor_derives_ci_state_from_draft_head_sha(monkeypatch, tmp_path
     assert calls == [{"repo": "Felippen/Oryn", "ref": report["execution"]["head_sha"]}]
 
 
+def test_lab_executor_records_approved_code_review_and_contract_score(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure approved R4 review after a passing verification fixture.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/review-approved.md"],
+        "source": "docs",
+        "payload": {
+            "ci_status": {"state": "success", "repo": "Felippen/Oryn"},
+            "code_review_result": {
+                "object": "hermes.dev_code_review_result",
+                "verdict": "approved",
+                "findings": [],
+                "summary": "Reviewed the scoped docs diff against the task intent.",
+                "evidence_refs": ["docs/review-approved.md"],
+            },
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/review-approved.md"]),
+    )
+
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert report["status"] == "completed"
+    assert report["gate_verdicts"]["review"] == "approved"
+    assert report["gate_verdicts"]["contract_score"] == 1.0
+    assert outcome["code_review_verdict"] == "approved"
+    assert outcome["output_contract_score"] == 1.0
+    assert outcome["source_refs"]["gates"]["review"] == "approved"
+    assert outcome["success"] is True
+
+
+def test_lab_executor_marks_changes_requested_review_as_failed_outcome(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure changes-requested R4 review after a passing verification fixture.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/review-changes.md"],
+        "source": "docs",
+        "payload": {
+            "ci_status": {"state": "success", "repo": "Felippen/Oryn"},
+            "code_review_result": {
+                "object": "hermes.dev_code_review_result",
+                "verdict": "changes_requested",
+                "findings": [{"severity": "major", "file": "docs/review-changes.md", "line": 1, "note": "Requested change."}],
+                "summary": "The review found a concrete issue.",
+                "evidence_refs": ["docs/review-changes.md:1"],
+            },
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        max_consecutive_failures=10,
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/review-changes.md"]),
+    )
+
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert report["status"] == "failed"
+    assert report["gate_verdicts"]["review"] == "changes_requested"
+    assert outcome["code_review_verdict"] == "changes_requested"
+    assert outcome["source_refs"]["gates"]["review"] == "changes_requested"
+    assert outcome["success"] is False
+
+
 def test_lab_ci_finalizer_updates_pending_outcome_to_success(monkeypatch, tmp_path):
     db_path, _stable_db = _env(monkeypatch, tmp_path)
     store = DevReliabilityStore(db_path)

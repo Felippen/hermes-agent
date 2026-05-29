@@ -32,6 +32,7 @@ from gateway.dev_control.lab_process_isolation import audit_current_process_isol
 from gateway.dev_control.production_signals import DevProductionSignalStore, run_signal_digest_sources
 from gateway.dev_control.product_events import DevProductEventStore
 from gateway.dev_control.reliability import DevReliabilityStore, outcome_excluded, scorecard
+from gateway.dev_control.scm_lifecycle import build_code_review_prompt, parse_code_review_result
 from gateway.dev_control.worker_output_contract import parse_worker_output_contract, worker_output_contract_score
 from gateway.dev_execution import (
     DevExecutionStore,
@@ -565,8 +566,19 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         fetcher=context.get("ci_status_fetcher"),
     )
     ci_state = str(ci_status.get("state") or verification.get("ci_state") or "unknown")
-    code_review_verdict = str(verification.get("code_review_verdict") or "unknown")
-    output_contract_score = verification.get("output_contract_score")
+    code_review = _measure_code_review_r4(
+        candidate=candidate,
+        context=context,
+        plan=derived_plan,
+        task=derived_task,
+        draft_artifact=draft_artifact,
+        implementation=implementation,
+        verification=verification,
+    )
+    code_review_verdict = str(code_review.get("verdict") or verification.get("code_review_verdict") or "unknown")
+    output_contract_score = code_review.get("output_contract_score")
+    if output_contract_score is None:
+        output_contract_score = verification.get("output_contract_score")
     draft_pr_ready = bool(draft_artifact and draft_artifact.get("ready"))
     terminal_status = _lab_terminal_status(
         implementation=implementation,
@@ -608,11 +620,12 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
                 "empty_diff": empty_diff,
                 "draft_artifact": draft_artifact,
                 "ci_status": ci_status,
+                "code_review": code_review,
                 "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
                 "gates": {
                     "verification": verification.get("status") or "unknown",
                     "ci": ci_status.get("status") or ("not_measured" if ci_state == "unknown" else ci_state),
-                    "review": "not_measured" if code_review_verdict == "unknown" else code_review_verdict,
+                    "review": code_review.get("status") or ("not_measured" if code_review_verdict == "unknown" else code_review_verdict),
                 },
                 "verification_run_id": verification.get("verification_run_id"),
             },
@@ -621,7 +634,13 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
             "completed_at": now,
             "merged_at": None,
         })
-    failed = terminal_status == "failed" or verification_verdict in {"failed", "partial", "needs_review"} or ci_state == "failure"
+    review_failed = bool(code_review.get("measured")) and code_review_verdict != "approved"
+    failed = (
+        terminal_status == "failed"
+        or verification_verdict in {"failed", "partial", "needs_review"}
+        or ci_state == "failure"
+        or review_failed
+    )
     result = {
         "status": "failed" if failed else "completed",
         "plan_id": plan["plan_id"],
@@ -644,6 +663,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         "verification_verdict": verification_verdict,
         "ci_status": ci_status,
         "ci_state": ci_state,
+        "code_review": code_review,
         "code_review_verdict": code_review_verdict,
         "output_contract_score": output_contract_score,
         "draft_pr_only": True,
@@ -1379,6 +1399,191 @@ def _measure_ci_r3(
         "raw": payload,
         "warnings": (payload or {}).get("warnings") or [],
     }
+
+
+def _measure_code_review_r4(
+    *,
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+    plan: dict[str, Any],
+    task: dict[str, Any],
+    draft_artifact: Optional[dict[str, Any]],
+    implementation: dict[str, Any],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    fixture = payload.get("code_review_result")
+    if fixture is not None:
+        parsed = parse_code_review_result(fixture)
+        return {
+            **parsed,
+            "status": parsed.get("verdict") if parsed.get("verdict") != "unknown" else "not_measured",
+            "measured": parsed.get("verdict") != "unknown",
+            "source": "fixture",
+            "output_contract_score": _code_review_contract_score(parsed),
+        }
+    if not draft_artifact or not draft_artifact.get("ready"):
+        return _unmeasured_code_review("Code review was not measured because no draft PR artifact exists.")
+    pr_url = str(draft_artifact.get("pr_url") or "").strip()
+    pr_number = _pr_number_from_url(pr_url)
+    publish = draft_artifact.get("publish") if isinstance(draft_artifact.get("publish"), dict) else {}
+    repo = str(payload.get("code_review_repo") or publish.get("repo") or payload.get("ci_repo") or "").strip()
+    if not repo or not pr_number:
+        return _unmeasured_code_review("Code review was not measured because the draft PR repo or number is unavailable.")
+    bridge = context.get("bridge")
+    if bridge is None:
+        return _unmeasured_code_review("Code review was not measured because no lab worker bridge is configured.")
+    pr_state = {
+        "repo": repo,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "head_sha": draft_artifact.get("head_sha") or implementation.get("head_sha"),
+        "ci_state": verification.get("ci_state") or "unknown",
+    }
+    prompt = build_code_review_prompt(plan=plan or {}, pr_state=pr_state)
+    prompt = "\n".join([
+        prompt,
+        "",
+        "Lab R4 constraints:",
+        "- Review only. Do not edit files, commit, push, merge, approve, or publish.",
+        "- Use the draft PR diff as the evidence source.",
+        "- If you cannot inspect the PR, return verdict commented with a finding explaining why.",
+    ])
+    timeout_seconds = min(max(float(context.get("max_seconds") or 600.0) / 2.0, 60.0), 600.0)
+    try:
+        session = _spawn_lab_review_worker(
+            bridge=bridge,
+            candidate=candidate,
+            project_id=_lab_project_id(candidate),
+            prompt=prompt,
+            branch=str(draft_artifact.get("branch") or implementation.get("branch") or ""),
+        )
+        terminal = _await_review_terminal(
+            bridge=bridge,
+            runtime="ao",
+            session=session,
+            timeout_seconds=timeout_seconds,
+        )
+        transcript = terminal.get("transcript") or ""
+        parsed = parse_code_review_result(transcript)
+        status = "completed" if parsed.get("verdict") != "unknown" else "needs_attention"
+        return {
+            **parsed,
+            "status": status,
+            "measured": parsed.get("verdict") != "unknown",
+            "source": "ao",
+            "review_session_id": _session_value(session, "id"),
+            "review_status": terminal.get("status"),
+            "timed_out": terminal.get("timed_out", False),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": pr_state.get("head_sha"),
+            "prompt": prompt,
+            "output_contract_score": _code_review_contract_score(parsed),
+        }
+    except Exception as exc:  # noqa: BLE001 - review is measured as unavailable, never a pass constant.
+        return _unmeasured_code_review(f"Code review unavailable: {exc}")
+
+
+def _unmeasured_code_review(warning: str) -> dict[str, Any]:
+    return {
+        "object": "hermes.dev_code_review_result",
+        "status": "not_measured",
+        "verdict": "unknown",
+        "findings": [],
+        "summary": "",
+        "evidence_refs": [],
+        "warnings": [warning],
+        "measured": False,
+        "output_contract_score": None,
+    }
+
+
+def _code_review_contract_score(review: dict[str, Any]) -> float:
+    if str(review.get("verdict") or "unknown").lower() == "unknown":
+        return 0.0
+    score = 0.4
+    score += 0.3 if str(review.get("summary") or "").strip() else 0.0
+    score += 0.2 if isinstance(review.get("evidence_refs"), list) and review.get("evidence_refs") else 0.0
+    score += 0.1 if isinstance(review.get("findings"), list) else 0.0
+    if review.get("warnings"):
+        score = min(score, 0.75)
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _pr_number_from_url(url: str) -> Optional[int]:
+    match = re.search(r"/pull/(\d+)(?:\D*$|$)", str(url or ""))
+    return int(match.group(1)) if match else None
+
+
+def _spawn_lab_review_worker(
+    *,
+    bridge: Any,
+    candidate: dict[str, Any],
+    project_id: str,
+    prompt: str,
+    branch: str,
+) -> Any:
+    kwargs = {
+        "project_id": project_id,
+        "prompt": prompt,
+        "issue_id": candidate.get("candidate_id"),
+        "branch": branch or None,
+        "agent": None,
+        "model": None,
+        "reasoning_effort": "high",
+        "minimal_worker_prompt": True,
+    }
+    try:
+        return bridge.spawn("ao", **kwargs)
+    except TypeError:
+        return bridge.spawn(**kwargs)
+
+
+def _await_review_terminal(*, bridge: Any, runtime: str, session: Any, timeout_seconds: float) -> dict[str, Any]:
+    session_id = str(_session_value(session, "id") or "").strip()
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds or 1.0))
+    latest = session
+    while True:
+        status = _session_status(latest)
+        if status in set(TASK_COMPLETED_STATUSES) | {"done", "completed"}:
+            return {
+                "status": "completed",
+                "session": latest,
+                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "timed_out": False,
+            }
+        if status in set(TASK_FAILED_STATUSES) | {"killed", "errored", "terminated"}:
+            return {
+                "status": "failed",
+                "session": latest,
+                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "timed_out": False,
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "status": "timed_out",
+                "session": latest,
+                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "timed_out": True,
+            }
+        time.sleep(1.0)
+        try:
+            refreshed = bridge.status(runtime, session_id)
+        except TypeError:
+            refreshed = bridge.status(session_id)
+        except Exception:
+            refreshed = None
+        latest = refreshed or latest
+
+
+def _capture_lab_output(bridge: Any, runtime: str, session: Any) -> str:
+    try:
+        return bridge.capture_output(runtime, session, lines=240) or ""
+    except TypeError:
+        return bridge.capture_output(session, lines=240) or ""
+    except Exception:
+        return ""
 
 
 def finalize_pending_lab_ci_outcomes(
