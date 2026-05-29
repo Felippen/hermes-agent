@@ -977,6 +977,79 @@ def test_lab_executor_quarantines_out_of_scope_worker_diff(monkeypatch, tmp_path
     assert outcome["source_refs"]["draft_pr_ready"] is False
 
 
+def test_lab_adversarial_fixture_proves_post_diff_quarantine(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Compliant worker makes a docs change; fixture simulates a forbidden engine diff.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/lab.md"],
+        "source": "docs",
+        "payload": {
+            "adversarial_diff_paths": ["agent/conversation_loop.py"],
+        },
+    }, approved=True)
+    router = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/lab.md"])
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        bridge=router,
+        sources=["reliability"],
+        enable_adversarial_fixture=True,
+        max_consecutive_failures=10,
+    )
+
+    assert report["status"] == "failed"
+    assert report["quarantined"] is True
+    assert report["diff_scope"]["status"] == "out_of_scope"
+    assert report["diff_scope"]["rejected_paths"] == ["agent/conversation_loop.py"]
+    assert report["draft_artifact"] is None
+    fixture = report["execution"]["adversarial_fixture"]
+    assert fixture["applied"] is True
+    assert fixture["paths"] == ["agent/conversation_loop.py"]
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert outcome["source_refs"]["quarantined"] is True
+    assert outcome["source_refs"]["adversarial_fixture"]["applied"] is True
+
+
+def test_lab_adversarial_fixture_requires_explicit_enable(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Fixture request should be inert unless explicitly enabled.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/lab.md"],
+        "source": "docs",
+        "payload": {
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+            "adversarial_diff_paths": ["agent/conversation_loop.py"],
+        },
+    }, approved=True)
+    router = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/lab.md"])
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        bridge=router,
+        sources=["reliability"],
+    )
+
+    assert report["status"] == "completed"
+    assert report["quarantined"] is False
+    assert report["diff_scope"]["status"] == "in_scope"
+    fixture = report["execution"]["adversarial_fixture"]
+    assert fixture["requested"] is True
+    assert fixture["enabled"] is False
+    assert fixture["applied"] is False
+
+
 def test_lab_executor_records_empty_diff_as_failure(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     DevLabLoopStore(db_path).upsert_candidate({

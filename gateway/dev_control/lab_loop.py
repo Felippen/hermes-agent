@@ -23,6 +23,7 @@ from gateway.dev_control.dogfood_backlog import (
     dogfood_scope_check,
     is_guardrail_touching,
     normalize_candidate,
+    normalize_target_path,
     preapproval_allows,
 )
 from gateway.dev_control.lab_environment import lab_paths_from_env, validate_lab_or_raise
@@ -336,6 +337,7 @@ def run_lab_loop_pass(
     max_cost_usd: Optional[float] = None,
     regression_threshold: float = 0.20,
     isolation_pids: Optional[list[int | str]] = None,
+    enable_adversarial_fixture: Optional[bool] = None,
     now: Optional[float] = None,
 ) -> dict[str, Any]:
     started = float(now or time.time())
@@ -389,6 +391,11 @@ def run_lab_loop_pass(
             "started_at": started,
             "bridge": bridge,
             "max_seconds": max_seconds,
+            "enable_adversarial_fixture": (
+                bool(enable_adversarial_fixture)
+                if enable_adversarial_fixture is not None
+                else _env_bool("HERMES_DEV_LAB_ENABLE_ADVERSARIAL_FIXTURE", False)
+            ),
         })
     except Exception as exc:  # noqa: BLE001 - loop reports failed pass and lets breakers decide.
         execution = {"status": "failed", "error": str(exc)}
@@ -509,6 +516,13 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         task,
     )
     workspace_path = implementation.get("workspace_path") or derived_task.get("workspace_path")
+    adversarial_fixture = _apply_adversarial_diff_fixture(
+        candidate=candidate,
+        workspace_path=workspace_path,
+        enabled=bool(context.get("enable_adversarial_fixture")),
+    )
+    if adversarial_fixture.get("requested"):
+        implementation["adversarial_fixture"] = adversarial_fixture
     touched_paths = _touched_paths_from_worktree(
         workspace_path,
         fallback_paths=(derived_task.get("files_written") or derived_task.get("files_changed") or []),
@@ -582,6 +596,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
                 "quarantined": quarantined,
                 "empty_diff": empty_diff,
                 "draft_artifact": draft_artifact,
+                "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
                 "gates": {
                     "verification": verification.get("status") or "unknown",
                     "ci": "not_measured" if ci_state == "unknown" else ci_state,
@@ -625,6 +640,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         "cost_usd": implementation.get("cost_usd"),
         "duration_seconds": implementation.get("duration_seconds"),
         "pre_verification_cleanup": pre_verification_cleanup,
+        "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
     }
     _cleanup_lab_worktree(workspace_path)
     return result
@@ -1333,6 +1349,62 @@ def _worker_timeout_seconds(context: dict[str, Any]) -> float:
     elapsed = max(0.0, time.time() - float(context.get("started_at") or time.time()))
     remaining = max(1.0, pass_budget - elapsed)
     return min(configured, remaining)
+
+
+def _apply_adversarial_diff_fixture(
+    *,
+    candidate: dict[str, Any],
+    workspace_path: Any,
+    enabled: bool,
+) -> dict[str, Any]:
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    requested_paths = [
+        normalize_target_path(path)
+        for path in payload.get("adversarial_diff_paths") or []
+        if normalize_target_path(path)
+    ]
+    if not requested_paths:
+        return {"requested": False, "enabled": bool(enabled), "applied": False, "paths": [], "warnings": []}
+    result: dict[str, Any] = {
+        "requested": True,
+        "enabled": bool(enabled),
+        "applied": False,
+        "paths": [],
+        "warnings": [],
+    }
+    if not enabled:
+        result["warnings"].append("Adversarial diff fixture was requested but not enabled for this lab pass.")
+        return result
+    workspace = Path(str(workspace_path or "")).expanduser()
+    if not workspace.exists() or not workspace.is_dir():
+        result["warnings"].append("Adversarial diff fixture could not run because the worker workspace is missing.")
+        return result
+    workspace_root = workspace.resolve(strict=False)
+    for rel_path in requested_paths:
+        if rel_path.startswith("/") or ".." in Path(rel_path).parts:
+            result["warnings"].append(f"Rejected unsafe adversarial fixture path: {rel_path}")
+            continue
+        target = (workspace / rel_path).resolve(strict=False)
+        if workspace_root != target and workspace_root not in target.parents:
+            result["warnings"].append(f"Rejected adversarial fixture path outside workspace: {rel_path}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing = target.read_text(encoding="utf-8") if target.exists() else ""
+        suffix = "\n" if existing and not existing.endswith("\n") else ""
+        target.write_text(
+            f"{existing}{suffix}# HERMES LAB ADVERSARIAL DIFF FIXTURE: {uuid.uuid4().hex[:8]}\n",
+            encoding="utf-8",
+        )
+        result["paths"].append(rel_path)
+    result["applied"] = bool(result["paths"])
+    return result
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _diff_scope_result(touched_paths: list[str]) -> dict[str, Any]:

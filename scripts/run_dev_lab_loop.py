@@ -48,6 +48,11 @@ def main() -> int:
     parser.add_argument("--regression-threshold", type=float, default=float(os.getenv("HERMES_DEV_LAB_REGRESSION_THRESHOLD", "0.20")))
     parser.add_argument("--isolation-pid", action="append", default=[], help="Additional lab process pid to include in the open-file isolation audit.")
     parser.add_argument("--extra-isolation-pids", default="", help="Comma-separated lab process pids to include in the open-file isolation audit.")
+    parser.add_argument(
+        "--enable-adversarial-fixture",
+        action="store_true",
+        help="Lab-only: apply candidate payload adversarial_diff_paths after worker completion to prove post-diff quarantine.",
+    )
     args = parser.parse_args()
 
     paths = lab_paths_from_env()
@@ -82,6 +87,7 @@ def main() -> int:
         max_cost_usd=args.max_cost_usd if args.max_cost_usd > 0 else None,
         regression_threshold=args.regression_threshold,
         isolation_pids=isolation_pids,
+        enable_adversarial_fixture=args.enable_adversarial_fixture,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1
