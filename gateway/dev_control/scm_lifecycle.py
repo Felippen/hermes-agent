@@ -530,7 +530,7 @@ def fetch_pr_state(
 
 
 def parse_code_review_result(text_or_payload: Any) -> Dict[str, Any]:
-    """Parse a structured review result from a dict or fenced worker output."""
+    """Parse a structured review result from a dict or worker output."""
 
     warnings: list[str] = []
     if isinstance(text_or_payload, dict):
@@ -539,14 +539,21 @@ def parse_code_review_result(text_or_payload: Any) -> Dict[str, Any]:
         text = str(text_or_payload or "")
         match = CODE_REVIEW_RE.search(text)
         if not match:
-            payload = {}
-            warnings.append("DEV_CODE_REVIEW_RESULT block was missing.")
+            payload = _extract_unfenced_code_review_payload(text)
+            if payload:
+                warnings.append("DEV_CODE_REVIEW_RESULT block was missing; recovered review JSON from transcript.")
+            else:
+                warnings.append("DEV_CODE_REVIEW_RESULT block was missing.")
         else:
             try:
                 payload = json.loads(match.group(1))
             except Exception as exc:
-                payload = {}
-                warnings.append(f"DEV_CODE_REVIEW_RESULT JSON was invalid: {exc}")
+                payload = _extract_unfenced_code_review_payload(text)
+                if payload:
+                    warnings.append(f"DEV_CODE_REVIEW_RESULT JSON was invalid: {exc}; recovered review JSON from transcript.")
+                else:
+                    payload = {}
+                    warnings.append(f"DEV_CODE_REVIEW_RESULT JSON was invalid: {exc}")
     verdict = _normalize_review_verdict(payload.get("verdict"))
     findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
     if payload.get("object") and payload.get("object") != CODE_REVIEW_OBJECT:
@@ -561,6 +568,79 @@ def parse_code_review_result(text_or_payload: Any) -> Dict[str, Any]:
         if isinstance(payload.get("warnings"), list)
         else warnings,
     }
+
+
+def _extract_unfenced_code_review_payload(text: str) -> Dict[str, Any]:
+    """Recover a code-review JSON object that was emitted without the fence."""
+
+    if CODE_REVIEW_OBJECT not in text:
+        return {}
+    payload = _extract_json_object_containing(text, CODE_REVIEW_OBJECT)
+    if payload:
+        return payload
+    verdict_match = re.search(r'"verdict"\s*:\s*"(approved|changes_requested|commented|unknown)"', text, re.IGNORECASE)
+    if not verdict_match:
+        return {}
+    summary = ""
+    summary_match = re.search(
+        r'"summary"\s*:\s*"(?P<summary>.*?)(?<!\\)"\s*,\s*"evidence_refs"',
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if summary_match:
+        summary = re.sub(r"\s+", " ", summary_match.group("summary")).strip()
+    evidence_refs: list[str] = []
+    evidence_match = re.search(r'"evidence_refs"\s*:\s*\[(?P<refs>.*?)\]', text, re.IGNORECASE | re.DOTALL)
+    if evidence_match:
+        evidence_refs = [
+            re.sub(r"\s+", " ", item).strip()
+            for item in re.findall(r'"(.*?)(?<!\\)"', evidence_match.group("refs"), re.DOTALL)
+            if item.strip()
+        ]
+    return {
+        "object": CODE_REVIEW_OBJECT,
+        "verdict": verdict_match.group(1).lower(),
+        "findings": [],
+        "summary": summary,
+        "evidence_refs": evidence_refs,
+    }
+
+
+def _extract_json_object_containing(text: str, marker: str) -> Dict[str, Any]:
+    marker_index = text.rfind(marker)
+    if marker_index < 0:
+        return {}
+    starts = [match.start() for match in re.finditer(r"\{", text[:marker_index])]
+    for start in reversed(starts):
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:index + 1]
+                    try:
+                        payload = json.loads(candidate)
+                    except Exception:
+                        break
+                    if payload.get("object") == marker:
+                        return payload
+                    break
+    return {}
 
 
 def build_code_review_prompt(*, plan: Dict[str, Any], pr_state: Dict[str, Any]) -> str:

@@ -117,6 +117,49 @@ def test_code_review_result_parser_normalizes_structured_worker_output():
     assert parsed["evidence_refs"] == ["diff:Sources/App.swift:12"]
 
 
+def test_code_review_result_parser_recovers_unfenced_worker_json():
+    parsed = parse_code_review_result(
+        """
+        Reviewed the PR. No findings.
+
+        {
+          "object": "hermes.dev_code_review_result",
+          "verdict": "approved",
+          "findings": [],
+          "summary": "Review approved.",
+          "evidence_refs": ["diff:docs/lab.md:1"]
+        }
+        """
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"] == "Review approved."
+    assert parsed["evidence_refs"] == ["diff:docs/lab.md:1"]
+    assert "recovered review JSON" in " ".join(parsed["warnings"])
+
+
+def test_code_review_result_parser_recovers_wrapped_unfenced_worker_json():
+    parsed = parse_code_review_result(
+        '''
+        {
+          "object": "hermes.dev_code_review_result",
+          "verdict": "approved",
+          "findings": [],
+          "summary": "Using the draft PR diff as the evidence source, PR #23 satisfies
+          the docs criterion.",
+          "evidence_refs": [
+            "Felippen/hermes-agent#23",
+            "PR diff: docs/lab-dogfood.md:1"
+          ]
+        }
+        '''
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"].startswith("Using the draft PR diff")
+    assert parsed["evidence_refs"] == ["Felippen/hermes-agent#23", "PR diff: docs/lab-dogfood.md:1"]
+
+
 @pytest.mark.parametrize(
     ("name", "kwargs", "gate"),
     [

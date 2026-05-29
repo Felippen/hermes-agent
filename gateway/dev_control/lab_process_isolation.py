@@ -11,6 +11,11 @@ from gateway.dev_control.lab_environment import PRODUCTION_ROOTS, lab_paths_from
 
 
 WRITE_FD_SUFFIXES = ("u", "w")
+BENIGN_OUTPUT_FDS = {"1w", "2w"}
+BENIGN_OUTPUT_ROOTS = tuple(
+    Path(root).resolve(strict=False)
+    for root in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
+)
 
 
 def audit_process_isolation(
@@ -38,6 +43,8 @@ def audit_process_isolation(
         path = Path(str(handle.get("path") or "")).expanduser().resolve(strict=False)
         in_allowed = any(_is_same_or_child(path, root) for root in allowed)
         in_forbidden = any(_is_same_or_child(path, root) for root in forbidden)
+        if not in_forbidden and not in_allowed and _is_benign_output_handle(handle, path):
+            continue
         if in_forbidden or not in_allowed:
             offending.append({**handle, "path": str(path), "in_forbidden_root": in_forbidden})
 
@@ -113,3 +120,10 @@ def _parse_lsof_table(output: str, *, pid: int) -> list[dict[str, Any]]:
 
 def _is_same_or_child(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+def _is_benign_output_handle(handle: dict[str, Any], path: Path) -> bool:
+    fd = str(handle.get("fd") or "")
+    if fd not in BENIGN_OUTPUT_FDS:
+        return False
+    return any(_is_same_or_child(path, root) for root in BENIGN_OUTPUT_ROOTS)

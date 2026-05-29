@@ -1555,26 +1555,35 @@ def _await_review_terminal(*, bridge: Any, runtime: str, session: Any, timeout_s
     deadline = time.monotonic() + max(1.0, float(timeout_seconds or 1.0))
     latest = session
     while True:
+        transcript = _capture_lab_output(bridge, runtime, latest)
+        parsed = parse_code_review_result(transcript)
+        if parsed.get("verdict") != "unknown":
+            return {
+                "status": "completed_from_transcript",
+                "session": latest,
+                "transcript": transcript,
+                "timed_out": False,
+            }
         status = _session_status(latest)
         if status in set(TASK_COMPLETED_STATUSES) | {"done", "completed"}:
             return {
                 "status": "completed",
                 "session": latest,
-                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "transcript": transcript,
                 "timed_out": False,
             }
         if status in set(TASK_FAILED_STATUSES) | {"killed", "errored", "terminated"}:
             return {
                 "status": "failed",
                 "session": latest,
-                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "transcript": transcript,
                 "timed_out": False,
             }
         if time.monotonic() >= deadline:
             return {
                 "status": "timed_out",
                 "session": latest,
-                "transcript": _capture_lab_output(bridge, runtime, latest),
+                "transcript": transcript,
                 "timed_out": True,
             }
         time.sleep(1.0)

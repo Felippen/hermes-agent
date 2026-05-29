@@ -342,6 +342,57 @@ complete) in 3.7s (28 workers) ===",
     assert "22 tests" in parsed["results"][0]["output_excerpt"]
 
 
+def test_verification_recovers_successful_exit_code_phrase():
+    transcript = """
+• Ran scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+• Verification completed. The allowed command exited successfully with code 0.
+
+=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 3.0s (28 workers) ===
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "22 tests passed" in parsed["results"][0]["output_excerpt"]
+
+
+def test_verification_unfenced_parser_prefers_latest_results_object():
+    transcript = """
+{
+  "object": "hermes.dev_verification_results",
+  "results": [{
+    "criterion_id": "crit-1",
+    "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+    "cwd": ".",
+    "exit_code": 0,
+    "output_excerpt": "include the real test/build summary line",
+    "notes": ""
+  }]
+}
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [{
+    "criterion_id": "crit-1",
+    "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+    "cwd": ".",
+    "exit_code": 0,
+    "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 3.0s (28 workers) ===",
+    "notes": ""
+  }]
+}
+"""
+
+    parsed = parse_verification_results(transcript)
+
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "include the real" not in parsed["results"][0]["output_excerpt"]
+
+
 def test_verification_recovers_missing_fence_and_classifies_unrunnable_as_error(tmp_path):
     db_path = tmp_path / "state.db"
     execution_store = DevExecutionStore(db_path)

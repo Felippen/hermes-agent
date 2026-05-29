@@ -39,7 +39,15 @@ UNRUNNABLE_OUTPUT_RES = [
         r"(^|\n).*\bnot executable\b",
     )
 ]
-TRANSCRIPT_EXIT_RE = re.compile(r"\b(?:exit(?:ed)?(?:\s+with)?\s+(?:code|status)|returncode|exited)\s*[:=]?\s*(?P<code>-?\d+)\b", re.IGNORECASE)
+TRANSCRIPT_EXIT_RE = re.compile(
+    r"\b(?:"
+    r"exit(?:ed)?(?:\s+\w+){0,4}?\s+with\s+(?:code|status)"
+    r"|exit(?:ed)?(?:\s+with)?\s+(?:code|status)"
+    r"|returncode"
+    r"|exited"
+    r")\s*[:=]?\s*(?P<code>-?\d+)\b",
+    re.IGNORECASE,
+)
 UNFENCED_RESULTS_OBJECT_RE = re.compile(r"\{[^{}]*\"object\"\s*:\s*\"hermes\.dev_verification_results\".*\}", re.IGNORECASE | re.DOTALL)
 DEFAULT_PROJECT_WORKDIRS = {
     "OrynWorkspace": "apps/oryn-workspace",
@@ -858,9 +866,9 @@ def _find_verification_block(text: str) -> Optional[re.Match[str]]:
 
 
 def _parse_unfenced_results_object(text: str) -> Optional[Dict[str, Any]]:
-    marker_index = text.find(f'"object": "{VERIFICATION_OBJECT}"')
+    marker_index = text.rfind(f'"object": "{VERIFICATION_OBJECT}"')
     if marker_index < 0:
-        marker_index = text.find(f'"object":"{VERIFICATION_OBJECT}"')
+        marker_index = text.rfind(f'"object":"{VERIFICATION_OBJECT}"')
     if marker_index < 0:
         return None
     start = text.rfind("{", 0, marker_index)

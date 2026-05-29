@@ -11,6 +11,7 @@ from gateway.dev_control.lab_process_isolation import audit_process_isolation
 from gateway.dev_control.lab_loop import (
     DevLabLoopStore,
     _await_implementation_terminal,
+    _await_review_terminal,
     _touched_paths_from_worktree,
     finalize_pending_lab_ci_outcomes,
     loop_health,
@@ -204,6 +205,24 @@ def test_open_file_isolation_audit_flags_non_lab_write_handle(monkeypatch, tmp_p
 
     assert not audit["ok"]
     assert any(str(outside.resolve(strict=False)) == item["path"] for item in audit["offending_paths"])
+
+
+def test_open_file_isolation_audit_allows_temp_stdout_handle(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    temp_output = Path("/private/tmp/hermes-lab-test/run-output.json")
+    monkeypatch.setattr(
+        "gateway.dev_control.lab_process_isolation._write_handles_for_pid",
+        lambda _pid: [
+            {"pid": os.getpid(), "fd": "1w", "type": "REG", "path": str(temp_output)},
+            {"pid": os.getpid(), "fd": "3u", "type": "REG", "path": str(db_path)},
+        ],
+    )
+
+    audit = audit_process_isolation(pids=[os.getpid()])
+
+    assert audit["ok"] is True
+    assert audit["offending_paths"] == []
+    assert any(item["path"] == str(temp_output) for item in audit["write_handles"])
 
 
 def test_lab_pass_hard_stops_on_non_lab_write_handle(monkeypatch, tmp_path):
@@ -479,6 +498,37 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     assert "Do not invoke slash commands or interactive review modes" in review_spawn["kwargs"]["prompt"]
     assert report["gate_verdicts"]["review"] == "approved"
     assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
+
+
+def test_lab_review_await_completes_when_plain_review_json_appears(tmp_path):
+    transcript = """
+{
+  "object": "hermes.dev_code_review_result",
+  "verdict": "approved",
+  "findings": [],
+  "summary": "Review approved.",
+  "evidence_refs": ["docs/review-live.md:1"]
+}
+"""
+    bridge = _FakeLabRouter(
+        tmp_path / "lab",
+        status="working",
+        status_sequence=["working", "working", "working"],
+        transcript=transcript,
+    )
+    session = AOSession(id="review-session", status="working", workspace_path=str(tmp_path / "lab" / "review"))
+    bridge.sessions[session.id] = session
+
+    terminal = _await_review_terminal(
+        bridge=bridge,
+        runtime="ao",
+        session=session,
+        timeout_seconds=30.0,
+    )
+
+    assert terminal["status"] == "completed_from_transcript"
+    assert terminal["timed_out"] is False
+    assert "hermes.dev_code_review_result" in terminal["transcript"]
 
 
 def test_lab_executor_marks_changes_requested_review_as_failed_outcome(monkeypatch, tmp_path):
