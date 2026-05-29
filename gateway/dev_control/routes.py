@@ -109,6 +109,12 @@ from gateway.dev_control.read_models import (
     build_agent_board_rows,
     build_dev_plans_response,
 )
+from gateway.dev_control.reliability import (
+    DevReliabilityStore,
+    recompute_reliability_outcomes,
+    scorecard as reliability_scorecard,
+    weakest_categories,
+)
 from gateway.dev_control.scm_lifecycle import (
     DevSCMLifecycleStore,
     build_code_review_prompt,
@@ -224,6 +230,10 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_backlog_proposals": {"method": "GET", "path": "/v1/dev/backlog-proposals"},
         "dev_backlog_proposal_action": {"method": "POST", "path": "/v1/dev/backlog-proposals/{proposal_id}/{action}"},
         "dev_signal_health": {"method": "GET", "path": "/v1/dev/signal-health"},
+        "dev_reliability": {"method": "GET", "path": "/v1/dev/reliability"},
+        "dev_reliability_recompute": {"method": "POST", "path": "/v1/dev/reliability/recompute"},
+        "dev_reliability_weakest": {"method": "GET", "path": "/v1/dev/reliability/weakest"},
+        "dev_reliability_category": {"method": "GET", "path": "/v1/dev/reliability/{category}"},
     }
 
 
@@ -283,6 +293,10 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_get("/v1/dev/backlog-proposals", adapter._handle_dev_backlog_proposals)
     app.router.add_post("/v1/dev/backlog-proposals/{proposal_id}/{action}", adapter._handle_dev_backlog_proposal_action)
     app.router.add_get("/v1/dev/signal-health", adapter._handle_dev_signal_health)
+    app.router.add_get("/v1/dev/reliability", adapter._handle_dev_reliability)
+    app.router.add_post("/v1/dev/reliability/recompute", adapter._handle_dev_reliability_recompute)
+    app.router.add_get("/v1/dev/reliability/weakest", adapter._handle_dev_reliability_weakest)
+    app.router.add_get("/v1/dev/reliability/{category:.+}", adapter._handle_dev_reliability_category)
     app.router.add_post("/v1/dev/execution-plans/supervise", adapter._handle_dev_execution_plans_supervise)
     app.router.add_get("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
     app.router.add_post("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
@@ -339,6 +353,7 @@ class DevControlRouteMixin:
         signal_store = self._ensure_dev_signal_store()
         incident_store = self._ensure_dev_incident_store()
         scm_store = self._ensure_dev_scm_store()
+        reliability_store = self._ensure_dev_reliability_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
@@ -436,6 +451,7 @@ class DevControlRouteMixin:
                 "dev_backlog_proposals": (list_backlog_proposals(signal_store=signal_store, limit=10).get("data", []) if signal_store else []),
                 "dev_incidents": (incident_store.list_incidents(limit=5) if incident_store else []),
                 "dev_merge_readiness": (scm_store.latest_readiness(limit=5) if scm_store else []),
+                "dev_reliability": (reliability_scorecard(reliability_store.list_outcomes(limit=500)) if reliability_store else None),
             }
 
         cached = await self._read_model_cache.get_or_compute(
@@ -597,6 +613,20 @@ class DevControlRouteMixin:
             logger.warning("Dev SCM lifecycle store unavailable: %s", exc)
             return None
         return self._dev_scm_store
+
+    def _ensure_dev_reliability_store(self) -> Optional[DevReliabilityStore]:
+        """Create the Dev reliability store on the same state.db as execution plans."""
+        if getattr(self, "_dev_reliability_store", None) is not None:
+            return self._dev_reliability_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_reliability_store = DevReliabilityStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev reliability store unavailable: %s", exc)
+            return None
+        return self._dev_reliability_store
 
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
@@ -2270,6 +2300,96 @@ class DevControlRouteMixin:
             signal_store=signal_store,
             event_store=self._ensure_subagent_event_store(),
         ))
+
+    async def _handle_dev_reliability(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/reliability — advisory scorecard by task category."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        reliability_store = self._ensure_dev_reliability_store()
+        if reliability_store is None:
+            return web.json_response(_openai_error("Dev reliability store unavailable"), status=503)
+        outcomes = reliability_store.list_outcomes(limit=5000)
+        return web.json_response(reliability_scorecard(outcomes))
+
+    async def _handle_dev_reliability_recompute(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/reliability/recompute — rebuild outcomes from gate stores."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reliability_store = self._ensure_dev_reliability_store()
+        execution_store = self._ensure_dev_execution_store()
+        if reliability_store is None or execution_store is None:
+            return web.json_response(_openai_error("Dev reliability stores unavailable"), status=503)
+        result = recompute_reliability_outcomes(
+            reliability_store=reliability_store,
+            execution_store=execution_store,
+            verification_store=self._ensure_dev_verification_store(),
+            scm_store=self._ensure_dev_scm_store(),
+            incident_store=self._ensure_dev_incident_store(),
+            product_event_store=self._ensure_dev_product_event_store(),
+            project_id=body.get("project_id"),
+            limit=int(body.get("limit") or 200),
+        )
+        return web.json_response({
+            **result,
+            "scorecard": reliability_scorecard(reliability_store.list_outcomes(limit=5000)),
+            "advisory_only": True,
+        })
+
+    async def _handle_dev_reliability_weakest(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/reliability/weakest — categories for self-improvement targeting."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        reliability_store = self._ensure_dev_reliability_store()
+        if reliability_store is None:
+            return web.json_response(_openai_error("Dev reliability store unavailable"), status=503)
+        try:
+            limit = int(request.rel_url.query.get("limit", "5"))
+        except ValueError:
+            limit = 5
+        card = reliability_scorecard(reliability_store.list_outcomes(limit=5000))
+        rows = weakest_categories(card.get("categories") or [], limit=limit)
+        return web.json_response({
+            "ok": True,
+            "object": "list",
+            "data": rows,
+            "total": len(rows),
+            "advisory_only": True,
+        })
+
+    async def _handle_dev_reliability_category(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/reliability/{category} — detail for one category."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        reliability_store = self._ensure_dev_reliability_store()
+        if reliability_store is None:
+            return web.json_response(_openai_error("Dev reliability store unavailable"), status=503)
+        category = str(request.match_info.get("category") or "").strip()
+        outcomes = reliability_store.list_outcomes(category=category, limit=1000)
+        card = reliability_scorecard(outcomes)
+        category_rows = card.get("categories") or []
+        detail = category_rows[0] if category_rows else {
+            "object": "hermes.dev_reliability_category",
+            "category": category,
+            "sample_count": 0,
+            "success_rate": None,
+            "tier": "unproven",
+            "trend": "flat",
+            "tier_reasons": ["No samples in window."],
+            "advisory_only": True,
+        }
+        return web.json_response({
+            **detail,
+            "outcomes": outcomes,
+            "measurements": reliability_store.list_improvement_measurements(category=category),
+        })
 
     async def _run_dev_supervisor_loop(self) -> None:
         """Run the project-opt-in Dev supervisor loop while the gateway is alive."""

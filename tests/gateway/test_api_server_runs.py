@@ -30,6 +30,7 @@ from gateway.dev_control.clarifications import DevClarificationStore
 from gateway.dev_control.plan_artifacts import DevPlanArtifactStore
 from gateway.dev_control.acceptance_verification import DevVerificationStore
 from gateway.dev_control.production_signals import DevProductionSignalStore
+from gateway.dev_control.reliability import DevReliabilityStore
 from gateway.dev_control.repo_grounding import collect_repo_grounding
 from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
@@ -251,6 +252,10 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/dev/backlog-proposals", adapter._handle_dev_backlog_proposals)
     app.router.add_post("/v1/dev/backlog-proposals/{proposal_id}/{action}", adapter._handle_dev_backlog_proposal_action)
     app.router.add_get("/v1/dev/signal-health", adapter._handle_dev_signal_health)
+    app.router.add_get("/v1/dev/reliability", adapter._handle_dev_reliability)
+    app.router.add_post("/v1/dev/reliability/recompute", adapter._handle_dev_reliability_recompute)
+    app.router.add_get("/v1/dev/reliability/weakest", adapter._handle_dev_reliability_weakest)
+    app.router.add_get("/v1/dev/reliability/{category:.+}", adapter._handle_dev_reliability_category)
     app.router.add_post("/v1/dev/execution-plans/supervise", adapter._handle_dev_execution_plans_supervise)
     app.router.add_get("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
     app.router.add_post("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
@@ -5970,3 +5975,44 @@ class TestDevProductionSignalAPI:
             health = await health_resp.json()
             assert health["last_analysis_status"] == "completed_with_clusters"
             assert health["proposals_by_status"]["approved"] == 1
+
+
+class TestDevReliabilityAPI:
+    @pytest.mark.asyncio
+    async def test_reliability_routes_are_advisory_and_empty_safe(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_reliability_store = DevReliabilityStore(db_path)
+        adapter._dev_reliability_store.upsert_outcome({
+            "plan_id": "plan-api",
+            "task_id": "task-api",
+            "category": "workspace.implement/high",
+            "profile_id": "workspace.implement",
+            "risk_level": "high",
+            "terminal_status": "completed",
+            "merged": True,
+            "verification_verdict": "verified",
+            "ci_state": "success",
+            "code_review_verdict": "approved",
+            "output_contract_score": 0.95,
+            "completed_at": _time.time(),
+        })
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            score_resp = await cli.get("/v1/dev/reliability")
+            assert score_resp.status == 200
+            score = await score_resp.json()
+            assert score["advisory_only"] is True
+            assert score["categories"][0]["category"] == "workspace.implement/high"
+            assert score["categories"][0]["tier"] == "unproven"
+
+            weak_resp = await cli.get("/v1/dev/reliability/weakest")
+            assert weak_resp.status == 200
+            weak = await weak_resp.json()
+            assert weak["data"][0]["category"] == "workspace.implement/high"
+
+            detail_resp = await cli.get("/v1/dev/reliability/workspace.implement/high")
+            assert detail_resp.status == 200
+            detail = await detail_resp.json()
+            assert detail["category"] == "workspace.implement/high"
+            assert detail["outcomes"][0]["task_id"] == "task-api"
