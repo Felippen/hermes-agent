@@ -128,7 +128,9 @@ from tools.openhands_bridge import (
     start_openhands_server,
     stop_openhands_server,
 )
+from gateway.ao_snapshot_cache import AOSnapshotCache
 from gateway.platforms.kanban_api_routes import register_kanban_routes
+from gateway.read_model_cache import ReadModelCache, read_model_etag, read_model_metric_headers, request_fingerprint
 from gateway.subagent_events import SubagentEventStore, events_response
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -895,6 +897,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._dev_plan_artifact_store: Optional[DevPlanArtifactStore] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
+        self._read_model_cache = ReadModelCache()
+        self._ao_snapshot_cache = AOSnapshotCache()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1125,6 +1129,165 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    def _cached_read_model_response(
+        self,
+        request: "web.Request",
+        payload: Dict[str, Any],
+        fingerprint: str,
+        *,
+        cached: Any = None,
+        model_name: str = "unknown",
+        status: int = 200,
+    ) -> "web.Response":
+        etag = read_model_etag(fingerprint)
+        if request_fingerprint(request) == fingerprint:
+            headers = {"ETag": etag}
+            if cached is not None:
+                headers.update(read_model_metric_headers(cached, payload_size_bytes=0))
+                logger.info(
+                    "oryn read-model %s status=304 cache=%s total_ms=%.2f compute_ms=%.2f bytes=0",
+                    model_name,
+                    cached.cache_status,
+                    cached.total_ms,
+                    cached.compute_ms,
+                )
+            return web.Response(status=304, headers=headers)
+        response_payload = dict(payload)
+        response_payload.setdefault("fingerprint", fingerprint)
+        payload_size = len(json.dumps(response_payload, ensure_ascii=False, default=str).encode("utf-8"))
+        response = web.json_response(response_payload, status=status)
+        response.headers["ETag"] = etag
+        if cached is not None:
+            response.headers.update(read_model_metric_headers(cached, payload_size_bytes=payload_size))
+            logger.info(
+                "oryn read-model %s status=%s cache=%s total_ms=%.2f compute_ms=%.2f cache_read_ms=%.2f store_ms=%.2f bytes=%s",
+                model_name,
+                status,
+                cached.cache_status,
+                cached.total_ms,
+                cached.compute_ms,
+                cached.cache_read_ms,
+                cached.store_ms,
+                payload_size,
+            )
+        return response
+
+    @staticmethod
+    def _session_list_fingerprint(db: Any, *, limit: int, offset: int) -> str:
+        try:
+            with db._lock:
+                row = db._conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS session_count,
+                        COALESCE(MAX(started_at), 0) AS max_started_at,
+                        COALESCE(MAX(ended_at), 0) AS max_ended_at,
+                        COALESCE(SUM(message_count), 0) AS total_messages,
+                        COALESCE(MAX(title), '') AS max_title,
+                        (SELECT COALESCE(MAX(timestamp), 0) FROM messages) AS max_message_at
+                    FROM sessions
+                    """
+                ).fetchone()
+            parts = [
+                "sessions",
+                str(limit),
+                str(offset),
+                str(row["session_count"]),
+                str(row["max_started_at"]),
+                str(row["max_ended_at"]),
+                str(row["total_messages"]),
+                str(row["max_title"]),
+                str(row["max_message_at"]),
+            ]
+            return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+        except Exception:
+            return hashlib.sha256(f"sessions|{limit}|{offset}|{time.time()}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _session_messages_fingerprint(db: Any, session_id: str) -> str:
+        try:
+            with db._lock:
+                session = db._conn.execute(
+                    "SELECT message_count, title FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                row = db._conn.execute(
+                    """
+                    SELECT COUNT(*) AS message_count, COALESCE(MAX(timestamp), 0) AS max_message_at
+                    FROM messages
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            parts = [
+                "messages",
+                session_id,
+                str((session["message_count"] if session else None) or row["message_count"]),
+                str(row["max_message_at"]),
+                str((session["title"] if session else None) or ""),
+            ]
+            return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+        except Exception:
+            return hashlib.sha256(f"messages|{session_id}|{time.time()}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _subagent_board_fingerprint(store: Any, params: Any) -> str:
+        try:
+            row = store._conn.execute("SELECT COALESCE(MAX(event_id), 0) AS max_event_id FROM subagent_events").fetchone()
+            max_event_id = row["max_event_id"] if row else 0
+        except Exception:
+            max_event_id = int(time.time())
+        # AO bridge state is live process state; a short time bucket keeps it fresh
+        # while still allowing repeated UI reloads to coalesce.
+        try:
+            bucket_seconds = max(5, int(os.getenv("ORYN_SUBAGENT_BOARD_LIVE_BUCKET_SECONDS", "60")))
+        except ValueError:
+            bucket_seconds = 60
+        ao_bucket = int(time.time() / bucket_seconds)
+        query = "&".join(f"{key}={params.get(key)}" for key in sorted(params.keys()))
+        return hashlib.sha256(f"subagents|{max_event_id}|{ao_bucket}|{query}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _table_max_timestamp(store: Any, table: str, column: str = "updated_at") -> float:
+        try:
+            row = store._conn.execute(f"SELECT COALESCE(MAX({column}), 0) AS value FROM {table}").fetchone()
+            return float(row["value"] if row else 0)
+        except Exception:
+            return 0.0
+
+    def _project_dashboard_fingerprint(
+        self,
+        project_id: Optional[str],
+        *,
+        plan_limit: int = 12,
+        derive_plans: bool = False,
+    ) -> str:
+        parts = ["project-dashboard", project_id or "", str(plan_limit), str(derive_plans)]
+        for store, table, column in (
+            (self._dev_clarification_store, "dev_clarification_sessions", "updated_at"),
+            (self._dev_plan_artifact_store, "dev_plan_artifacts", "updated_at"),
+            (self._dev_plan_artifact_store, "dev_plan_artifact_builds", "created_at"),
+            (self._dev_execution_store, "dev_execution_plans", "updated_at"),
+            (self._dev_execution_store, "dev_execution_plan_tasks", "updated_at"),
+            (self._subagent_event_store, "subagent_events", "event_id"),
+        ):
+            if store is None:
+                parts.append("0")
+                continue
+            parts.append(str(self._table_max_timestamp(store, table, column=column)))
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+    def _invalidate_ao_read_models(self) -> None:
+        try:
+            self._ao_snapshot_cache.invalidate()
+        except Exception as exc:
+            logger.debug("AO snapshot cache invalidation failed: %s", exc)
+        try:
+            self._read_model_cache.invalidate_prefix("subagents:board")
+            self._read_model_cache.invalidate_prefix("project-dashboard")
+        except Exception as exc:
+            logger.debug("AO read-model cache invalidation failed: %s", exc)
 
     def _ensure_subagent_event_store(self) -> Optional[SubagentEventStore]:
         """Lazily initialise persistent subagent event history."""
@@ -1490,10 +1653,12 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = max(0, offset)
 
         try:
-            from hermes_state import SessionDB
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(_openai_error("Session database unavailable"), status=503)
+            fingerprint = self._session_list_fingerprint(db, limit=limit, offset=offset)
 
-            db = SessionDB()
-            try:
+            def _compute_payload() -> Dict[str, Any]:
                 sessions = db.list_sessions_rich(
                     limit=limit,
                     offset=offset,
@@ -1512,15 +1677,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message_count": session.get("message_count"),
                         "source": session.get("source"),
                     })
-                return web.json_response({
+                return {
                     "object": "list",
                     "data": payload,
                     "total": total,
                     "limit": limit,
                     "offset": offset,
-                })
-            finally:
-                db.close()
+                }
+
+            cached = await self._read_model_cache.get_or_compute(
+                key=f"sessions:list:{limit}:{offset}",
+                fingerprint=fingerprint,
+                compute=_compute_payload,
+            )
+            return self._cached_read_model_response(
+                request,
+                cached.payload,
+                cached.fingerprint,
+                cached=cached,
+                model_name="sessions.list",
+            )
         except Exception as exc:
             logger.warning("GET /v1/sessions failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -1575,13 +1751,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Session ID required"), status=400)
 
         try:
-            from hermes_state import SessionDB
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(_openai_error("Session database unavailable"), status=503)
+            resolved = db.resolve_session_id(session_id)
+            if not resolved:
+                return web.json_response(_openai_error("Session not found"), status=404)
+            fingerprint = self._session_messages_fingerprint(db, resolved)
 
-            db = SessionDB()
-            try:
-                resolved = db.resolve_session_id(session_id)
-                if not resolved:
-                    return web.json_response(_openai_error("Session not found"), status=404)
+            def _compute_payload() -> Dict[str, Any]:
                 raw_messages = db.get_messages(resolved)
                 messages = []
                 for msg in raw_messages:
@@ -1611,13 +1789,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         if tool_name:
                             item["tool_name"] = tool_name
                     messages.append(item)
-                return web.json_response({
+                return {
                     "object": "hermes.session.messages",
                     "session_id": resolved,
                     "messages": messages,
-                })
-            finally:
-                db.close()
+                }
+
+            cached = await self._read_model_cache.get_or_compute(
+                key=f"sessions:messages:{resolved}",
+                fingerprint=fingerprint,
+                compute=_compute_payload,
+            )
+            return self._cached_read_model_response(
+                request,
+                cached.payload,
+                cached.fingerprint,
+                cached=cached,
+                model_name="sessions.messages",
+            )
         except Exception as exc:
             logger.warning("GET /v1/sessions/{id}/messages failed: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -5662,8 +5851,157 @@ class APIServerAdapter(BasePlatformAdapter):
         if store is None:
             return web.json_response(_openai_error("Subagent event store unavailable"), status=503)
 
-        rows = build_agent_board_rows(store=store, params=params, limit=limit)
-        return web.json_response(build_agent_board_response(rows))
+        fingerprint = self._subagent_board_fingerprint(store, params)
+
+        def _compute_payload() -> Dict[str, Any]:
+            rows = build_agent_board_rows(
+                store=store,
+                params=params,
+                limit=limit,
+                ao_snapshot_cache=self._ao_snapshot_cache,
+            )
+            return build_agent_board_response(rows)
+
+        key = "subagents:board:" + "&".join(f"{name}={params.get(name)}" for name in sorted(params.keys())) + f":{limit}"
+        cached = await self._read_model_cache.get_or_compute(
+            key=key,
+            fingerprint=fingerprint,
+            compute=_compute_payload,
+        )
+        return self._cached_read_model_response(
+            request,
+            cached.payload,
+            cached.fingerprint,
+            cached=cached,
+            model_name="subagents.board",
+        )
+
+    async def _handle_oryn_project_dashboard(self, request: "web.Request") -> "web.Response":
+        """GET /v1/oryn/project-dashboard — bundled project dashboard read model."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        project_id = request.rel_url.query.get("project_id") or None
+        try:
+            default_plan_limit = int(os.getenv("ORYN_PROJECT_DASHBOARD_PLAN_LIMIT", "12"))
+        except ValueError:
+            default_plan_limit = 12
+        try:
+            plan_limit = int(request.rel_url.query.get("plan_limit", str(default_plan_limit)))
+        except ValueError:
+            plan_limit = default_plan_limit
+        plan_limit = max(1, min(plan_limit, 50))
+        derive_plans = str(request.rel_url.query.get("derive_plans") or "").lower() in {"1", "true", "yes"}
+        clarification_store = self._ensure_dev_clarification_store()
+        artifact_store = self._ensure_dev_plan_artifact_store()
+        execution_store = self._ensure_dev_execution_store()
+        event_store = self._ensure_subagent_event_store()
+        if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
+            return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
+
+        fingerprint = self._project_dashboard_fingerprint(
+            project_id,
+            plan_limit=plan_limit,
+            derive_plans=derive_plans,
+        )
+
+        def _compute_payload() -> Dict[str, Any]:
+            clarifications = list_clarifications(
+                store=clarification_store,
+                project_id=project_id,
+                session_id=None,
+                status=None,
+                limit=5,
+            )
+            artifacts = list_plan_artifacts(
+                store=artifact_store,
+                clarification_id=None,
+                project_id=project_id,
+                status=None,
+                limit=10,
+            )
+            raw_plans = execution_store.list_plans(limit=plan_limit, project_id=project_id)
+            plans = list(raw_plans)
+            if derive_plans:
+                try:
+                    from tools.ao_bridge import AOBridge
+
+                    bridge = AOBridge()
+                except Exception:
+                    bridge = None
+                if bridge is not None:
+                    derived_plans = []
+                    for plan in raw_plans:
+                        try:
+                            derived_plans.append(derive_execution_plan_status(
+                                store=execution_store,
+                                plan_id=plan["plan_id"],
+                                bridge=bridge,
+                                event_store=event_store,
+                            )["plan"])
+                        except Exception:
+                            derived_plans.append(plan)
+                    plans = derived_plans
+
+            board_params = {
+                "project_id": project_id,
+                "limit": "100",
+            }
+            board_rows = build_agent_board_rows(
+                store=event_store,
+                params=board_params,
+                limit=100,
+                ao_snapshot_cache=self._ao_snapshot_cache,
+            )
+            latest_artifact = next(
+                (
+                    artifact for artifact in artifacts.get("data", [])
+                    if artifact.get("status") not in {"cancelled", "superseded"}
+                ),
+                None,
+            )
+            latest_build = None
+            latest_draft_review = None
+            if latest_artifact:
+                builds = list_plan_artifact_builds(
+                    store=artifact_store,
+                    plan_artifact_id=latest_artifact["plan_artifact_id"],
+                    limit=1,
+                ).get("data", [])
+                latest_build = builds[0] if builds else None
+                if latest_build and latest_build.get("plan_id"):
+                    try:
+                        latest_draft_review = get_execution_plan_draft_review(
+                            execution_store=execution_store,
+                            plan_id=latest_build["plan_id"],
+                        )
+                    except Exception:
+                        latest_draft_review = None
+
+            return {
+                "object": "hermes.oryn.project_dashboard",
+                "project_id": project_id,
+                "clarifications": clarifications.get("data", []),
+                "plan_artifacts": artifacts.get("data", []),
+                "subagent_board": build_agent_board_response(board_rows),
+                "dev_plans": plans,
+                "latest_plan_artifact_build": latest_build,
+                "latest_draft_review": latest_draft_review,
+            }
+
+        cached = await self._read_model_cache.get_or_compute(
+            key=f"project-dashboard:{project_id or 'default'}:{plan_limit}:{derive_plans}",
+            fingerprint=fingerprint,
+            compute=_compute_payload,
+        )
+        return self._cached_read_model_response(
+            request,
+            cached.payload,
+            cached.fingerprint,
+            cached=cached,
+            model_name="project.dashboard",
+        )
 
     def _bounded_query_limit(self, request: "web.Request", *, default: int = 100) -> int:
         try:
@@ -7507,6 +7845,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session=session,
             base_event=progress_event,
         )
+        self._invalidate_ao_read_models()
         return web.json_response(self._ao_action_response(
             action="follow-up",
             source_session_id=session_id,
@@ -7571,6 +7910,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session=session,
             base_event=progress_event,
         )
+        self._invalidate_ao_read_models()
         return web.json_response(self._ao_action_response(
             action="resume",
             source_session_id=session_id,
@@ -7711,6 +8051,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session=session,
             base_event=latest,
         )
+        self._invalidate_ao_read_models()
         return web.json_response(self._ao_action_response(
             action=mode,
             source_session_id=source_session_id,
@@ -7957,6 +8298,7 @@ class APIServerAdapter(BasePlatformAdapter):
             event=action_event,
         )
         response["session_id"] = session_id
+        self._invalidate_ao_read_models()
         return web.json_response(response)
 
     async def _handle_ao_session_open(self, request: "web.Request") -> "web.Response":
@@ -8093,6 +8435,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/subagents/events", self._handle_run_subagent_events)
             self._app.router.add_get("/v1/subagents/board", self._handle_subagent_board)
             self._app.router.add_get("/v1/subagents/events", self._handle_subagent_events)
+            self._app.router.add_get("/v1/oryn/project-dashboard", self._handle_oryn_project_dashboard)
             self._app.router.add_get("/v1/dev/launch-profiles", self._handle_dev_launch_profiles)
             self._app.router.add_get("/v1/dev/runtimes", self._handle_dev_worker_runtimes)
             self._app.router.add_post("/v1/dev/runtime-selection", self._handle_dev_runtime_selection)
