@@ -314,6 +314,42 @@ class AOBridge:
             "process_alive": process_alive,
         }
 
+    def runtime_health_many(self, sessions: list[AOSession]) -> Dict[str, Dict[str, Any]]:
+        """Batch runtime health checks for AO session read models."""
+
+        alive_tmux_names = self._tmux_session_names()
+        process_patterns = {
+            value
+            for session in sessions
+            for value in (session.id, session.tmux_name or "")
+            if value
+        }
+        alive_process_patterns = self._matching_patterns(process_patterns)
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for session in sessions:
+            if session.tmux_name:
+                tmux_alive = session.tmux_name in alive_tmux_names if alive_tmux_names is not None else None
+            else:
+                tmux_alive = None
+            process_alive = bool(
+                session.id in alive_process_patterns
+                or bool(session.tmux_name and session.tmux_name in alive_process_patterns)
+            )
+            is_stale = (
+                not session.is_terminal
+                and bool(session.tmux_name)
+                and tmux_alive is False
+                and not process_alive
+            )
+            result[session.id] = {
+                "runtime_health": "stale" if is_stale else "ok",
+                "runtime_warning": "AO reports this worker as running, but its tmux/process runtime is gone." if is_stale else None,
+                "tmux_alive": tmux_alive,
+                "process_alive": process_alive,
+            }
+        return result
+
     @staticmethod
     def _tmux_session_exists(tmux_name: Optional[str]) -> Optional[bool]:
         if not tmux_name:
@@ -390,6 +426,54 @@ class AOBridge:
             except Exception:
                 pass
 
+        return matched
+
+    @staticmethod
+    def _tmux_session_names() -> Optional[set[str]]:
+        try:
+            proc = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return set()
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    @staticmethod
+    def _matching_patterns(patterns: set[str]) -> set[str]:
+        if not patterns:
+            return set()
+        try:
+            proc = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return set()
+        if proc.returncode != 0:
+            return set()
+
+        current_pid = os.getpid()
+        matched: set[str] = set()
+        for line in proc.stdout.splitlines():
+            try:
+                raw_pid, command = line.strip().split(None, 1)
+                pid = int(raw_pid)
+            except ValueError:
+                continue
+            if pid == current_pid:
+                continue
+            for pattern in patterns:
+                if pattern in command:
+                    matched.add(pattern)
         return matched
 
     def open_session(self, session_id: str) -> Dict[str, Any]:

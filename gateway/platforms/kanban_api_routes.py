@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from aiohttp import web
 
 from hermes_cli import kanban_http as kh
+from gateway.read_model_cache import read_model_etag, read_model_metric_headers, request_fingerprint
 
 if TYPE_CHECKING:
     from gateway.platforms.api_server import APIServerAdapter
@@ -39,6 +40,34 @@ def _body(request: web.Request) -> dict:
     return {}
 
 
+def _board_fingerprint(q: Any) -> str:
+    import hashlib
+    import time
+
+    board = kh.resolve_board(q.get("board"))
+    try:
+        conn = kh._conn(board=board)
+        try:
+            latest_event = conn.execute("SELECT COALESCE(MAX(id), 0) AS value FROM task_events").fetchone()["value"]
+            task_count = conn.execute("SELECT COUNT(*) AS value FROM tasks").fetchone()["value"]
+        finally:
+            conn.close()
+    except Exception:
+        latest_event = int(time.time())
+        task_count = 0
+    parts = [
+        "kanban-board",
+        str(board),
+        str(q.get("tenant") or ""),
+        str(q.get("include_archived") or ""),
+        str(q.get("workflow_template_id") or ""),
+        str(q.get("current_step_key") or ""),
+        str(latest_event),
+        str(task_count),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
 async def _read_json(request: web.Request) -> dict:
     if not request.body_exists:
         return {}
@@ -60,14 +89,49 @@ def register_kanban_routes(app: web.Application, adapter: "APIServerAdapter") ->
             return err
         try:
             q = request.rel_url.query
-            data = kh.http_get_board(
-                q.get("tenant"),
-                q.get("include_archived", "false").lower() in {"1", "true", "yes"},
-                q.get("board"),
-                q.get("workflow_template_id"),
-                q.get("current_step_key"),
+            fingerprint = _board_fingerprint(q)
+            key = (
+                f"kanban:board:{q.get('board') or ''}:{q.get('tenant') or ''}:"
+                f"{q.get('include_archived') or ''}:{q.get('workflow_template_id') or ''}:"
+                f"{q.get('current_step_key') or ''}"
             )
-            return _json(data)
+            cached = await adapter._read_model_cache.get_or_compute(
+                key=key,
+                fingerprint=fingerprint,
+                compute=lambda: kh.http_get_board(
+                    q.get("tenant"),
+                    q.get("include_archived", "false").lower() in {"1", "true", "yes"},
+                    q.get("board"),
+                    q.get("workflow_template_id"),
+                    q.get("current_step_key"),
+                ),
+            )
+            if request_fingerprint(request) == cached.fingerprint:
+                headers = {"ETag": read_model_etag(cached.fingerprint)}
+                headers.update(read_model_metric_headers(cached, payload_size_bytes=0))
+                logger.info(
+                    "oryn read-model kanban.board status=304 cache=%s total_ms=%.2f compute_ms=%.2f bytes=0",
+                    cached.cache_status,
+                    cached.total_ms,
+                    cached.compute_ms,
+                )
+                return web.Response(status=304, headers=headers)
+            data = dict(cached.payload)
+            data.setdefault("fingerprint", cached.fingerprint)
+            payload_size = len(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
+            response = _json(data)
+            response.headers["ETag"] = read_model_etag(cached.fingerprint)
+            response.headers.update(read_model_metric_headers(cached, payload_size_bytes=payload_size))
+            logger.info(
+                "oryn read-model kanban.board status=200 cache=%s total_ms=%.2f compute_ms=%.2f cache_read_ms=%.2f store_ms=%.2f bytes=%s",
+                cached.cache_status,
+                cached.total_ms,
+                cached.compute_ms,
+                cached.cache_read_ms,
+                cached.store_ms,
+                payload_size,
+            )
+            return response
         except Exception as exc:
             return _error(exc)
 

@@ -111,6 +111,8 @@ honcho = ["honcho-ai==2.0.1"]
 mcp = ["mcp==1.26.0"]
 homeassistant = ["aiohttp==3.13.3"]
 sms = ["aiohttp==3.13.3"]
+# Optional Redis-backed read-model and AO snapshot caches for Oryn/Hermes gateways.
+redis = ["redis==7.0.1"]
 # Computer use — macOS background desktop control via cua-driver (MCP stdio).
 # The cua-driver binary itself is installed via `hermes tools` post-setup
 # (curl install script); this extra just pins the MCP client used to talk

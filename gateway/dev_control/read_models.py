@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, Iterable, Optional
 
 
@@ -17,6 +18,7 @@ def build_agent_board_rows(
     store: Any,
     params: Any,
     limit: int = 250,
+    ao_snapshot_cache: Any = None,
 ) -> list[Dict[str, Any]]:
     """Build Agent Board rows from normalized subagent events plus live AO state."""
 
@@ -50,17 +52,54 @@ def build_agent_board_rows(
 
     project_id = params.get("project_id") or None
     try:
-        from tools.ao_bridge import AOBridge
+        from tools.ao_bridge import AOBridge, AOSession
 
-        bridge = AOBridge()
-        for session in bridge.list(project_id=project_id):
+        def _load_ao_snapshot() -> Dict[str, Any]:
+            bridge = AOBridge()
+            live_sessions = bridge.list(project_id=project_id)
+            live_health_by_id = {}
+            batch_health = getattr(bridge, "runtime_health_many", None)
+            if callable(batch_health):
+                try:
+                    live_health_by_id = batch_health(live_sessions)
+                except Exception as exc:
+                    logger.debug("AO batch runtime health unavailable for subagent board: %s", exc)
+            if not live_health_by_id:
+                for live_session in live_sessions:
+                    live_health_by_id[live_session.id] = bridge.runtime_health(live_session)
+            return {
+                "sessions": [_ao_session_snapshot_payload(session) for session in live_sessions],
+                "health_by_id": live_health_by_id,
+            }
+
+        bridge = None
+        if ao_snapshot_cache is not None:
+            snapshot = ao_snapshot_cache.get_or_load(project_id=project_id, load=_load_ao_snapshot)
+            sessions = [AOSession.from_payload(item) for item in snapshot.sessions]
+            health_by_id = snapshot.health_by_id
+        else:
+            bridge = AOBridge()
+            sessions = bridge.list(project_id=project_id)
+            health_by_id = {}
+            batch_health = getattr(bridge, "runtime_health_many", None)
+            if callable(batch_health):
+                try:
+                    health_by_id = batch_health(sessions)
+                except Exception as exc:
+                    logger.debug("AO batch runtime health unavailable for subagent board: %s", exc)
+        for session in sessions:
             row_id = f"ao:{session.id}"
             existing = rows_by_id.get(row_id) or {}
+            runtime_health = health_by_id.get(session.id)
+            if runtime_health is None:
+                if bridge is None:
+                    bridge = AOBridge()
+                runtime_health = bridge.runtime_health(session)
             rows_by_id[row_id] = _merge_ao_session_into_board_item(
                 existing,
                 session,
                 store,
-                runtime_health=bridge.runtime_health(session),
+                runtime_health=runtime_health,
             )
     except Exception as exc:
         logger.debug("AO sessions unavailable for subagent board: %s", exc)
@@ -114,6 +153,30 @@ def build_agent_board_response(
         "attention_count": sum(1 for item in data if item.get("lane") in {"needs_input", "failed"}),
         "updated_at": updated_at or time.time(),
     }
+
+
+def _ao_session_snapshot_payload(session: Any) -> Dict[str, Any]:
+    if is_dataclass(session):
+        payload = asdict(session)
+    else:
+        payload = {
+            "id": getattr(session, "id", None),
+            "project_id": getattr(session, "project_id", None),
+            "status": getattr(session, "status", None),
+            "activity": getattr(session, "activity", None),
+            "branch": getattr(session, "branch", None),
+            "issue_id": getattr(session, "issue_id", None),
+            "workspace_path": getattr(session, "workspace_path", None),
+            "tmux_name": getattr(session, "tmux_name", None),
+            "agent": getattr(session, "agent", None),
+            "model": getattr(session, "model", None),
+            "reasoning_effort": getattr(session, "reasoning_effort", None),
+            "pr": getattr(session, "pr", None),
+            "summary": getattr(session, "summary", None),
+            "open_command": getattr(session, "open_command", None),
+        }
+    payload["id"] = str(payload.get("id") or "")
+    return payload
 
 
 def build_dev_plans_response(plans: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

@@ -25,6 +25,8 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from gateway.dev_execution import DevExecutionStore, _extract_completion_summary, supervisor_loop_tick
+from gateway.dev_control.clarifications import DevClarificationStore
+from gateway.dev_control.plan_artifacts import DevPlanArtifactStore
 from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
 from tools.ao_bridge import AOSession
@@ -176,6 +178,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/subagents/events", adapter._handle_run_subagent_events)
     app.router.add_get("/v1/subagents/board", adapter._handle_subagent_board)
     app.router.add_get("/v1/subagents/events", adapter._handle_subagent_events)
+    app.router.add_get("/v1/oryn/project-dashboard", adapter._handle_oryn_project_dashboard)
     app.router.add_get("/v1/dev/launch-profiles", adapter._handle_dev_launch_profiles)
     app.router.add_get("/v1/dev/runtimes", adapter._handle_dev_worker_runtimes)
     app.router.add_post("/v1/dev/runtime-selection", adapter._handle_dev_runtime_selection)
@@ -4853,6 +4856,37 @@ class TestRunEvents:
         assert len(complete_events) == 1
         assert complete_events[0]["launch_plan_id"] == plan["plan_id"]
         assert complete_events[0]["launch_task_id"] == task["task_id"]
+
+    @pytest.mark.asyncio
+    async def test_oryn_project_dashboard_returns_bundled_read_model_with_etag(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_clarification_store = DevClarificationStore(db_path)
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._dev_plan_artifact_store = DevPlanArtifactStore(db_path)
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        app = _create_runs_app(adapter)
+
+        bridge = MagicMock()
+        bridge.list.return_value = []
+        with patch("tools.ao_bridge.AOBridge", return_value=bridge):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/oryn/project-dashboard?project_id=OrynWorkspace")
+                assert resp.status == 200
+                etag = resp.headers.get("ETag")
+                assert etag
+                data = await resp.json()
+                assert data["object"] == "hermes.oryn.project_dashboard"
+                assert data["project_id"] == "OrynWorkspace"
+                assert data["clarifications"] == []
+                assert data["plan_artifacts"] == []
+                assert data["dev_plans"] == []
+                assert data["subagent_board"]["data"] == []
+
+                repeat = await cli.get(
+                    "/v1/oryn/project-dashboard?project_id=OrynWorkspace",
+                    headers={"If-None-Match": etag},
+                )
+                assert repeat.status == 304
 
     @pytest.mark.asyncio
     async def test_subagent_board_merges_ao_sessions_and_maps_lanes(self, adapter, tmp_path):
