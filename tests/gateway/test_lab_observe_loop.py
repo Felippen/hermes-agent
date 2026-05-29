@@ -225,7 +225,7 @@ def test_lab_pass_hard_stops_on_non_lab_write_handle(monkeypatch, tmp_path):
             "object": "hermes.dev_lab_process_isolation",
             "pids": [os.getpid()],
             "write_handles": [{"pid": os.getpid(), "fd": "9u", "type": "REG", "path": str(outside)}],
-            "offending_paths": [{"pid": os.getpid(), "fd": "9u", "type": "REG", "path": str(outside)}],
+            "offending_paths": [{"pid": os.getpid(), "fd": "9u", "type": "REG", "path": str(outside), "in_forbidden_root": True}],
             "warnings": [],
             "authoritative": True,
         },
@@ -245,6 +245,43 @@ def test_lab_pass_hard_stops_on_non_lab_write_handle(monkeypatch, tmp_path):
     assert report["breaker_reason"] == "isolation_breach"
     assert not report["isolation"]["ok"]
     assert store.get_state()["status"] == "halted"
+
+
+def test_lab_pass_does_not_halt_on_non_forbidden_stdout_write(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    store = DevLabLoopStore(db_path)
+    store.upsert_candidate({
+        "prompt": "Exercise benign output redirection telemetry.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/lab.md"],
+        "source": "docs",
+    }, approved=True)
+    stdout_path = tmp_path / "run-output.json"
+    monkeypatch.setattr(
+        "gateway.dev_control.lab_loop.audit_current_process_isolation",
+        lambda extra_pids=None: {
+            "ok": False,
+            "object": "hermes.dev_lab_process_isolation",
+            "pids": [os.getpid()],
+            "write_handles": [{"pid": os.getpid(), "fd": "1w", "type": "REG", "path": str(stdout_path)}],
+            "offending_paths": [{"pid": os.getpid(), "fd": "1w", "type": "REG", "path": str(stdout_path), "in_forbidden_root": False}],
+            "warnings": [],
+            "authoritative": True,
+        },
+    )
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        executor=lambda _candidate, _context: {"status": "completed", "duration_seconds": 0.1},
+        max_consecutive_failures=10,
+    )
+
+    assert report["status"] == "completed"
+    assert report.get("breaker_reason") is None
+    assert report["isolation"]["offending_paths"][0]["in_forbidden_root"] is False
+    assert store.get_state()["status"] == "idle"
 
 
 def test_lab_executor_derives_verified_outcome_from_measured_verification(monkeypatch, tmp_path):
@@ -439,6 +476,7 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     assert review_spawn["kwargs"]["issue_id"] is None
     assert review_spawn["kwargs"]["branch"] is None
     assert "Profile: review; permissions: review_only." in review_spawn["kwargs"]["prompt"]
+    assert "Do not invoke slash commands or interactive review modes" in review_spawn["kwargs"]["prompt"]
     assert report["gate_verdicts"]["review"] == "approved"
     assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
 

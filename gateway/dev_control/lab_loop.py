@@ -1447,7 +1447,10 @@ def _measure_code_review_r4(
         "Lab R4 constraints:",
         "- Review only. Do not edit files, commit, push, merge, approve, or publish.",
         "- Use the draft PR diff as the evidence source.",
+        "- Do not invoke slash commands or interactive review modes; answer directly.",
+        "- If there are no blocking findings, return verdict approved.",
         "- If you cannot inspect the PR, return verdict commented with a finding explaining why.",
+        "- Your final response must include the fenced DEV_CODE_REVIEW_RESULT JSON block, then stop.",
     ])
     timeout_seconds = min(max(float(context.get("max_seconds") or 600.0) / 2.0, 60.0), 600.0)
     session = None
@@ -2299,10 +2302,14 @@ def _attach_isolation_fields(
     # Backward-compatible field only. This is no longer an isolation gate.
     report["stable_db_unchanged"] = report["stable_db_telemetry"]["unchanged"]
     report["isolation"] = _audit_lab_isolation(isolation_pids)
-    if not report["isolation"].get("ok"):
+    if _has_forbidden_root_write(report["isolation"]):
         report["breaker_reason"] = "isolation_breach"
         report["status"] = "loop_halted"
         report["ok"] = False
+
+
+def _has_forbidden_root_write(isolation: dict[str, Any]) -> bool:
+    return any(bool(item.get("in_forbidden_root")) for item in (isolation or {}).get("offending_paths") or [])
 
 
 def _stable_db_telemetry(before: float | None, path: Optional[Path]) -> dict[str, Any]:
