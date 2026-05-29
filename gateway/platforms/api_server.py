@@ -837,6 +837,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_product_event_store: Optional[Any] = None
         self._dev_incident_store: Optional[Any] = None
         self._dev_scm_store: Optional[Any] = None
+        self._dev_reliability_store: Optional[Any] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
         self._read_model_cache = ReadModelCache()
@@ -1218,6 +1219,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             (self._dev_incident_store, "dev_incidents", "updated_at"),
             (self._dev_scm_store, "dev_merge_readiness", "created_at"),
             (self._dev_scm_store, "dev_merge_approvals", "created_at"),
+            (self._dev_reliability_store, "dev_reliability_outcomes", "updated_at"),
+            (self._dev_reliability_store, "dev_reliability_improvements", "measured_at"),
             (self._subagent_event_store, "subagent_events", "event_id"),
         ):
             if store is None:
