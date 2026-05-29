@@ -25,8 +25,12 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from gateway.dev_execution import DevExecutionStore, _extract_completion_summary, supervisor_loop_tick
+from gateway.dev_control.acceptance_criteria import acceptance_criteria_to_strings
 from gateway.dev_control.clarifications import DevClarificationStore
 from gateway.dev_control.plan_artifacts import DevPlanArtifactStore
+from gateway.dev_control.acceptance_verification import DevVerificationStore
+from gateway.dev_control.production_signals import DevProductionSignalStore
+from gateway.dev_control.repo_grounding import collect_repo_grounding
 from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
 from tools.ao_bridge import AOSession
@@ -111,10 +115,39 @@ def _fake_plan_artifact_response(title: str = "Planning Mode Artifact"):
         "validation_slices": [
             {"title": "No execution", "description": "Confirm no workers or Dev plans are created."},
         ],
-        "acceptance_criteria": ["Artifact can be retrieved and approved without execution."],
+        "acceptance_criteria": [
+            {
+                "statement": "Artifact can be retrieved and approved without execution.",
+                "verification_method": "test",
+                "verification_detail": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -k dev_plan_artifact",
+                "machine_checkable": True,
+            }
+        ],
         "risks": ["The first artifact may still need human revision."],
         "open_questions": [],
         "recommended_next_action": "Review, revise if needed, then approve for Phase 29.",
+    }
+    return _fake_text_response(json.dumps(payload))
+
+
+def _fake_clarified_brief_response():
+    payload = {
+        "refined_vision": "Build an interactive planning mode for vague feature ideas.",
+        "goals": ["Clarify scope before creating a plan artifact."],
+        "non_goals": ["Do not create or launch a Dev execution plan from this clarification alone."],
+        "constraints": [],
+        "assumptions": ["Project: Oryn Workspace"],
+        "acceptance_criteria": [
+            {
+                "statement": "The clarified brief contains a verifiable definition of done.",
+                "verification_method": "test",
+                "verification_detail": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -k dev_clarification",
+                "machine_checkable": True,
+            }
+        ],
+        "risk_notes": ["Technical feasibility still needs codebase validation."],
+        "open_questions": [],
+        "suggested_next_action": "Review the clarified brief, then draft a Dev execution plan if the direction is correct.",
     }
     return _fake_text_response(json.dumps(payload))
 
@@ -209,6 +242,15 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/dev/runtimes/openhands/server/stop", adapter._handle_dev_openhands_server_stop)
     app.router.add_get("/v1/dev/execution-plans", adapter._handle_dev_execution_plans)
     app.router.add_post("/v1/dev/execution-plans", adapter._handle_dev_execution_plans)
+    app.router.add_get("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
+    app.router.add_post("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
+    app.router.add_get("/v1/dev/verification-runs/{verification_run_id}", adapter._handle_dev_verification_run_detail)
+    app.router.add_get("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
+    app.router.add_post("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
+    app.router.add_get("/v1/dev/signal-reports/{report_id}", adapter._handle_dev_signal_report_detail)
+    app.router.add_get("/v1/dev/backlog-proposals", adapter._handle_dev_backlog_proposals)
+    app.router.add_post("/v1/dev/backlog-proposals/{proposal_id}/{action}", adapter._handle_dev_backlog_proposal_action)
+    app.router.add_get("/v1/dev/signal-health", adapter._handle_dev_signal_health)
     app.router.add_post("/v1/dev/execution-plans/supervise", adapter._handle_dev_execution_plans_supervise)
     app.router.add_get("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
     app.router.add_post("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
@@ -1010,7 +1052,8 @@ class TestRunEvents:
             })
             assert second.status == 200
 
-            complete = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()) as synthesis_mock:
+                complete = await cli.post(f"/v1/dev/clarifications/{data['clarification_id']}/complete", json={})
             assert complete.status == 200
             completed = await complete.json()
 
@@ -1018,6 +1061,8 @@ class TestRunEvents:
             assert completed["clarified_brief"]["refined_vision"].startswith("Build an interactive")
             assert "Do not create or launch a Dev execution plan" in completed["clarified_brief"]["non_goals"][0]
             assert "Project: Oryn Workspace" in completed["clarified_brief"]["assumptions"]
+            assert completed["clarified_brief"]["acceptance_criteria"][0]["machine_checkable"] is True
+            assert synthesis_mock.call_args.kwargs["task"] == "dev_clarification_synthesis"
             assert adapter._dev_execution_store.list_plans(limit=10) == []
 
             listed = await cli.get("/v1/dev/clarifications?status=completed")
@@ -1031,6 +1076,103 @@ class TestRunEvents:
             assert other_project_listed.status == 200
             assert (await project_listed.json())["total"] == 1
             assert (await other_project_listed.json())["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_persists_bounded_repo_grounding(self, adapter, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "AGENTS.md").write_text("Use focused changes and run tests.\n", encoding="utf-8")
+        (repo / "feedback_loop.py").write_text("def runtime_error_to_backlog():\n    return 'backlog'\n", encoding="utf-8")
+        before = sorted(path.relative_to(repo) for path in repo.rglob("*"))
+        monkeypatch.setenv("ORYN_REPO_GROUNDING_ROOTS", str(tmp_path))
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()) as call_mock:
+                resp = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Turn runtime errors into reviewed backlog items.",
+                    "project_context": {
+                        "repositories": [{"label": "Fixture", "path": str(repo)}],
+                    },
+                })
+            assert resp.status == 200
+            data = await resp.json()
+
+        after = sorted(path.relative_to(repo) for path in repo.rglob("*"))
+        assert before == after
+        assert data["grounding"]["time_budget_seconds"] == 8.0
+        assert data["grounding"]["file_budget"] == 60
+        assert data["grounding"]["byte_budget"] == 204800
+        assert data["grounding_provenance"]
+        assert any(path.endswith("AGENTS.md") for path in data["grounding_provenance"])
+        assert "Read-only repository grounding" in call_mock.call_args.kwargs["messages"][1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_grounding_invalid_path_warns_without_raising(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("ORYN_REPO_GROUNDING_ROOTS", str(tmp_path))
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                resp = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Clarify work with an unavailable repository.",
+                    "project_context": {
+                        "repositories": [{"label": "Missing", "path": str(tmp_path / "missing")}],
+                    },
+                })
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["grounding_provenance"] == []
+        assert data["grounding_warnings"]
+        assert "does not exist" in data["grounding_warnings"][0]
+
+    def test_repo_grounding_caps_time_budget_and_skips_unsafe_roots(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "README.md").write_text("Repo readme\n", encoding="utf-8")
+
+        result = collect_repo_grounding(
+            repositories=[{"path": str(repo)}],
+            vision_brief="Read a repo",
+            time_budget_seconds=99,
+            allowed_roots=[tmp_path / "other"],
+        )
+
+        assert result["grounding"]["time_budget_seconds"] == 10.0
+        assert result["provenance"] == []
+        assert result["warnings"]
+        assert "outside allowed grounding roots" in result["warnings"][0]
+
+    @pytest.mark.asyncio
+    async def test_dev_clarification_synthesis_fallback_marks_criteria_manual(self, adapter, tmp_path):
+        adapter._dev_execution_store = DevExecutionStore(tmp_path / "state.db")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarification_response()):
+                start = await cli.post("/v1/dev/clarifications", json={
+                    "vision_brief": "Clarify a fallback synthesis path.",
+                    "project_context": {"project_name": "Oryn Workspace"},
+                })
+            clarification = await start.json()
+            for question in clarification["questions"]:
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/answer", json={
+                    "question_id": question["question_id"],
+                    "option_id": question["recommended_option_id"],
+                })
+            with patch("gateway.dev_control.clarifications.call_llm", side_effect=RuntimeError("synthesis unavailable")):
+                complete = await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            assert complete.status == 200
+            completed = await complete.json()
+
+        assert "LLM clarified brief synthesis failed" in completed["warning"]
+        criteria = completed["clarified_brief"]["acceptance_criteria"]
+        assert criteria
+        assert all(item["machine_checkable"] is False for item in criteria)
+        assert all(item["verification_method"] == "manual" for item in criteria)
 
     @pytest.mark.asyncio
     async def test_dev_plan_artifact_lifecycle_versions_and_approves_without_execution_plan(self, adapter, tmp_path):
@@ -1051,7 +1193,8 @@ class TestRunEvents:
                 })
                 assert answer.status == 200
 
-            complete = await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                complete = await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
             assert complete.status == 200
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
@@ -1066,6 +1209,8 @@ class TestRunEvents:
             assert created["version"] == 1
             assert created["source"] == "llm"
             assert created["payload"]["implementation_slices"]
+            assert created["payload"]["acceptance_criteria"][0]["statement"]
+            assert created["payload"]["acceptance_criteria"][0]["machine_checkable"] is True
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response("Revised Planning Artifact")):
                 revised_resp = await cli.post(f"/v1/dev/plan-artifacts/{created['plan_artifact_id']}/revise", json={
@@ -1105,7 +1250,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
@@ -1142,7 +1288,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
@@ -1199,6 +1346,7 @@ class TestRunEvents:
         assert build["plan"]["tasks"][0].get("ao_session_id") is None
         assert build["plan"]["tasks"][0].get("runtime_session_id") is None
         assert "DEV_WORKER_EVIDENCE" in build["plan"]["tasks"][0]["prompt"]
+        assert isinstance(build["plan"]["tasks"][0]["acceptance_criteria"][0], str)
         assert builds["total"] == 1
         assert builds["data"][0]["plan_id"] == build["plan_id"]
         assert artifact_list["total"] == 1
@@ -1243,7 +1391,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
@@ -1281,6 +1430,90 @@ class TestRunEvents:
         assert draft["plan"]["tasks"][1]["status"] == "planned"
 
     @pytest.mark.asyncio
+    async def test_dev_verification_runs_api_launches_verify_worker_and_surfaces_read_model(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        adapter._dev_verification_store = DevVerificationStore(db_path)
+        criteria = acceptance_criteria_to_strings([{
+            "statement": "Verification API can run a worker.",
+            "verification_method": "test",
+            "verification_detail": "scripts/run_tests.sh tests/gateway/test_acceptance_verification.py",
+            "machine_checkable": True,
+        }])
+        plan = adapter._dev_execution_store.create_plan(
+            title="Verify via API",
+            vision_brief=None,
+            tasks=[{
+                "goal": "Implemented feature",
+                "prompt": "Implement the feature.",
+                "profile_id": "workspace.implement",
+                "project_id": "OrynWorkspace",
+                "permissions": "edit",
+                "acceptance_criteria": criteria,
+            }],
+        )
+        task_id = plan["tasks"][0]["task_id"]
+        from gateway.dev_execution import set_execution_plan_test_state
+
+        set_execution_plan_test_state(
+            store=adapter._dev_execution_store,
+            plan_id=plan["plan_id"],
+            task_id=task_id,
+            state="completed_ok",
+            event_store=adapter._subagent_event_store,
+            ao_session_id="implemented-api-session",
+            files_written=["gateway/dev_control/example.py"],
+        )
+        fake_router = _FakeRuntimeRouter()
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.dev_control.acceptance_verification._runtime_router", return_value=fake_router):
+                start_resp = await cli.post("/v1/dev/verification-runs", json={
+                    "plan_id": plan["plan_id"],
+                    "task_id": task_id,
+                })
+            assert start_resp.status == 200
+            started = await start_resp.json()
+            run_id = started["verification_run_id"]
+            adapter._subagent_event_store.append_event({
+                "event": "subagent.complete",
+                "subagent_id": f"ao:{started['verification_session_id']}",
+                "ao_session_id": started["verification_session_id"],
+                "status": "completed",
+                "summary": (
+                    "Verification finished\n"
+                    "```json DEV_VERIFICATION_RESULTS\n"
+                    + json.dumps({
+                        "object": "hermes.dev_verification_results",
+                        "results": [{
+                            "criterion_id": "crit-1",
+                            "command_run": started["executable_commands"][0]["command"],
+                            "exit_code": 0,
+                            "output_excerpt": "1 passed in 0.1s",
+                            "notes": "",
+                        }],
+                    })
+                    + "\n```"
+                ),
+            })
+            detail_resp = await cli.get(f"/v1/dev/verification-runs/{run_id}")
+            plan_resp = await cli.get(f"/v1/dev/execution-plans/{plan['plan_id']}")
+            detail = await detail_resp.json()
+            plan_payload = await plan_resp.json()
+
+        assert started["worker_launch_profile_id"] == "workspace.test"
+        assert started["status"] == "launched"
+        assert fake_router.spawned[0]["runtime"] == "ao"
+        assert "DEV_VERIFICATION_RESULTS" in fake_router.spawned[0]["kwargs"]["prompt"]
+        assert detail["status"] == "completed"
+        assert detail["verdict"] == "verified"
+        task = plan_payload["plan"]["tasks"][0]
+        assert task["acceptance_verification"]["verdict"] == "verified"
+        assert plan_payload["plan"]["acceptance_verification"]["counts"]["passed"] == 1
+
+    @pytest.mark.asyncio
     async def test_dev_execution_plan_draft_can_revise_and_approve_without_launch(self, adapter, tmp_path):
         db_path = tmp_path / "state.db"
         adapter._dev_execution_store = DevExecutionStore(db_path)
@@ -1297,7 +1530,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
                     "clarification_id": clarification["clarification_id"],
@@ -1358,7 +1592,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
                     "clarification_id": clarification["clarification_id"],
@@ -1401,7 +1636,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", return_value=_fake_plan_artifact_response()):
                 artifact_resp = await cli.post("/v1/dev/plan-artifacts", json={
@@ -1461,7 +1697,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             with patch("gateway.dev_control.plan_artifacts.call_llm", side_effect=[
                 _fake_text_response("not json"),
@@ -1493,7 +1730,8 @@ class TestRunEvents:
                     "question_id": question["question_id"],
                     "option_id": question["recommended_option_id"],
                 })
-            await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
+            with patch("gateway.dev_control.clarifications.call_llm", return_value=_fake_clarified_brief_response()):
+                await cli.post(f"/v1/dev/clarifications/{clarification['clarification_id']}/complete", json={})
 
             payload = json.loads(_fake_plan_artifact_response("Ignored").choices[0].message.content)
             payload.pop("title", None)
@@ -5684,3 +5922,51 @@ class TestAOSessionControls:
                 assert data["session"]["runtime"] == "ao"
                 assert data["session"]["ao_session_id"] == "oryn-workspace-1"
                 mock_bridge.open_session.assert_called_once_with("oryn-workspace-1")
+
+
+class TestDevProductionSignalAPI:
+    @pytest.mark.asyncio
+    async def test_signal_report_health_and_proposal_action_routes(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        adapter._dev_signal_store = DevProductionSignalStore(db_path)
+        for _ in range(3):
+            adapter._subagent_event_store.append_event({
+                "runtime": "fixture",
+                "subagent_id": "worker-api",
+                "event": "subagent.completed",
+                "status": "failed",
+                "summary": "api production signal",
+                "launch_plan_id": "plan-api",
+                "launch_task_id": "task-api",
+                "worker_confidence": 0.3,
+                "output_contract_score": 0.4,
+                "created_at": _time.time(),
+            })
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post("/v1/dev/signal-reports", json={"window_days": 7, "digest": True})
+            assert create_resp.status == 200
+            report = await create_resp.json()
+            assert report["status"] == "completed_with_clusters"
+            assert report["counts"]["proposal_count"] >= 1
+
+            list_resp = await cli.get("/v1/dev/signal-reports")
+            assert list_resp.status == 200
+            assert (await list_resp.json())["total"] == 1
+
+            proposals_resp = await cli.get("/v1/dev/backlog-proposals")
+            assert proposals_resp.status == 200
+            proposal = (await proposals_resp.json())["data"][0]
+            assert proposal["payload"]["source"] == "production_signal"
+
+            approve_resp = await cli.post(f"/v1/dev/backlog-proposals/{proposal['proposal_id']}/approve")
+            assert approve_resp.status == 200
+            assert (await approve_resp.json())["status"] == "approved"
+
+            health_resp = await cli.get("/v1/dev/signal-health")
+            assert health_resp.status == 200
+            health = await health_resp.json()
+            assert health["last_analysis_status"] == "completed_with_clusters"
+            assert health["proposals_by_status"]["approved"] == 1

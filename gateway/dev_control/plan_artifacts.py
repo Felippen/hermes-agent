@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.auxiliary_client import call_llm
+from gateway.dev_control.acceptance_criteria import (
+    ACCEPTANCE_CRITERION_JSON_SCHEMA,
+    ALLOWED_VERIFICATION_COMMAND_SHAPES,
+    acceptance_criteria_to_strings,
+    normalize_acceptance_criteria,
+    validate_and_downgrade_criteria,
+)
 from gateway.dev_control.clarifications import DevClarificationStore, get_clarification
 from gateway.dev_control.worker_output_contract import append_worker_output_contract
 from gateway.dev_execution import DevExecutionStore
@@ -116,7 +123,7 @@ ARTIFACT_JSON_SCHEMA: Dict[str, Any] = {
                 },
             },
         },
-        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+        "acceptance_criteria": {"type": "array", "items": ACCEPTANCE_CRITERION_JSON_SCHEMA},
         "risks": {"type": "array", "items": {"type": "string"}},
         "open_questions": {"type": "array", "items": {"type": "string"}},
         "recommended_next_action": {"type": "string"},
@@ -609,7 +616,12 @@ def _generate_artifact(
     for _ in range(2):
         try:
             payload = _generate_artifact_with_llm(clarification, previous=previous, feedback=feedback)
-            return {"source": "llm", "payload": _validate_artifact_payload(payload), "warning": None}
+            validated = _validate_artifact_payload(payload)
+            validated, warnings = _validate_artifact_criteria(validated, clarification)
+            warning = _criteria_warning_text(warnings)
+            if warning:
+                validated["warning"] = warning
+            return {"source": "llm", "payload": validated, "warning": warning}
         except Exception as exc:
             last_error = exc
     try:
@@ -633,7 +645,14 @@ def _generate_artifact_with_llm(
                 "Generate a rich but non-executing implementation planning artifact. "
                 "Return only valid JSON matching the provided schema. "
                 "Do not create worker tasks, do not say work has started, and do not approve execution. "
-                "Make the plan specific to the vision and clarification answers."
+                "Make the plan specific to the vision and clarification answers. "
+                "Artifact-level acceptance_criteria must be structured verification objects. "
+                "verification_detail for any machine_checkable: true criterion MUST match one of these exact "
+                f"command shapes: {'; '.join(ALLOWED_VERIFICATION_COMMAND_SHAPES)}. "
+                "Reference only files/paths present in the provided repository grounding; do not invent file paths. "
+                "Prefer a whole-suite or directory-level command when unsure of an exact file. "
+                "If no allowlisted command fits, set machine_checkable: false and describe a manual check instead. "
+                "Do not change execution task acceptance criteria; task drafting still uses string criteria later."
             ),
         },
         {
@@ -642,6 +661,7 @@ def _generate_artifact_with_llm(
                 "clarification": _clarification_context(clarification),
                 "previous_artifact": previous.get("payload") if previous else None,
                 "revision_feedback": feedback,
+                "repository_grounding_paths": _grounding_paths(clarification.get("grounding_provenance")),
             }, ensure_ascii=False),
         },
     ]
@@ -905,7 +925,7 @@ def _task_revision_snapshot(task: Dict[str, Any]) -> Dict[str, Any]:
 
 def _artifact_acceptance(artifact: Dict[str, Any]) -> list[str]:
     payload = artifact.get("payload") or {}
-    return _string_list(payload.get("acceptance_criteria")) or ["Complete the assigned slice and report verification evidence."]
+    return acceptance_criteria_to_strings(payload.get("acceptance_criteria")) or ["Complete the assigned slice and report verification evidence."]
 
 
 def _artifact_vision_brief(artifact: Dict[str, Any]) -> str:
@@ -935,6 +955,8 @@ def _clarification_context(clarification: Dict[str, Any]) -> Dict[str, Any]:
         "project_context": clarification.get("project_context") or {},
         "vision_brief": clarification.get("vision_brief"),
         "clarified_brief": clarification.get("clarified_brief"),
+        "grounding": clarification.get("grounding") or {},
+        "grounding_provenance": clarification.get("grounding_provenance") or [],
         "answers": answers,
     }
 
@@ -977,7 +999,7 @@ def _validate_artifact_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "user_workflow": _string_list(payload.get("user_workflow")),
         "implementation_slices": _slice_list(payload.get("implementation_slices")),
         "validation_slices": _slice_list(payload.get("validation_slices")),
-        "acceptance_criteria": _string_list(payload.get("acceptance_criteria")),
+        "acceptance_criteria": normalize_acceptance_criteria(payload.get("acceptance_criteria")),
         "risks": _string_list(payload.get("risks")),
         "open_questions": _string_list(payload.get("open_questions")),
         "recommended_next_action": _required_text(payload, "recommended_next_action"),
@@ -987,6 +1009,27 @@ def _validate_artifact_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not normalized["acceptance_criteria"]:
         raise ValueError("Plan artifact requires acceptance_criteria")
     return normalized
+
+
+def _validate_artifact_criteria(
+    payload: Dict[str, Any],
+    clarification: Dict[str, Any],
+) -> tuple[Dict[str, Any], list[str]]:
+    criteria, warnings = validate_and_downgrade_criteria(
+        payload.get("acceptance_criteria"),
+        repo_roots=_repo_roots_from_project_context(clarification.get("project_context") or {}),
+    )
+    if not warnings:
+        return payload, []
+    updated = dict(payload)
+    updated["acceptance_criteria"] = criteria
+    return updated, warnings
+
+
+def _criteria_warning_text(warnings: list[str]) -> Optional[str]:
+    if not warnings:
+        return None
+    return "Acceptance criteria downgraded: " + " ".join(warnings)
 
 
 def _fallback_artifact_payload(
@@ -1039,9 +1082,24 @@ def _fallback_artifact_payload(
             {"title": "Versioned revision", "description": "Confirm revision creates a new artifact version and supersedes the prior version."},
         ],
         "acceptance_criteria": [
-            "The plan artifact is durable and can be retrieved after refresh.",
-            "The artifact is visible in the right-side planning panel.",
-            "Approval does not create or launch any worker execution.",
+            {
+                "statement": "The plan artifact is durable and can be retrieved after refresh.",
+                "verification_method": "test",
+                "verification_detail": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -k dev_plan_artifact",
+                "machine_checkable": True,
+            },
+            {
+                "statement": "The artifact is visible in the right-side planning panel.",
+                "verification_method": "manual",
+                "verification_detail": "Review the Oryn Workspace planning panel.",
+                "machine_checkable": False,
+            },
+            {
+                "statement": "Approval does not create or launch any worker execution.",
+                "verification_method": "test",
+                "verification_detail": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -k dev_plan_artifact",
+                "machine_checkable": True,
+            },
         ],
         "risks": ["The fallback artifact is useful for continuity but may be less specific than an LLM-generated artifact."],
         "open_questions": [item.get("question") for item in skipped if item.get("question")],
@@ -1070,7 +1128,11 @@ def _render_markdown(payload: Dict[str, Any]) -> str:
         lines.extend([f"## {title}", ""])
         if isinstance(value, list):
             for item in value:
-                if isinstance(item, dict):
+                if isinstance(item, dict) and item.get("statement"):
+                    detail = item.get("verification_detail") or "Review manually."
+                    method = item.get("verification_method") or "manual"
+                    lines.append(f"- {item.get('statement')} _(verify: {method} - {detail})_")
+                elif isinstance(item, dict):
                     lines.append(f"- **{item.get('title', 'Slice')}**: {item.get('description', '')}")
                 else:
                     lines.append(f"- {item}")
@@ -1176,3 +1238,33 @@ def _title_from_vision(vision: str) -> str:
         return "Planning Artifact"
     text = re.sub(r"^(i want|we need|build|add|create)\s+", "", text, flags=re.IGNORECASE)
     return text[:72].strip(" .") or "Planning Artifact"
+
+
+def _repo_roots_from_project_context(project_context: Dict[str, Any]) -> list[str]:
+    roots: list[str] = []
+    repositories = project_context.get("repositories")
+    if isinstance(repositories, list):
+        for repo in repositories:
+            if isinstance(repo, dict):
+                path = str(repo.get("path") or "").strip()
+                if path:
+                    roots.append(path)
+    return roots
+
+
+def _grounding_paths(provenance: Any) -> list[str]:
+    paths: list[str] = []
+    if not isinstance(provenance, list):
+        return paths
+    for item in provenance:
+        if isinstance(item, str):
+            path = item.strip()
+            if path:
+                paths.append(path)
+            continue
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("repo_path") or "").strip()
+        if path:
+            paths.append(path)
+    return paths
