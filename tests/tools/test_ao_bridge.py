@@ -20,15 +20,20 @@ def test_bridge_env_prepends_codex_shim(tmp_path, monkeypatch):
     assert env["CODEX_REAL_BIN"] == "/opt/test/bin/codex"
     assert env["HOME"] == "/Users/felipelamartine"
     assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == "/Users/felipelamartine/.codex-verification"
+    assert env["HERMES_AO_CODEX_AUTH_HOME"].endswith("/.codex")
 
 
 def test_bridge_env_allows_verification_codex_home_override(tmp_path, monkeypatch):
     override = tmp_path / "codex-verify"
     monkeypatch.setenv("HERMES_AO_VERIFICATION_CODEX_HOME", str(override))
+    auth_home = tmp_path / "codex-auth"
+    monkeypatch.setenv("HERMES_AO_CODEX_AUTH_HOME", str(auth_home))
 
     bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
 
-    assert bridge._bridge_env()["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(override)
+    env = bridge._bridge_env()
+    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(override)
+    assert env["HERMES_AO_CODEX_AUTH_HOME"] == str(auth_home)
 
 
 def test_bridge_env_does_not_use_shim_as_real_codex(tmp_path, monkeypatch):
@@ -373,6 +378,9 @@ def test_codex_shim_isolates_dev_verification_codex_home(tmp_path):
     )
     real_codex.chmod(0o755)
     verification_home = tmp_path / "codex-verification"
+    auth_home = tmp_path / "codex-auth"
+    auth_home.mkdir()
+    (auth_home / "auth.json").write_text('{"token":"test"}\n', encoding="utf-8")
     workspace = tmp_path / "worktree"
     workspace.mkdir()
 
@@ -396,6 +404,7 @@ def test_codex_shim_isolates_dev_verification_codex_home(tmp_path):
         env={
             "CODEX_REAL_BIN": str(real_codex),
             "HERMES_AO_VERIFICATION_CODEX_HOME": str(verification_home),
+            "HERMES_AO_CODEX_AUTH_HOME": str(auth_home),
             "HOME": str(tmp_path / "home"),
             "PATH": os.environ.get("PATH", ""),
         },
@@ -406,3 +415,4 @@ def test_codex_shim_isolates_dev_verification_codex_home(tmp_path):
     config = verification_home / "config.toml"
     assert config.exists()
     assert f'[projects."{workspace}"]' in config.read_text(encoding="utf-8")
+    assert (verification_home / "auth.json").read_text(encoding="utf-8") == '{"token":"test"}\n'

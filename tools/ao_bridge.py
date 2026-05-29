@@ -538,6 +538,11 @@ class AOBridge:
             os.environ.get("HERMES_AO_VERIFICATION_CODEX_HOME")
             or str(Path(self.home) / ".codex-verification")
         )
+        env["HERMES_AO_CODEX_AUTH_HOME"] = (
+            os.environ.get("HERMES_AO_CODEX_AUTH_HOME")
+            or os.environ.get("CODEX_HOME")
+            or str(Path.home() / ".codex")
+        )
         shim_path = str(self.codex_shim_dir)
         current_path = env.get("PATH", "")
         if shim_path not in current_path.split(os.pathsep):
@@ -559,7 +564,7 @@ class AOBridge:
 
     def _prepare_tmux_environment(self, env: Dict[str, str]) -> None:
         """Make AO-created tmux sessions resolve the Codex compatibility shim."""
-        for key in ("PATH", "CODEX_REAL_BIN", "HERMES_AO_VERIFICATION_CODEX_HOME"):
+        for key in ("PATH", "CODEX_REAL_BIN", "HERMES_AO_VERIFICATION_CODEX_HOME", "HERMES_AO_CODEX_AUTH_HOME"):
             value = env.get(key)
             if not value:
                 continue

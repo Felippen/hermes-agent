@@ -15,6 +15,11 @@ done
 
 if [[ "$is_dev_verification" == "1" && -n "${HERMES_AO_VERIFICATION_CODEX_HOME:-}" ]]; then
   export CODEX_HOME="$HERMES_AO_VERIFICATION_CODEX_HOME"
+  if [[ -n "${HERMES_AO_CODEX_AUTH_HOME:-}" && -f "$HERMES_AO_CODEX_AUTH_HOME/auth.json" ]]; then
+    mkdir -p "$CODEX_HOME"
+    cp "$HERMES_AO_CODEX_AUTH_HOME/auth.json" "$CODEX_HOME/auth.json"
+    chmod 600 "$CODEX_HOME/auth.json" 2>/dev/null || true
+  fi
 fi
 
 codex_home="${CODEX_HOME:-${HOME:-}/.codex}"
