@@ -271,7 +271,9 @@ def test_lab_executor_derives_verified_outcome_from_measured_verification(monkey
     assert outcome["verification_verdict"] == "verified"
     assert outcome["merged"] is False
     assert outcome["source_refs"]["draft_pr_only"] is True
-    assert outcome["success"] is False
+    assert outcome["source_refs"]["gates"]["ci"] == "not_measured"
+    assert outcome["source_refs"]["gates"]["review"] == "not_measured"
+    assert outcome["success"] is True
 
     ready_payload = dict(outcome)
     ready_payload.pop("outcome_id", None)

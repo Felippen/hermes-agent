@@ -550,6 +550,9 @@ def test_verification_launch_uses_verify_profile_and_refreshes_from_worker_outpu
     assert "apps/oryn-workspace" in bridge.spawned[0]["kwargs"]["prompt"]
     assert "/Users/" not in bridge.spawned[0]["kwargs"]["prompt"]
     assert "Do not edit source files" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "valid JSON" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "Do not paste raw multi-line command output inside a JSON string" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "escape any newline as \\n" in bridge.spawned[0]["kwargs"]["prompt"]
     prompt_meta = event_store.get_ao_prompt(run["verification_session_id"])
     assert prompt_meta["permissions"] == "verify"
     assert prompt_meta["launch_profile_id"] == "workspace.test"

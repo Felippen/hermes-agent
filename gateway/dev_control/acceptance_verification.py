@@ -789,6 +789,9 @@ def _verification_prompt(*, plan: Dict[str, Any], task: Dict[str, Any], commands
         ],
         "",
         "Final output is mandatory: return a short summary followed by this exact fenced JSON block as your final response.",
+        "The fenced block must be valid JSON. Do not paste raw multi-line command output inside a JSON string.",
+        "Keep output_excerpt to one short JSON string with the real summary line or command-output tail; escape any newline as \\n.",
+        "Set exit_code to the real process exit code you observed. Do not leave the template exit_code or output_excerpt unchanged.",
         "```json DEV_VERIFICATION_RESULTS",
         json.dumps({
             "object": VERIFICATION_OBJECT,

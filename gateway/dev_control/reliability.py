@@ -69,6 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_dev_reliability_improvements_category
 SUCCESS_VERIFICATION_VERDICTS = {"verified", "passed"}
 SUCCESS_CI_STATES = {"success"}
 SUCCESS_REVIEW_VERDICTS = {"approved"}
+UNMEASURED_GATE_STATES = {"", "unknown", "not_measured", "not-measured", "not measured", "unavailable"}
 MERGED_STATUSES = {"merged", "shipped", "completed"}
 TERMINAL_STATUSES = MERGED_STATUSES | {"failed", "cancelled", "needs_attention", "needs_review"}
 TIER_RANK = {"unproven": 0, "observed": 1, "trusted": 2}
@@ -648,8 +649,8 @@ def outcome_success(outcome: Dict[str, Any]) -> bool:
             str(outcome.get("terminal_status") or "").lower() in {"completed", "ready", "draft_pr_ready"}
             and bool(source_refs.get("draft_pr_ready"))
             and str(outcome.get("verification_verdict") or "").lower() in SUCCESS_VERIFICATION_VERDICTS
-            and str(outcome.get("ci_state") or "").lower() in SUCCESS_CI_STATES
-            and str(outcome.get("code_review_verdict") or "").lower() in SUCCESS_REVIEW_VERDICTS
+            and _draft_gate_success_or_unmeasured(outcome, gate="ci", success_states=SUCCESS_CI_STATES)
+            and _draft_gate_success_or_unmeasured(outcome, gate="review", success_states=SUCCESS_REVIEW_VERDICTS)
             and not bool(outcome.get("escaped"))
         )
     return (
@@ -660,6 +661,17 @@ def outcome_success(outcome: Dict[str, Any]) -> bool:
         and str(outcome.get("code_review_verdict") or "").lower() in SUCCESS_REVIEW_VERDICTS
         and not bool(outcome.get("escaped"))
     )
+
+
+def _draft_gate_success_or_unmeasured(outcome: Dict[str, Any], *, gate: str, success_states: set[str]) -> bool:
+    source_refs = outcome.get("source_refs") if isinstance(outcome.get("source_refs"), dict) else {}
+    gates = source_refs.get("gates") if isinstance(source_refs.get("gates"), dict) else {}
+    outcome_key = "ci_state" if gate == "ci" else "code_review_verdict"
+    state = str(outcome.get(outcome_key) or "").strip().lower()
+    gate_state = str(gates.get(gate) or state).strip().lower()
+    if gate_state in UNMEASURED_GATE_STATES and state in UNMEASURED_GATE_STATES:
+        return True
+    return state in success_states
 
 
 def outcome_excluded(outcome: Dict[str, Any]) -> bool:
