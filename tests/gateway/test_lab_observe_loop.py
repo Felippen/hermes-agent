@@ -8,7 +8,7 @@ from pathlib import Path
 
 from gateway.dev_control.dogfood_backlog import dogfood_scope_check
 from gateway.dev_control.lab_process_isolation import audit_process_isolation
-from gateway.dev_control.lab_loop import DevLabLoopStore, _await_implementation_terminal, loop_health, run_lab_loop_pass
+from gateway.dev_control.lab_loop import DevLabLoopStore, _await_implementation_terminal, _touched_paths_from_worktree, loop_health, run_lab_loop_pass
 from gateway.dev_control.reliability import DevReliabilityStore, scorecard
 from gateway.subagent_events import SubagentEventStore
 from gateway.dev_execution import DevExecutionStore
@@ -1048,6 +1048,22 @@ def test_lab_adversarial_fixture_requires_explicit_enable(monkeypatch, tmp_path)
     assert fixture["requested"] is True
     assert fixture["enabled"] is False
     assert fixture["applied"] is False
+
+
+def test_touched_paths_preserve_porcelain_paths_with_leading_status_space(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "agent" / "conversation_loop.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("print('seed')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "agent/conversation_loop.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed agent file"], cwd=repo, check=True)
+
+    target.write_text("print('changed')\n", encoding="utf-8")
+    paths = _touched_paths_from_worktree(repo)
+
+    assert "agent/conversation_loop.py" in paths
+    assert "gent/conversation_loop.py" not in paths
 
 
 def test_lab_executor_records_empty_diff_as_failure(monkeypatch, tmp_path):

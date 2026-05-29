@@ -1483,7 +1483,7 @@ def _git_lines(workspace: Path, args: list[str]) -> list[str]:
         return []
     if result.returncode != 0:
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return [line.rstrip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def _paths_from_porcelain(lines: list[str]) -> list[str]:
