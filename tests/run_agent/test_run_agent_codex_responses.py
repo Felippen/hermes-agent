@@ -1708,6 +1708,41 @@ def test_normalize_codex_response_marks_reasoning_only_as_incomplete(monkeypatch
     assert assistant_message.codex_reasoning_items[0]["encrypted_content"] == "enc_abc123"
 
 
+def test_normalize_codex_response_falls_back_to_streamed_reasoning(monkeypatch):
+    """When the terminal reasoning item carries no readable summary (text
+    arrived only via ``*.delta`` events), normalization must persist the
+    streamed reasoning the consumer assembled on ``_hermes_streamed_reasoning``.
+    Otherwise nothing reasoning-shaped reaches the sessions DB and the client's
+    reasoning trace vanishes on resume/resync."""
+    agent = _build_agent(monkeypatch)
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                id="rs_002",
+                encrypted_content="enc_only",
+                summary=[],  # no readable summary echoed
+                status="completed",
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="Done.")],
+                status="completed",
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=20, total_tokens=30),
+        status="completed",
+        model="gpt-5.5",
+    )
+    response._hermes_streamed_reasoning = "Weighing options then deciding"
+
+    from agent.codex_responses_adapter import _normalize_codex_response
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.reasoning == "Weighing options then deciding"
+
+
 def test_normalize_codex_response_reasoning_with_content_is_stop(monkeypatch):
     """If a response has both reasoning and message content, it should still be 'stop'."""
     agent = _build_agent(monkeypatch)

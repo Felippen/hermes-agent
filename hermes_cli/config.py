@@ -1132,6 +1132,17 @@ DEFAULT_CONFIG = {
             "timeout": 600,
             "extra_body": {},
         },
+        # Goal loop judge — must NOT inherit the session's main Codex/chat
+        # model (auto-detect routes there and breaks on Codex sessions).
+        # Route to a cheap OpenRouter model by default; override per profile.
+        "goal_judge": {
+            "provider": "openrouter",
+            "model": "google/gemini-3-flash-preview",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
     },
     
     "display": {

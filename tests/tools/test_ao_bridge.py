@@ -19,6 +19,16 @@ def test_bridge_env_prepends_codex_shim(tmp_path, monkeypatch):
     assert env["PATH"].split(os.pathsep)[0] == str(shim_dir)
     assert env["CODEX_REAL_BIN"] == "/opt/test/bin/codex"
     assert env["HOME"] == "/Users/felipelamartine"
+    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == "/Users/felipelamartine/.codex-verification"
+
+
+def test_bridge_env_allows_verification_codex_home_override(tmp_path, monkeypatch):
+    override = tmp_path / "codex-verify"
+    monkeypatch.setenv("HERMES_AO_VERIFICATION_CODEX_HOME", str(override))
+
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+
+    assert bridge._bridge_env()["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(override)
 
 
 def test_bridge_env_does_not_use_shim_as_real_codex(tmp_path, monkeypatch):
@@ -351,3 +361,48 @@ def test_codex_shim_translates_ao_approval_mode(tmp_path):
         "--",
         "hello",
     ]
+
+
+def test_codex_shim_isolates_dev_verification_codex_home(tmp_path):
+    real_codex = tmp_path / "real-codex"
+    real_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'CODEX_HOME=%s\\n' \"${CODEX_HOME:-}\"\n"
+        "printf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    verification_home = tmp_path / "codex-verification"
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+
+    shim = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "tools",
+        "ao_shims",
+        "codex",
+    )
+    proc = subprocess.run(
+        [
+            shim,
+            "--model",
+            "gpt-5.5",
+            "--",
+            "Run fixed verification commands and return DEV_VERIFICATION_RESULTS.",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=workspace,
+        env={
+            "CODEX_REAL_BIN": str(real_codex),
+            "HERMES_AO_VERIFICATION_CODEX_HOME": str(verification_home),
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ.get("PATH", ""),
+        },
+        check=True,
+    )
+
+    assert proc.stdout.splitlines()[0] == f"CODEX_HOME={verification_home}"
+    config = verification_home / "config.toml"
+    assert config.exists()
+    assert f'[projects."{workspace}"]' in config.read_text(encoding="utf-8")

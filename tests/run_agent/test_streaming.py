@@ -715,6 +715,87 @@ class TestReasoningStreaming:
         assert response.choices[0].message.content == "The answer is 42"
 
 
+class TestConsumeCodexReasoningItemFallback:
+    """``_consume_codex_event_stream`` must forward reasoning text even when
+    the backend delivers it only as a completed ``reasoning`` item (no
+    ``*.delta`` events).  Otherwise the client's reasoning trace stays empty
+    and vanishes on completion (the "thinking disappears" bug)."""
+
+    def test_completed_reasoning_item_forwarded_when_no_deltas(self):
+        from agent.codex_runtime import _consume_codex_event_stream
+
+        reasoning_deltas = []
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="reasoning",
+                    summary=[SimpleNamespace(type="summary_text", text="Weighing options")],
+                    content=[SimpleNamespace(type="reasoning_text", text="picked the simplest")],
+                ),
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    content=[SimpleNamespace(type="output_text", text="The answer is 42.")],
+                ),
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r1", usage=None),
+            ),
+        ]
+
+        final = _consume_codex_event_stream(
+            iter(events),
+            model="test/model",
+            on_reasoning_delta=lambda t: reasoning_deltas.append(t),
+        )
+
+        assert reasoning_deltas == ["Weighing options\npicked the simplest"]
+        assert final.output_text == "" or "42" in (final.output_text or "")
+
+    def test_completed_reasoning_item_skipped_when_deltas_already_streamed(self):
+        """No duplication: if reasoning streamed as deltas, the completed
+        reasoning item must NOT be re-forwarded."""
+        from agent.codex_runtime import _consume_codex_event_stream
+
+        reasoning_deltas = []
+        events = [
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                delta="Thinking",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                delta=" hard",
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="reasoning",
+                    summary=[SimpleNamespace(type="summary_text", text="Thinking hard")],
+                    content=[],
+                ),
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r2", usage=None),
+            ),
+        ]
+
+        _consume_codex_event_stream(
+            iter(events),
+            model="test/model",
+            on_reasoning_delta=lambda t: reasoning_deltas.append(t),
+        )
+
+        assert reasoning_deltas == ["Thinking", " hard"]
+
+
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 
 

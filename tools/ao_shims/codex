@@ -3,8 +3,24 @@ set -euo pipefail
 
 real_codex="${CODEX_REAL_BIN:-/opt/homebrew/bin/codex}"
 
-if [[ "${HOME:-}" == *"/.oryn-lab" && "${PWD:-}" == "$HOME"* ]]; then
-  config="$HOME/.codex/config.toml"
+is_dev_verification=0
+for arg in "$@"; do
+  case "$arg" in
+    *"DEV_VERIFICATION_RESULTS"*|*"Independent Dev Verification"*)
+      is_dev_verification=1
+      break
+      ;;
+  esac
+done
+
+if [[ "$is_dev_verification" == "1" && -n "${HERMES_AO_VERIFICATION_CODEX_HOME:-}" ]]; then
+  export CODEX_HOME="$HERMES_AO_VERIFICATION_CODEX_HOME"
+fi
+
+codex_home="${CODEX_HOME:-${HOME:-}/.codex}"
+
+if [[ "$is_dev_verification" == "1" || ( "${HOME:-}" == *"/.oryn-lab" && "${PWD:-}" == "$HOME"* ) ]]; then
+  config="$codex_home/config.toml"
   mkdir -p "$(dirname "$config")"
   if ! grep -Fq "[projects.\"$PWD\"]" "$config" 2>/dev/null; then
     {

@@ -1192,10 +1192,20 @@ def _normalize_codex_response(
         # so the model keeps its chain-of-thought on the retry.
         final_text = ""
 
+    reasoning_value = "\n\n".join(reasoning_parts).strip() if reasoning_parts else None
+    if not reasoning_value:
+        # Fallback: the streaming consumer assembled reasoning from
+        # ``reasoning_summary_text.delta`` events that the terminal
+        # ``reasoning`` item did not echo in its ``summary``.  Persisting it
+        # keeps the client's reasoning trace alive across resume/resync.
+        streamed_reasoning = getattr(response, "_hermes_streamed_reasoning", None)
+        if isinstance(streamed_reasoning, str) and streamed_reasoning.strip():
+            reasoning_value = streamed_reasoning.strip()
+
     assistant_message = SimpleNamespace(
         content=final_text,
         tool_calls=tool_calls,
-        reasoning="\n\n".join(reasoning_parts).strip() if reasoning_parts else None,
+        reasoning=reasoning_value,
         reasoning_content=None,
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
