@@ -534,7 +534,11 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
     quarantined = not diff_scope.get("ok")
     draft_artifact = None
     if implementation.get("status") == "completed" and not quarantined and not empty_diff:
-        draft_artifact = _draft_branch_artifact(implementation=implementation, workspace_path=workspace_path)
+        draft_artifact = _draft_branch_artifact(
+            candidate=candidate,
+            implementation=implementation,
+            workspace_path=workspace_path,
+        )
     pre_verification_cleanup = None
     if draft_artifact:
         pre_verification_cleanup = _cleanup_lab_worktree(workspace_path)
@@ -1562,6 +1566,24 @@ def _git_lines(workspace: Path, args: list[str]) -> list[str]:
     return [line.rstrip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def _run_command(args: list[str], *, timeout: float = 30.0) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - command failures are carried as evidence.
+        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 def _paths_from_porcelain(lines: list[str]) -> list[str]:
     paths: list[str] = []
     for line in lines:
@@ -1595,18 +1617,135 @@ def _drop_parent_directory_entries(paths: list[str]) -> list[str]:
     return result
 
 
-def _draft_branch_artifact(*, implementation: dict[str, Any], workspace_path: Any) -> dict[str, Any]:
+def _draft_branch_artifact(
+    *,
+    candidate: dict[str, Any],
+    implementation: dict[str, Any],
+    workspace_path: Any,
+) -> dict[str, Any]:
     branch = str(implementation.get("branch") or "").strip()
     head_sha = implementation.get("head_sha") or _git_head_sha(workspace_path)
     pr = implementation.get("pr") if isinstance(implementation.get("pr"), dict) else None
+    publish = _publish_lab_draft_pr(candidate=candidate, workspace_path=workspace_path, branch=branch)
+    if publish.get("ready"):
+        pr = {
+            "url": publish.get("pr_url"),
+            "html_url": publish.get("pr_url"),
+            "number": publish.get("pr_number"),
+        }
+        head_sha = publish.get("head_sha") or head_sha
     return {
         "ready": True,
         "type": "draft_pr" if pr else "local_branch",
         "branch": branch,
         "head_sha": head_sha,
         "pr_url": (pr or {}).get("url") or (pr or {}).get("html_url"),
+        "pr_number": (pr or {}).get("number"),
         "draft": True,
+        "publish": publish,
     }
+
+
+def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, branch: str) -> dict[str, Any]:
+    config = _lab_draft_pr_config(candidate)
+    if not config.get("enabled"):
+        return {
+            "ready": False,
+            "status": "not_configured",
+            "warnings": [config.get("reason") or "Lab draft PR publishing is not configured."],
+        }
+    workspace = Path(str(workspace_path or "")).expanduser()
+    if not workspace.exists():
+        return {
+            "ready": False,
+            "status": "failed",
+            "warnings": [f"Workspace path does not exist: {workspace}"],
+        }
+    remote = config["remote"]
+    repo = config["repo"]
+    base = config["base"]
+    head = config.get("head") or branch
+    title = str(candidate.get("prompt") or "Hermes Lab dogfood task").strip().splitlines()[0][:120]
+    body = "\n".join([
+        "Hermes Lab dogfood draft PR.",
+        "",
+        "Safety posture:",
+        "- lab-generated branch",
+        "- draft PR only",
+        "- no merge or publish authority",
+    ])
+    push = _run_command(["git", "-C", str(workspace), "push", remote, f"HEAD:{branch}"], timeout=60)
+    if push["returncode"] != 0:
+        return {
+            "ready": False,
+            "status": "push_failed",
+            "repo": repo,
+            "remote": remote,
+            "branch": branch,
+            "warnings": [push.get("stderr") or push.get("stdout") or "git push failed"],
+        }
+    pr = _run_command(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--draft",
+            "--repo",
+            repo,
+            "--base",
+            base,
+            "--head",
+            head,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+        timeout=60,
+    )
+    if pr["returncode"] != 0:
+        return {
+            "ready": False,
+            "status": "pr_create_failed",
+            "repo": repo,
+            "remote": remote,
+            "branch": branch,
+            "head": head,
+            "warnings": [pr.get("stderr") or pr.get("stdout") or "gh pr create failed"],
+        }
+    head_sha = _git_head_sha(workspace)
+    pr_url = (pr.get("stdout") or "").strip().splitlines()[-1] if (pr.get("stdout") or "").strip() else None
+    return {
+        "ready": True,
+        "status": "created",
+        "repo": repo,
+        "remote": remote,
+        "base": base,
+        "head": head,
+        "branch": branch,
+        "head_sha": head_sha,
+        "pr_url": pr_url,
+        "warnings": [],
+    }
+
+
+def _lab_draft_pr_config(candidate: dict[str, Any]) -> dict[str, Any]:
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    repo = str(
+        payload.get("draft_pr_repo")
+        or payload.get("ci_repo")
+        or os.getenv("HERMES_DEV_LAB_DRAFT_PR_REPO")
+        or os.getenv("HERMES_DEV_LAB_CI_REPO")
+        or ""
+    ).strip()
+    remote = str(payload.get("draft_pr_remote") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_REMOTE") or "").strip()
+    base = str(payload.get("draft_pr_base") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_BASE") or "main").strip()
+    head = str(payload.get("draft_pr_head") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_HEAD") or "").strip()
+    if not repo:
+        return {"enabled": False, "reason": "Lab draft PR repo is not configured."}
+    if not remote:
+        return {"enabled": False, "repo": repo, "reason": "Lab draft PR remote is not configured."}
+    return {"enabled": True, "repo": repo, "remote": remote, "base": base or "main", "head": head}
 
 
 def _lab_terminal_status(

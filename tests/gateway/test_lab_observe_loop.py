@@ -334,6 +334,94 @@ def test_lab_executor_derives_ci_state_from_draft_head_sha(monkeypatch, tmp_path
     assert calls == [{"repo": "Felippen/Oryn", "ref": report["execution"]["head_sha"]}]
 
 
+def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    commands = []
+
+    def fake_run_command(args, *, timeout=30.0):
+        commands.append(args)
+        if args[:2] == ["gh", "pr"]:
+            return {"returncode": 0, "stdout": "https://github.com/Felippen/Oryn/pull/123\n", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    def fake_fetch_ci_status(*, repo, ref):
+        return {"state": "success", "repo": repo, "ref": ref, "warnings": []}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+    monkeypatch.setattr("gateway.dev_control.lab_loop.fetch_ci_status", fake_fetch_ci_status)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Publish a draft PR artifact for a lab docs task.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/lab-draft-pr.md"],
+        "source": "docs",
+        "payload": {
+            "branch": "lab/dogfood/draft-pr-fixture",
+            "ci_repo": "Felippen/Oryn",
+            "draft_pr_remote": "lab-origin",
+            "draft_pr_base": "main",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/lab-draft-pr.md"]),
+    )
+
+    artifact = report["execution"]["draft_artifact"]
+    assert report["status"] == "completed"
+    assert artifact["type"] == "draft_pr"
+    assert artifact["pr_url"] == "https://github.com/Felippen/Oryn/pull/123"
+    assert artifact["publish"]["status"] == "created"
+    assert any(command[:4] == ["git", "-C", str(Path(report["execution"]["workspace_path"])), "push"] for command in commands)
+    assert any(command[:3] == ["gh", "pr", "create"] and "--draft" in command for command in commands)
+
+
+def test_lab_executor_keeps_local_branch_when_draft_pr_remote_missing(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    commands = []
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", lambda args, *, timeout=30.0: commands.append(args) or {"returncode": 0, "stdout": "", "stderr": ""})
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Keep local branch artifact when draft PR remote is absent.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/local-branch.md"],
+        "source": "docs",
+        "payload": {
+            "ci_repo": "Felippen/Oryn",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/local-branch.md"]),
+    )
+
+    artifact = report["execution"]["draft_artifact"]
+    assert artifact["type"] == "local_branch"
+    assert artifact["pr_url"] is None
+    assert artifact["publish"]["status"] == "not_configured"
+    assert commands == []
+
+
 def test_lab_executor_ci_failure_is_real_failed_outcome(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     DevLabLoopStore(db_path).upsert_candidate({
@@ -1033,12 +1121,15 @@ def test_lab_executor_preserves_structured_acceptance_criteria(monkeypatch, tmp_
 
 def test_lab_executor_quarantines_out_of_scope_worker_diff(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
+    commands = []
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", lambda args, *, timeout=30.0: commands.append(args) or {"returncode": 0, "stdout": "", "stderr": ""})
     DevLabLoopStore(db_path).upsert_candidate({
         "prompt": "Worker attempts an engine edit despite scoped intent.",
         "profile_id": "platform.implement",
         "risk_level": "low",
         "target_paths": ["gateway/dev_control/lab_loop.py"],
         "source": "todo",
+        "payload": {"ci_repo": "Felippen/Oryn", "draft_pr_remote": "lab-origin"},
     }, approved=True)
     router = _FakeLabRouter(tmp_path / "lab", diff_paths=["agent/conversation_loop.py"])
 
@@ -1054,6 +1145,7 @@ def test_lab_executor_quarantines_out_of_scope_worker_diff(monkeypatch, tmp_path
     assert report["diff_scope"]["status"] == "out_of_scope"
     assert "agent/conversation_loop.py" in report["diff_scope"]["rejected_paths"]
     assert report["draft_artifact"] is None
+    assert commands == []
     outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
     assert outcome["source_refs"]["quarantined"] is True
     assert outcome["source_refs"]["draft_pr_ready"] is False
