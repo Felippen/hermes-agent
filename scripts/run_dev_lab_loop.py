@@ -19,6 +19,7 @@ from gateway.dev_control.lab_loop import (  # noqa: E402
     DevLabLoopStore,
     enqueue_approved_proposals,
     enqueue_candidates,
+    finalize_pending_lab_ci_outcomes,
     loop_health,
     run_lab_loop,
 )
@@ -36,6 +37,7 @@ def main() -> int:
     parser.add_argument("--auto-approve", action="store_true", help="Auto-approve discovered low-risk allowed candidates.")
     parser.add_argument("--resume", action="store_true", help="Clear a halted loop before running.")
     parser.add_argument("--health", action="store_true", help="Print loop health and exit.")
+    parser.add_argument("--finalize-ci", action="store_true", help="Refresh pending CI states for draft-PR lab outcomes and exit.")
     parser.add_argument(
         "--ao-config-path",
         default=os.getenv("ORYN_LAB_AO_CONFIG_PATH"),
@@ -60,6 +62,9 @@ def main() -> int:
     store = DevLabLoopStore(db_path)
     if args.resume:
         store.resume()
+    if args.finalize_ci:
+        print(json.dumps(finalize_pending_lab_ci_outcomes(db_path=db_path), ensure_ascii=False, sort_keys=True))
+        return 0
     if args.health:
         print(json.dumps(loop_health(db_path=db_path), ensure_ascii=False, sort_keys=True))
         return 0

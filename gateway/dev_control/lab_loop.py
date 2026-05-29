@@ -1381,6 +1381,97 @@ def _measure_ci_r3(
     }
 
 
+def finalize_pending_lab_ci_outcomes(
+    *,
+    db_path: Path,
+    fetcher: Optional[Callable[..., dict[str, Any]]] = None,
+    limit: int = 50,
+    now: Optional[float] = None,
+) -> dict[str, Any]:
+    """Refresh CI for draft-PR lab outcomes that were recorded before checks settled."""
+    reliability_store = DevReliabilityStore(db_path)
+    refreshed_at = float(now or time.time())
+    refreshed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for outcome in reliability_store.list_outcomes(limit=limit):
+        source_refs = outcome.get("source_refs") if isinstance(outcome.get("source_refs"), dict) else {}
+        if source_refs.get("source") != "dogfood_lab_loop" or not source_refs.get("draft_pr_only"):
+            continue
+        current_state = str(outcome.get("ci_state") or "unknown").strip().lower()
+        if current_state != "pending":
+            skipped.append({
+                "outcome_id": outcome.get("outcome_id"),
+                "reason": f"ci_state_not_pending:{current_state}",
+            })
+            continue
+        ci_status_ref = source_refs.get("ci_status") if isinstance(source_refs.get("ci_status"), dict) else {}
+        draft_artifact = source_refs.get("draft_artifact") if isinstance(source_refs.get("draft_artifact"), dict) else {}
+        publish = draft_artifact.get("publish") if isinstance(draft_artifact.get("publish"), dict) else {}
+        repo = str(ci_status_ref.get("repo") or publish.get("repo") or "").strip()
+        ref = str(ci_status_ref.get("ref") or source_refs.get("head_sha") or draft_artifact.get("head_sha") or "").strip()
+        if not repo or not ref:
+            skipped.append({
+                "outcome_id": outcome.get("outcome_id"),
+                "reason": "missing_repo_or_ref",
+                "repo": repo or None,
+                "ref": ref or None,
+            })
+            continue
+        try:
+            raw_ci = (fetcher or fetch_ci_status)(repo=repo, ref=ref)
+        except Exception as exc:  # noqa: BLE001 - CI refresh is advisory and should not break the loop.
+            raw_ci = {"state": "unknown", "warnings": [f"CI status unavailable: {exc}"]}
+        next_state = str((raw_ci or {}).get("state") or "unknown").strip().lower()
+        measured = next_state != "unknown"
+        next_status = next_state if measured else "not_measured"
+        next_source_refs = {
+            **source_refs,
+            "ci_status": {
+                "status": next_status,
+                "state": next_state,
+                "measured": measured,
+                "source": "github",
+                "repo": repo,
+                "ref": ref,
+                "raw": raw_ci,
+                "warnings": (raw_ci or {}).get("warnings") or [],
+                "refreshed_at": refreshed_at,
+            },
+            "ci_finalized_at": refreshed_at if next_state in {"success", "failure"} else None,
+        }
+        gates = dict(next_source_refs.get("gates") or {})
+        gates["ci"] = next_status
+        next_source_refs["gates"] = gates
+        next_terminal_status = "failed" if next_state == "failure" else outcome.get("terminal_status")
+        updated = reliability_store.upsert_outcome({
+            **outcome,
+            "terminal_status": next_terminal_status,
+            "ci_state": next_state if measured else current_state,
+            "source_refs": next_source_refs,
+            "updated_at": refreshed_at,
+        })
+        refreshed.append({
+            "outcome_id": updated.get("outcome_id"),
+            "previous_ci_state": current_state,
+            "ci_state": updated.get("ci_state"),
+            "terminal_status": updated.get("terminal_status"),
+            "success": updated.get("success"),
+            "repo": repo,
+            "ref": ref,
+            "warnings": (raw_ci or {}).get("warnings") or [],
+        })
+    return {
+        "object": "hermes.dev_lab_ci_finalization",
+        "refreshed_at": refreshed_at,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "counts": {
+            "refreshed": len(refreshed),
+            "skipped": len(skipped),
+        },
+    }
+
+
 def _task_branch(candidate: dict[str, Any]) -> str:
     payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
     branch = str(payload.get("branch") or "").strip()

@@ -8,7 +8,14 @@ from pathlib import Path
 
 from gateway.dev_control.dogfood_backlog import dogfood_scope_check
 from gateway.dev_control.lab_process_isolation import audit_process_isolation
-from gateway.dev_control.lab_loop import DevLabLoopStore, _await_implementation_terminal, _touched_paths_from_worktree, loop_health, run_lab_loop_pass
+from gateway.dev_control.lab_loop import (
+    DevLabLoopStore,
+    _await_implementation_terminal,
+    _touched_paths_from_worktree,
+    finalize_pending_lab_ci_outcomes,
+    loop_health,
+    run_lab_loop_pass,
+)
 from gateway.dev_control.reliability import DevReliabilityStore, scorecard
 from gateway.subagent_events import SubagentEventStore
 from gateway.dev_execution import DevExecutionStore
@@ -332,6 +339,147 @@ def test_lab_executor_derives_ci_state_from_draft_head_sha(monkeypatch, tmp_path
     assert outcome["source_refs"]["gates"]["ci"] == "success"
     assert outcome["success"] is True
     assert calls == [{"repo": "Felippen/Oryn", "ref": report["execution"]["head_sha"]}]
+
+
+def test_lab_ci_finalizer_updates_pending_outcome_to_success(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-ci-finalize",
+        "task_id": "task-ci-finalize",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "pending",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "ci_status": {"repo": "Felippen/Oryn", "ref": "abc123", "state": "pending"},
+            "gates": {"verification": "completed", "ci": "pending", "review": "not_measured"},
+        },
+    })
+
+    result = finalize_pending_lab_ci_outcomes(
+        db_path=db_path,
+        fetcher=lambda *, repo, ref: {"state": "success", "repo": repo, "ref": ref, "warnings": []},
+        now=1234.0,
+    )
+
+    outcome = store.get_outcome(plan_id="plan-ci-finalize", task_id="task-ci-finalize")
+    assert result["counts"]["refreshed"] == 1
+    assert outcome["ci_state"] == "success"
+    assert outcome["source_refs"]["gates"]["ci"] == "success"
+    assert outcome["source_refs"]["ci_finalized_at"] == 1234.0
+    assert outcome["success"] is True
+
+
+def test_lab_ci_finalizer_updates_pending_outcome_to_failure(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-ci-fail",
+        "task_id": "task-ci-fail",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "pending",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "draft_artifact": {"head_sha": "def456", "publish": {"repo": "Felippen/Oryn"}},
+            "gates": {"verification": "completed", "ci": "pending", "review": "not_measured"},
+        },
+    })
+
+    finalize_pending_lab_ci_outcomes(
+        db_path=db_path,
+        fetcher=lambda *, repo, ref: {"state": "failure", "repo": repo, "ref": ref, "warnings": []},
+    )
+
+    outcome = store.get_outcome(plan_id="plan-ci-fail", task_id="task-ci-fail")
+    assert outcome["terminal_status"] == "failed"
+    assert outcome["ci_state"] == "failure"
+    assert outcome["source_refs"]["gates"]["ci"] == "failure"
+    assert outcome["success"] is False
+
+
+def test_lab_ci_finalizer_keeps_pending_when_checks_still_running(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-ci-pending",
+        "task_id": "task-ci-pending",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "pending",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "ci_status": {"repo": "Felippen/Oryn", "ref": "ghi789", "state": "pending"},
+            "gates": {"verification": "completed", "ci": "pending", "review": "not_measured"},
+        },
+    })
+
+    finalize_pending_lab_ci_outcomes(
+        db_path=db_path,
+        fetcher=lambda *, repo, ref: {"state": "pending", "repo": repo, "ref": ref, "warnings": []},
+        now=5678.0,
+    )
+
+    outcome = store.get_outcome(plan_id="plan-ci-pending", task_id="task-ci-pending")
+    assert outcome["ci_state"] == "pending"
+    assert outcome["source_refs"]["gates"]["ci"] == "pending"
+    assert outcome["source_refs"]["ci_finalized_at"] is None
+    assert outcome["success"] is False
+
+
+def test_lab_ci_finalizer_leaves_unknown_unmeasured_outcomes_alone(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-ci-unknown",
+        "task_id": "task-ci-unknown",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "unknown",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "ci_status": {"repo": "Felippen/Oryn", "ref": "unknown-ref", "state": "unknown"},
+            "gates": {"verification": "completed", "ci": "not_measured", "review": "not_measured"},
+        },
+    })
+    calls = []
+
+    result = finalize_pending_lab_ci_outcomes(
+        db_path=db_path,
+        fetcher=lambda *, repo, ref: calls.append({"repo": repo, "ref": ref}) or {"state": "success"},
+    )
+
+    outcome = store.get_outcome(plan_id="plan-ci-unknown", task_id="task-ci-unknown")
+    assert result["counts"]["refreshed"] == 0
+    assert result["skipped"][0]["reason"] == "ci_state_not_pending:unknown"
+    assert calls == []
+    assert outcome["ci_state"] == "unknown"
+    assert outcome["source_refs"]["gates"]["ci"] == "not_measured"
 
 
 def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_path):
