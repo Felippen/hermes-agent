@@ -10,7 +10,9 @@ Oryn-owned harness logic behind documented seams.
 ## Summary
 
 - Modified upstream-existing files: 39
-- Oryn-new files: 73, including this ledger and `gateway/dev_control/routes.py`
+- Oryn-new files: 78, including this ledger,
+  `gateway/dev_control/routes.py`, `agent/tool_recovery.py`, and upstream PR
+  preparation notes under `docs/upstream-prs/`
 - Primary core conflict surface before this refactor:
   `gateway/platforms/api_server.py`
 - Dev-control/project-dashboard route seam after this refactor:
@@ -24,12 +26,12 @@ These files exist in `upstream/main` and can collide with future upstream pulls.
 | --- | --- | --- |
 | `agent/agent_init.py` | Modified core | Oryn integration hook. |
 | `agent/agent_runtime_helpers.py` | Modified core | Oryn runtime/helper integration. |
-| `agent/conversation_loop.py` | Modified core | Oryn runtime behavior integration. |
+| `agent/conversation_loop.py` | Modified core | Oryn runtime behavior integration; context usage is reduced to one documented telemetry call, and empty-tool recovery delegates to `agent.tool_recovery.empty_tool_result_recovery_response`. |
 | `agent/credential_pool.py` | Modified core | Credential-pool hardening. |
-| `agent/message_sanitization.py` | Modified core | Message redaction/sanitization hardening. |
+| `agent/message_sanitization.py` | Modified core | Message redaction/sanitization hardening; chat-completions wire cleanup now lives here instead of inline transport logic. |
 | `agent/tool_dispatch_helpers.py` | Modified core | Tool dispatch integration. |
 | `agent/tool_executor.py` | Modified core | Tool execution integration. |
-| `agent/transports/chat_completions.py` | Modified core | Chat-completions transport integration. |
+| `agent/transports/chat_completions.py` | Modified core | Chat-completions transport integration; transport retains a one-line call into `agent.message_sanitization.sanitize_chat_completion_messages_for_wire`. |
 | `cli.py` | Modified core | CLI integration. |
 | `gateway/platforms/api_server.py` | Modified core | Thin Oryn route/capability/read-model seams remain; `/v1/dev/*` and `/v1/oryn/project-dashboard` handlers moved to `gateway/dev_control/routes.py`. |
 | `gateway/run.py` | Modified core | Gateway runtime seam; keep minimal and re-check on upstream pulls. |
@@ -75,9 +77,12 @@ merges unless upstream later creates the same paths.
 | `CLAUDE.md` | Oryn-new |
 | `Makefile` | Oryn-new |
 | `agent/context_usage.py` | Oryn-new |
+| `agent/tool_recovery.py` | Oryn-new |
 | `agent/secret_sources/onepassword.py` | Oryn-new |
 | `config.py` | Oryn-new |
 | `docs/oryn-core-edit-ledger.md` | Oryn-new |
+| `docs/upstream-prs/chat-completions-message-sanitization.md` | Oryn-new upstream PR preparation |
+| `docs/upstream-prs/empty-tool-result-recovery.md` | Oryn-new upstream PR preparation |
 | `docs/superpowers/specs/2026-05-23-scout-evidence-pipeline-design.md` | Oryn-new |
 | `gateway/ao_snapshot_cache.py` | Oryn-new |
 | `gateway/dev_control/__init__.py` | Oryn-new |
@@ -118,6 +123,8 @@ merges unless upstream later creates the same paths.
 | `scripts/smoke_ao_board.py` | Oryn-new |
 | `tests/agent/test_ao_delegate_sequential.py` | Oryn-new test |
 | `tests/agent/test_context_usage.py` | Oryn-new test |
+| `tests/agent/test_message_sanitization.py` | Oryn-new test |
+| `tests/agent/test_tool_recovery.py` | Oryn-new test |
 | `tests/gateway/test_acceptance_criteria.py` | Oryn-new test |
 | `tests/gateway/test_acceptance_verification.py` | Oryn-new test |
 | `tests/gateway/test_ao_snapshot_cache.py` | Oryn-new test |
@@ -144,6 +151,23 @@ merges unless upstream later creates the same paths.
 | `tools/vault_publish_tool.py` | Oryn-new |
 
 ## Remaining Core Seams
+
+`agent/conversation_loop.py` keeps these named seams:
+
+- Import context-usage telemetry:
+  `from agent.context_usage import emit_context_usage`
+- Emit context usage from one documented post-usage accounting point. The
+  previous four inline calls were reduced because existing hooks do not expose
+  the live agent/callback state needed for streaming context usage.
+- Import empty-tool recovery:
+  `from agent.tool_recovery import empty_tool_result_recovery_response`
+- Delegate empty final responses after tool calls through:
+  `empty_tool_result_recovery_response(messages)`
+
+`agent/transports/chat_completions.py` keeps this named seam:
+
+- Delegate provider-facing message cleanup through:
+  `sanitize_chat_completion_messages_for_wire(messages)`
 
 `gateway/platforms/api_server.py` keeps these named seams:
 
@@ -174,18 +198,41 @@ every upstream pull.
 6. Abort the dry run: `git merge --abort`
 7. Run dev-control route tests:
    `scripts/run_tests.sh tests/gateway/test_api_server_runs.py`
-8. Run lint: `.venv/bin/ruff check .`
+8. Run focused engine seam tests when engine files changed:
+   `scripts/run_tests.sh tests/agent/test_tool_recovery.py tests/agent/test_message_sanitization.py tests/agent/transports/test_chat_completions.py`
+9. Run lint: `.venv/bin/ruff check .`
+
+## Upstream PR Preparation
+
+Two Oryn-agnostic hardening changes are prepared for Felipe to submit upstream:
+
+- `codex/upstream-empty-tool-recovery`: extracts and proposes empty-tool-result
+  recovery. Description:
+  `docs/upstream-prs/empty-tool-result-recovery.md`
+- `codex/upstream-chat-message-sanitization`: consolidates chat-completions wire
+  message sanitization in `agent/message_sanitization.py`. Description:
+  `docs/upstream-prs/chat-completions-message-sanitization.md`
 
 ## 2026-05-29 Dry-Run Result
 
 Command: `git merge --no-commit --no-ff upstream/main`
 
-Result: conflicts remained in four upstream-existing files:
+Result after route extraction and engine-seam reduction: conflicts remained in
+four upstream-existing files:
 
 - `agent/conversation_loop.py`
 - `agent/transports/chat_completions.py`
 - `gateway/platforms/api_server.py`
 - `plugins/kanban/dashboard/plugin_api.py`
+
+The `agent/conversation_loop.py` residual conflict is now at the empty-tool
+recovery call site rather than an inline recovery helper body. The context-usage
+footprint is one documented telemetry call.
+
+The `agent/transports/chat_completions.py` residual conflict is now at imports;
+the transport body delegates sanitization through
+`sanitize_chat_completion_messages_for_wire(messages)` instead of carrying inline
+normalization logic.
 
 The `gateway/platforms/api_server.py` conflict was outside the extracted
 `/v1/dev/*` handler/registration regions. It was in startup wiring around the

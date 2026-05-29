@@ -37,7 +37,6 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
-    _sanitize_messages_control_chars,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
     _sanitize_structure_non_ascii,
@@ -65,6 +64,7 @@ from agent.nous_rate_guard import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.tool_recovery import empty_tool_result_recovery_response
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn, PARTIAL_STREAM_STUB_ID
@@ -74,60 +74,6 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
-
-
-def _tool_result_empty_recovery_response(messages: List[Dict[str, Any]]) -> Optional[str]:
-    """Build a useful final response when a model goes empty after tool calls."""
-    recent_tools: list[Dict[str, str]] = []
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if role == "tool":
-            name = str(message.get("name") or "tool")
-            content = message.get("content")
-            if not isinstance(content, str):
-                content = json.dumps(content, ensure_ascii=False)
-            recent_tools.append({
-                "name": name,
-                "content": content.strip(),
-            })
-            if len(recent_tools) >= 5:
-                break
-            continue
-        if recent_tools and role == "assistant" and message.get("tool_calls"):
-            break
-        if recent_tools and role not in {"tool"}:
-            break
-
-    if not recent_tools:
-        return None
-
-    recent_tools.reverse()
-    lines = [
-        "The model returned an empty message after running tools, so Hermes is returning the latest tool results instead of `(empty)`.",
-        "",
-        "Latest tool results:",
-    ]
-    for tool in recent_tools:
-        content = tool["content"] or "(no tool output)"
-        parsed = None
-        try:
-            parsed = json.loads(content)
-        except Exception:
-            parsed = None
-        if isinstance(parsed, dict):
-            compact = json.dumps(parsed, ensure_ascii=False, indent=2)
-            preview = compact[:4000] + "\n..." if len(compact) > 4000 else compact
-        else:
-            preview = content[:4000] + "\n..." if len(content) > 4000 else content
-        lines.extend([
-            f"- `{tool['name']}`:",
-            "```text",
-            preview,
-            "```",
-        ])
-    return "\n".join(lines).strip()
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -618,8 +564,6 @@ def run_conversation(
                 )
                 if _preflight_tokens < agent.context_compressor.threshold_tokens:
                     break  # Under threshold
-            emit_context_usage(agent)
-
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
     # return a dict with a ``context`` key (or a plain string) whose
@@ -1013,7 +957,6 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
-        _sanitize_messages_control_chars(api_messages)
 
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
@@ -1776,6 +1719,9 @@ def run_conversation(
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+                    # Oryn context-usage telemetry seam: keep one engine call
+                    # until Hermes has a turn-complete event carrying the live
+                    # agent/callback state needed by context usage streaming.
                     emit_context_usage(agent)
 
                     # Persist token counts to session DB for /insights.
@@ -2572,7 +2518,6 @@ def run_conversation(
                                 f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
                                 f"(was {old_ctx:,}), retrying..."
                             )
-                            emit_context_usage(agent)
                             time.sleep(2)
                             restart_with_compressed_messages = True
                             break
@@ -3721,7 +3666,6 @@ def run_conversation(
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
                     conversation_history = None
-                    emit_context_usage(agent)
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
@@ -3955,7 +3899,7 @@ def run_conversation(
                     # Exhausted retries and fallback chain (or no
                     # fallback configured).  Fall through to the
                     # "(empty)" terminal.
-                    tool_recovery_response = _tool_result_empty_recovery_response(messages)
+                    tool_recovery_response = empty_tool_result_recovery_response(messages)
                     if tool_recovery_response:
                         _turn_exit_reason = "tool_result_empty_recovery"
                         agent._drop_trailing_empty_response_scaffolding(messages)
