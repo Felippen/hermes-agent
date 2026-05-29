@@ -1457,7 +1457,7 @@ def _measure_code_review_r4(
             candidate=candidate,
             project_id=_lab_project_id(candidate),
             prompt=prompt,
-            branch=str(draft_artifact.get("branch") or implementation.get("branch") or ""),
+            branch=None,
         )
         terminal = _await_review_terminal(
             bridge=bridge,

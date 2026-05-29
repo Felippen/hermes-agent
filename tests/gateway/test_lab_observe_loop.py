@@ -437,6 +437,7 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     review_spawn = bridge.spawned[-1]
     assert len(bridge.spawned) == 2
     assert review_spawn["kwargs"]["issue_id"] is None
+    assert review_spawn["kwargs"]["branch"] is None
     assert "Profile: review; permissions: review_only." in review_spawn["kwargs"]["prompt"]
     assert report["gate_verdicts"]["review"] == "approved"
     assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
