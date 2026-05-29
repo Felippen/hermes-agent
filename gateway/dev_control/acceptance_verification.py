@@ -39,7 +39,7 @@ UNRUNNABLE_OUTPUT_RES = [
         r"(^|\n).*\bnot executable\b",
     )
 ]
-TRANSCRIPT_EXIT_RE = re.compile(r"\b(?:exit(?:ed)?(?:\s+with)?\s+(?:code|status)|returncode)\s*[:=]?\s*(?P<code>-?\d+)\b", re.IGNORECASE)
+TRANSCRIPT_EXIT_RE = re.compile(r"\b(?:exit(?:ed)?(?:\s+with)?\s+(?:code|status)|returncode|exited)\s*[:=]?\s*(?P<code>-?\d+)\b", re.IGNORECASE)
 UNFENCED_RESULTS_OBJECT_RE = re.compile(r"\{[^{}]*\"object\"\s*:\s*\"hermes\.dev_verification_results\".*\}", re.IGNORECASE | re.DOTALL)
 DEFAULT_PROJECT_WORKDIRS = {
     "OrynWorkspace": "apps/oryn-workspace",
@@ -307,16 +307,19 @@ def parse_transcript_verification_results(text: Optional[str], executable_comman
     results: list[Dict[str, Any]] = []
     for command in executable_commands or []:
         command_text = str(command.get("command") or "").strip()
+        criterion_id = str(command.get("criterion_id") or "").strip()
         if not command_text:
             continue
         window = _transcript_window_for_command(value, command_text)
+        if not window and criterion_id:
+            window = _transcript_window_for_command(value, criterion_id)
         if not window:
             continue
         exit_code = _exit_code_from_transcript(window)
         if exit_code is None:
             continue
         results.append({
-            "criterion_id": str(command.get("criterion_id") or "").strip(),
+            "criterion_id": criterion_id,
             "command_run": command_text,
             "cwd": str(command.get("relative_cwd") or command.get("cwd") or "").strip(),
             "exit_code": exit_code,
@@ -955,7 +958,7 @@ def _output_excerpt_from_transcript(text: str, command: str) -> str:
         if command not in line
         and not line.startswith("{")
         and not line.startswith("}")
-        and not line.startswith('"')
+        and (not line.startswith('"') or SUMMARY_RE.search(line))
         and "DEV_VERIFICATION_RESULTS" not in line
     ]
     if not useful:

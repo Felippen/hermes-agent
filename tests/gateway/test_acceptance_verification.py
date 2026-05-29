@@ -7,6 +7,7 @@ from gateway.dev_control.acceptance_verification import (
     allowlisted_command,
     classify_acceptance_criteria,
     launch_verification_run,
+    parse_transcript_verification_results,
     parse_verification_results,
     reconcile_results,
     refresh_verification_run,
@@ -307,6 +308,38 @@ def test_verification_refresh_recovers_transcript_before_runtime_terminal(tmp_pa
     assert refreshed["verdict"] == "failed"
     assert refreshed["counts"]["failed"] == 1
     assert refreshed["results"][0]["exit_code"] == 1
+
+
+def test_verification_recovers_wrapped_command_from_criterion_exit_line():
+    transcript = """
+Verification completed. crit-1 exited 0; summary line confirms 22 tests
+passed.
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/
+test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0%
+complete) in 3.7s (28 workers) ===",
+      "notes": ""
+    }
+  ]
+}
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "22 tests" in parsed["results"][0]["output_excerpt"]
 
 
 def test_verification_recovers_missing_fence_and_classifies_unrunnable_as_error(tmp_path):
