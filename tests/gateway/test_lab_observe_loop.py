@@ -385,6 +385,63 @@ def test_lab_executor_records_approved_code_review_and_contract_score(monkeypatc
     assert outcome["success"] is True
 
 
+def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    commands = []
+
+    def fake_run_command(args, *, timeout=30.0):
+        commands.append(args)
+        if args[:2] == ["gh", "pr"]:
+            return {"returncode": 0, "stdout": "https://github.com/Felippen/Oryn/pull/456\n", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+    transcript = """
+```json DEV_WORKER_EVIDENCE
+{"structured_summary":"Implemented docs task.","findings":[],"verification_status":"passed","verification_evidence":["fixture"],"files_changed":["docs/review-live.md"],"commands_run":[]}
+```
+```json DEV_CODE_REVIEW_RESULT
+{"object":"hermes.dev_code_review_result","verdict":"approved","findings":[],"summary":"Review approved.","evidence_refs":["docs/review-live.md"]}
+```
+"""
+    bridge = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/review-live.md"], transcript=transcript)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure live R4 review worker launch.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/review-live.md"],
+        "source": "docs",
+        "payload": {
+            "branch": "lab/dogfood/review-live",
+            "ci_status": {"state": "success", "repo": "Felippen/Oryn"},
+            "draft_pr_repo": "Felippen/Oryn",
+            "draft_pr_remote": "lab-origin",
+            "draft_pr_base": "main",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=bridge,
+    )
+
+    review_spawn = bridge.spawned[-1]
+    assert len(bridge.spawned) == 2
+    assert review_spawn["kwargs"]["issue_id"] is None
+    assert "Profile: review; permissions: review_only." in review_spawn["kwargs"]["prompt"]
+    assert report["gate_verdicts"]["review"] == "approved"
+    assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
+
+
 def test_lab_executor_marks_changes_requested_review_as_failed_outcome(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     DevLabLoopStore(db_path).upsert_candidate({

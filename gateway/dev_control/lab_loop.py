@@ -1450,6 +1450,7 @@ def _measure_code_review_r4(
         "- If you cannot inspect the PR, return verdict commented with a finding explaining why.",
     ])
     timeout_seconds = min(max(float(context.get("max_seconds") or 600.0) / 2.0, 60.0), 600.0)
+    session = None
     try:
         session = _spawn_lab_review_worker(
             bridge=bridge,
@@ -1480,8 +1481,14 @@ def _measure_code_review_r4(
             "head_sha": pr_state.get("head_sha"),
             "prompt": prompt,
             "output_contract_score": _code_review_contract_score(parsed),
+            "workspace_path": _session_value(terminal.get("session"), "workspace_path") or _session_value(session, "workspace_path"),
+            "cleanup": _cleanup_lab_worktree(
+                _session_value(terminal.get("session"), "workspace_path") or _session_value(session, "workspace_path")
+            ),
         }
     except Exception as exc:  # noqa: BLE001 - review is measured as unavailable, never a pass constant.
+        if session is not None:
+            _cleanup_lab_worktree(_session_value(session, "workspace_path"))
         return _unmeasured_code_review(f"Code review unavailable: {exc}")
 
 
@@ -1527,7 +1534,7 @@ def _spawn_lab_review_worker(
     kwargs = {
         "project_id": project_id,
         "prompt": prompt,
-        "issue_id": candidate.get("candidate_id"),
+        "issue_id": None,
         "branch": branch or None,
         "agent": None,
         "model": None,
