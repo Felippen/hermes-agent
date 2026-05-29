@@ -54,6 +54,7 @@ from agent.model_metadata import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.tool_recovery import empty_tool_result_recovery_response
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -4115,6 +4116,19 @@ def run_conversation(
                     # Exhausted retries and fallback chain (or no
                     # fallback configured).  Fall through to the
                     # "(empty)" terminal.
+                    tool_recovery_response = empty_tool_result_recovery_response(messages)
+                    if tool_recovery_response:
+                        _turn_exit_reason = "tool_result_empty_recovery"
+                        agent._drop_trailing_empty_response_scaffolding(messages)
+                        assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        assistant_msg["content"] = tool_recovery_response
+                        messages.append(assistant_msg)
+                        agent._emit_status(
+                            "⚠️ Model stayed empty after tool calls — returning latest tool results"
+                        )
+                        final_response = tool_recovery_response
+                        break
+
                     # Surface the buffered retry/fallback trace so the
                     # user can see what was attempted before "(empty)".
                     agent._flush_status_buffer()
