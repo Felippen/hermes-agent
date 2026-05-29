@@ -495,7 +495,10 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     assert review_spawn["kwargs"]["issue_id"] is None
     assert review_spawn["kwargs"]["branch"] is None
     assert "Profile: review; permissions: review_only." in review_spawn["kwargs"]["prompt"]
-    assert "Do not invoke slash commands or interactive review modes" in review_spawn["kwargs"]["prompt"]
+    assert "Do not invoke slash commands, /review, CodeRabbit, coderabbit" in review_spawn["kwargs"]["prompt"]
+    assert "gh pr diff 456 --repo Felippen/Oryn --patch" in review_spawn["kwargs"]["prompt"]
+    assert "run only the exact gh pr view/diff commands listed above" in review_spawn["kwargs"]["prompt"]
+    assert "Do not start background terminals or long-running tools" in review_spawn["kwargs"]["prompt"]
     assert report["gate_verdicts"]["review"] == "approved"
     assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
 

@@ -645,17 +645,25 @@ def _extract_json_object_containing(text: str, marker: str) -> Dict[str, Any]:
 
 def build_code_review_prompt(*, plan: Dict[str, Any], pr_state: Dict[str, Any]) -> str:
     title = str(plan.get("title") or plan.get("plan_id") or "Dev plan").strip()
+    repo = str(pr_state.get("repo") or "").strip()
+    pr_number = str(pr_state.get("pr_number") or "").strip()
     criteria = []
     for task in plan.get("tasks") or []:
         for criterion in task.get("acceptance_criteria") or []:
             criteria.append(str(criterion))
     return "\n".join([
-        "You are the independent Dev code-review worker.",
+        "You are the independent Dev code-review worker. Perform a direct PR diff review only.",
         "Profile: review; permissions: review_only.",
-        "Review the PR diff against the approved plan intent and acceptance criteria.",
-        "Do not edit files, create commits, approve a merge, or change branch state.",
-        f"Repository: {pr_state.get('repo')}",
-        f"PR: #{pr_state.get('pr_number')} ({pr_state.get('pr_url') or 'no URL'})",
+        "Review the PR diff against the approved plan intent and acceptance criteria using only direct GitHub diff evidence.",
+        "Do not edit files, create commits, approve a merge, comment on GitHub, or change branch state.",
+        "Do not run slash commands such as /review. Do not run CodeRabbit, coderabbit, review agents, tests, builds, or linters.",
+        "Allowed evidence commands, if you need shell evidence, are exactly:",
+        f"- gh pr view {pr_number} --repo {repo} --json number,title,headRefOid,headRefName,baseRefName,isDraft,state,files,commits",
+        f"- gh pr diff {pr_number} --repo {repo} --name-only",
+        f"- gh pr diff {pr_number} --repo {repo} --patch",
+        "After inspecting the diff, answer directly with the required JSON block. Do not start background tools.",
+        f"Repository: {repo}",
+        f"PR: #{pr_number} ({pr_state.get('pr_url') or 'no URL'})",
         f"Head SHA: {pr_state.get('head_sha')}",
         f"Plan: {title}",
         "Acceptance criteria:",
