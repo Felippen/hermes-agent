@@ -8,6 +8,7 @@ preserving the existing adapter method shape and auth/middleware behavior.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -71,6 +72,13 @@ from gateway.dev_control.harness_recommendations import (
     generate_harness_recommendations,
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
+)
+from gateway.dev_control.github_pr_automation import (
+    DevGitHubPRAutomationStore,
+    automation_summary,
+    process_github_webhook,
+    run_manual_pr_automation_action,
+    verify_github_signature,
 )
 from gateway.dev_control.incidents import (
     DevIncidentStore,
@@ -229,6 +237,9 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_merge_approval_request": {"method": "POST", "path": "/v1/dev/merge-approvals"},
         "dev_merge_approval_approve": {"method": "POST", "path": "/v1/dev/merge-approvals/{approval_id}/approve"},
         "dev_merge_execute": {"method": "POST", "path": "/v1/dev/merge"},
+        "dev_github_webhooks": {"method": "POST", "path": "/v1/dev/github-webhooks"},
+        "dev_pr_automation": {"method": "GET", "path": "/v1/dev/pr-automation"},
+        "dev_pr_automation_actions": {"method": "POST", "path": "/v1/dev/pr-automation/actions"},
         "dev_backlog_proposals": {"method": "GET", "path": "/v1/dev/backlog-proposals"},
         "dev_backlog_proposal_action": {"method": "POST", "path": "/v1/dev/backlog-proposals/{proposal_id}/{action}"},
         "dev_signal_health": {"method": "GET", "path": "/v1/dev/signal-health"},
@@ -287,6 +298,9 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/merge-approvals", adapter._handle_dev_merge_approvals)
     app.router.add_post("/v1/dev/merge-approvals/{approval_id}/approve", adapter._handle_dev_merge_approval_approve)
     app.router.add_post("/v1/dev/merge", adapter._handle_dev_merge_execute)
+    app.router.add_post("/v1/dev/github-webhooks", adapter._handle_dev_github_webhooks)
+    app.router.add_get("/v1/dev/pr-automation", adapter._handle_dev_pr_automation)
+    app.router.add_post("/v1/dev/pr-automation/actions", adapter._handle_dev_pr_automation_actions)
     app.router.add_get("/v1/dev/product-events", adapter._handle_dev_product_events)
     app.router.add_post("/v1/dev/product-events", adapter._handle_dev_product_events)
     app.router.add_post("/v1/dev/incidents/detect", adapter._handle_dev_incident_detect)
@@ -357,6 +371,7 @@ class DevControlRouteMixin:
         signal_store = self._ensure_dev_signal_store()
         incident_store = self._ensure_dev_incident_store()
         scm_store = self._ensure_dev_scm_store()
+        pr_automation_store = self._ensure_dev_github_pr_automation_store()
         reliability_store = self._ensure_dev_reliability_store()
         lab_loop_store = self._ensure_dev_lab_loop_store()
         event_store = self._ensure_subagent_event_store()
@@ -456,6 +471,11 @@ class DevControlRouteMixin:
                 "dev_backlog_proposals": (list_backlog_proposals(signal_store=signal_store, limit=10).get("data", []) if signal_store else []),
                 "dev_incidents": (incident_store.list_incidents(limit=5) if incident_store else []),
                 "dev_merge_readiness": (scm_store.latest_readiness(limit=5) if scm_store else []),
+                "dev_pr_automation": (
+                    automation_summary(store=pr_automation_store, scm_store=scm_store, limit=5).get("data", [])
+                    if pr_automation_store
+                    else []
+                ),
                 "dev_reliability": (reliability_scorecard(reliability_store.list_outcomes(limit=500)) if reliability_store else None),
                 "dev_lab_loop_health": (loop_health(db_path=lab_loop_store.db_path) if lab_loop_store else None),
             }
@@ -619,6 +639,20 @@ class DevControlRouteMixin:
             logger.warning("Dev SCM lifecycle store unavailable: %s", exc)
             return None
         return self._dev_scm_store
+
+    def _ensure_dev_github_pr_automation_store(self) -> Optional[DevGitHubPRAutomationStore]:
+        """Create the GitHub PR automation store on the same state.db as execution plans."""
+        if getattr(self, "_dev_github_pr_automation_store", None) is not None:
+            return self._dev_github_pr_automation_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_github_pr_automation_store = DevGitHubPRAutomationStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev GitHub PR automation store unavailable: %s", exc)
+            return None
+        return self._dev_github_pr_automation_store
 
     def _ensure_dev_reliability_store(self) -> Optional[DevReliabilityStore]:
         """Create the Dev reliability store on the same state.db as execution plans."""
@@ -2106,6 +2140,90 @@ class DevControlRouteMixin:
             )
         except KeyError as exc:
             return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_github_webhooks(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/github-webhooks — verified GitHub webhook entrypoint."""
+        automation_store = self._ensure_dev_github_pr_automation_store()
+        scm_store = self._ensure_dev_scm_store()
+        if automation_store is None or scm_store is None:
+            return web.json_response(_openai_error("Dev GitHub PR automation store unavailable"), status=503)
+        secret = os.getenv("GITHUB_WEBHOOK_SECRET") or os.getenv("HERMES_GITHUB_WEBHOOK_SECRET") or ""
+        if not secret.strip():
+            return web.json_response(_openai_error("GITHUB_WEBHOOK_SECRET is not configured"), status=503)
+        body = await request.read()
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_github_signature(body=body, signature_header=signature, secret=secret):
+            return web.json_response(_openai_error("Invalid GitHub webhook signature"), status=401)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return web.json_response(_openai_error("Invalid GitHub webhook JSON"), status=400)
+        if not isinstance(payload, dict):
+            return web.json_response(_openai_error("GitHub webhook payload must be an object"), status=400)
+        delivery_id = str(request.headers.get("X-GitHub-Delivery") or "").strip()
+        event_type = str(request.headers.get("X-GitHub-Event") or "").strip()
+        if not delivery_id or not event_type:
+            return web.json_response(_openai_error("GitHub delivery and event headers are required"), status=400)
+        try:
+            result = process_github_webhook(
+                store=automation_store,
+                scm_store=scm_store,
+                delivery_id=delivery_id,
+                event_type=event_type,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] GitHub webhook processing failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_pr_automation(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/pr-automation — list recent PR automation decisions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        automation_store = self._ensure_dev_github_pr_automation_store()
+        scm_store = self._ensure_dev_scm_store()
+        if automation_store is None:
+            return web.json_response(_openai_error("Dev GitHub PR automation store unavailable"), status=503)
+        pr_number = request.rel_url.query.get("pr_number")
+        try:
+            result = automation_summary(
+                store=automation_store,
+                scm_store=scm_store,
+                repo=request.rel_url.query.get("repo") or None,
+                pr_number=int(pr_number) if pr_number else None,
+                limit=self._bounded_query_limit(request, default=25),
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_pr_automation_actions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/pr-automation/actions — manually trigger one PR automation action."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        automation_store = self._ensure_dev_github_pr_automation_store()
+        scm_store = self._ensure_dev_scm_store()
+        if automation_store is None or scm_store is None:
+            return web.json_response(_openai_error("Dev GitHub PR automation store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = run_manual_pr_automation_action(
+                action=str(body.get("action") or "").strip(),
+                repo=str(body.get("repo") or "").strip(),
+                pr_number=int(body.get("pr_number") or 0),
+                store=automation_store,
+                scm_store=scm_store,
+            )
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         return web.json_response(result)
