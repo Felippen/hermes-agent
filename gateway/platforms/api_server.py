@@ -3976,6 +3976,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
+                if function_name in _legacy_started_tools:
+                    return
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
                 progress_payload = {
@@ -4014,6 +4016,22 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             def _on_context_usage(payload: Dict[str, Any]) -> None:
                 if payload:
                     _stream_q.put(("__context_usage__", payload))
+
+            def _on_approval_request(approval_data: Dict[str, Any]) -> None:
+                event = dict(approval_data or {})
+                event.update({
+                    "run_id": completion_id,
+                    "session_id": session_id,
+                    "gateway_session_key": gateway_session_key,
+                    "timestamp": time.time(),
+                    "choices": ["once", "session", "always", "deny"],
+                })
+                self._set_run_status(
+                    completion_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
+                )
+                _stream_q.put(("__approval_request__", event))
 
             def _on_approval_request(approval_data: Dict[str, Any]) -> None:
                 event = dict(approval_data or {})
