@@ -105,6 +105,7 @@ DIFF_SCOPE_IGNORED_PATHS = {
 }
 
 OBSERVE_PROFILE_ALLOWED_TARGET_PREFIXES = ("docs/", "tests/")
+DEFAULT_LAB_VERIFICATION_COMMAND = "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"
 
 
 class DevLabLoopStore:
@@ -1302,11 +1303,12 @@ def _candidate_acceptance_criteria(candidate: dict[str, Any]) -> list[Any]:
     criteria = payload.get("acceptance_criteria")
     if isinstance(criteria, list) and criteria:
         return criteria
+    command = str(os.getenv("HERMES_DEV_LAB_DEFAULT_VERIFICATION_COMMAND") or DEFAULT_LAB_VERIFICATION_COMMAND).strip()
     return [{
-        "statement": "The lab dogfood task has measurable verification evidence.",
-        "verification_method": "manual",
-        "verification_detail": "Review the pass report and linked task evidence.",
-        "machine_checkable": False,
+        "statement": "The lab dogfood task has executable verification evidence.",
+        "verification_method": "test",
+        "verification_detail": command,
+        "machine_checkable": True,
     }]
 
 

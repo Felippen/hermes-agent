@@ -9,8 +9,10 @@ from pathlib import Path
 from gateway.dev_control.dogfood_backlog import dogfood_scope_check
 from gateway.dev_control.lab_process_isolation import audit_process_isolation
 from gateway.dev_control.lab_loop import (
+    DEFAULT_LAB_VERIFICATION_COMMAND,
     DevLabLoopStore,
     _await_implementation_terminal,
+    _candidate_acceptance_criteria,
     _await_review_terminal,
     _recover_lab_verification_from_transcript,
     _touched_paths_from_worktree,
@@ -1690,6 +1692,28 @@ def test_lab_executor_preserves_structured_acceptance_criteria(monkeypatch, tmp_
     assert task_criteria == [criterion]
     assert isinstance(task_criteria[0], dict)
     assert report["execution"]["pre_verification_cleanup"]["cleaned"] is True
+
+
+def test_lab_default_acceptance_criterion_is_executable(monkeypatch):
+    monkeypatch.delenv("HERMES_DEV_LAB_DEFAULT_VERIFICATION_COMMAND", raising=False)
+
+    criteria = _candidate_acceptance_criteria({"payload": {}})
+
+    assert criteria == [{
+        "statement": "The lab dogfood task has executable verification evidence.",
+        "verification_method": "test",
+        "verification_detail": DEFAULT_LAB_VERIFICATION_COMMAND,
+        "machine_checkable": True,
+    }]
+
+
+def test_lab_default_acceptance_criterion_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("HERMES_DEV_LAB_DEFAULT_VERIFICATION_COMMAND", "make test")
+
+    criteria = _candidate_acceptance_criteria({"payload": {}})
+
+    assert criteria[0]["verification_detail"] == "make test"
+    assert criteria[0]["machine_checkable"] is True
 
 
 def test_lab_verification_recovers_from_direct_transcript(monkeypatch, tmp_path):
