@@ -101,6 +101,8 @@ DIFF_SCOPE_IGNORED_PATHS = {
     "venv",
 }
 
+OBSERVE_PROFILE_ALLOWED_TARGET_PREFIXES = ("docs/", "tests/")
+
 
 class DevLabLoopStore:
     """Durable dogfood backlog, pass reports, and breaker state."""
@@ -460,6 +462,145 @@ def run_lab_loop(
         "passes": passes,
         "pass_count": len(passes),
         "state": DevLabLoopStore(db_path).get_state(),
+    }
+
+
+def run_lab_observe_profile(
+    *,
+    db_path: Path,
+    stable_db_path: Optional[Path] = None,
+    max_passes: Optional[int] = None,
+    sources: Optional[list[str]] = None,
+    ci_fetcher: Optional[Callable[..., dict[str, Any]]] = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run the bounded observe-mode profile used for manual lab dogfooding."""
+
+    selected_max_passes = max(1, min(int(max_passes or 2), 2))
+    ci_before = finalize_pending_lab_ci_outcomes(db_path=db_path, fetcher=ci_fetcher)
+    preflight = observe_profile_preflight(db_path=db_path)
+    before = loop_health(db_path=db_path)
+    if not preflight.get("ok"):
+        return {
+            "ok": False,
+            "object": "hermes.dev_lab_observe_profile_run",
+            "profile": "observe",
+            "status": "blocked",
+            "advisory_only": True,
+            "preflight": preflight,
+            "ci_finalization": {"before": ci_before, "after": None},
+            "health_before": before,
+            "run": None,
+            "summary": _observe_profile_summary(
+                run=None,
+                preflight=preflight,
+                before=before,
+                after=before,
+                ci_before=ci_before,
+                ci_after=None,
+            ),
+        }
+
+    run = run_lab_loop(
+        db_path=db_path,
+        stable_db_path=stable_db_path,
+        max_passes=selected_max_passes,
+        sources=sources,
+        **kwargs,
+    )
+    ci_after = finalize_pending_lab_ci_outcomes(db_path=db_path, fetcher=ci_fetcher)
+    after = loop_health(db_path=db_path)
+    return {
+        "ok": bool(run.get("ok")),
+        "object": "hermes.dev_lab_observe_profile_run",
+        "profile": "observe",
+        "status": "completed" if run.get("ok") else "needs_attention",
+        "advisory_only": True,
+        "preflight": preflight,
+        "ci_finalization": {"before": ci_before, "after": ci_after},
+        "health_before": before,
+        "health_after": after,
+        "run": run,
+        "summary": _observe_profile_summary(
+            run=run,
+            preflight=preflight,
+            before=before,
+            after=after,
+            ci_before=ci_before,
+            ci_after=ci_after,
+        ),
+    }
+
+
+def observe_profile_preflight(
+    *,
+    db_path: Path,
+    active_session_lister: Optional[Callable[[], list[str]]] = None,
+    active_worktree_lister: Optional[Callable[[], list[str]]] = None,
+) -> dict[str, Any]:
+    """Refuse scheduled-style observe runs when the lab is not idle and scoped."""
+
+    store = DevLabLoopStore(db_path)
+    blockers: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    state = store.get_state()
+    if state.get("status") == "halted":
+        blockers.append({
+            "code": "loop_halted",
+            "reason": state.get("halted_reason") or "Lab loop state is halted.",
+        })
+
+    recent_pass = (store.list_passes(limit=1) or [None])[0]
+    recent_isolation = (recent_pass or {}).get("isolation") if isinstance(recent_pass, dict) else None
+    if recent_isolation and _has_forbidden_root_write(recent_isolation):
+        blockers.append({
+            "code": "recent_isolation_breach",
+            "pass_id": (recent_pass or {}).get("pass_id"),
+            "offending_paths": [
+                item for item in (recent_isolation.get("offending_paths") or [])
+                if item.get("in_forbidden_root")
+            ],
+        })
+
+    sessions = (active_session_lister or _active_lab_tmux_sessions)()
+    if sessions:
+        blockers.append({"code": "active_lab_sessions", "sessions": sessions})
+
+    worktrees = (active_worktree_lister or _active_lab_worktrees)()
+    if worktrees:
+        blockers.append({"code": "active_lab_worktrees", "worktrees": worktrees})
+
+    candidates = [
+        candidate for candidate in store.list_candidates(approved=True, limit=200)
+        if candidate.get("status") in {"approved", "candidate"}
+    ]
+    out_of_profile = [candidate for candidate in candidates if not _observe_profile_candidate_allowed(candidate)]
+    if out_of_profile:
+        blockers.append({
+            "code": "candidate_outside_observe_profile",
+            "candidate_ids": [candidate.get("candidate_id") for candidate in out_of_profile],
+            "allowed_target_prefixes": list(OBSERVE_PROFILE_ALLOWED_TARGET_PREFIXES),
+        })
+    if not candidates:
+        warnings.append("No approved docs/tests dogfood candidate is queued; the run will be idle.")
+
+    return {
+        "ok": not blockers,
+        "object": "hermes.dev_lab_observe_profile_preflight",
+        "advisory_only": True,
+        "state": state,
+        "blockers": blockers,
+        "warnings": warnings,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "source": candidate.get("source"),
+                "target_paths": candidate.get("target_paths") or [],
+                "guardrail_touching": bool(candidate.get("guardrail_touching")),
+            }
+            for candidate in candidates[:20]
+        ],
     }
 
 
@@ -2281,6 +2422,137 @@ def _base_report(started: float, status: str, *, candidate: Optional[dict[str, A
         "completed_at": now,
         "observe_mode": True,
         "draft_pr_only": True,
+        "merge_executed": False,
+        "publish_executed": False,
+    }
+
+
+def _observe_profile_candidate_allowed(candidate: dict[str, Any]) -> bool:
+    if is_guardrail_touching(candidate):
+        return False
+    paths = [normalize_target_path(path) for path in candidate.get("target_paths") or []]
+    paths = [path for path in paths if path]
+    if not paths:
+        return False
+    return all(path.startswith(OBSERVE_PROFILE_ALLOWED_TARGET_PREFIXES) for path in paths)
+
+
+def _active_lab_tmux_sessions() -> list[str]:
+    if not shutil.which("tmux"):
+        return []
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip().startswith("lab-hermes-agent-")
+    ]
+
+
+def _active_lab_worktrees() -> list[str]:
+    try:
+        paths = lab_paths_from_env()
+        repo = Path(paths["repos_dir"]).expanduser() / "hermes-agent"
+    except Exception:
+        return []
+    if not (repo / ".git").exists():
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    repo_resolved = repo.resolve(strict=False)
+    active: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line.removeprefix("worktree ").strip()).expanduser()
+        if path.resolve(strict=False) != repo_resolved:
+            active.append(str(path))
+    return active
+
+
+def _observe_profile_summary(
+    *,
+    run: Optional[dict[str, Any]],
+    preflight: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ci_before: Optional[dict[str, Any]],
+    ci_after: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    passes = list((run or {}).get("passes") or [])
+    forbidden_writes: list[dict[str, Any]] = []
+    pass_summaries: list[dict[str, Any]] = []
+    for item in passes:
+        isolation = item.get("isolation") if isinstance(item, dict) else {}
+        forbidden = [
+            path for path in (isolation or {}).get("offending_paths") or []
+            if path.get("in_forbidden_root")
+        ]
+        forbidden_writes.extend(forbidden)
+        execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+        pass_summaries.append({
+            "pass_id": item.get("pass_id"),
+            "status": item.get("status"),
+            "candidate_id": item.get("candidate_id"),
+            "outcome_id": item.get("outcome_id"),
+            "branch": item.get("branch") or execution.get("branch"),
+            "implement_session_id": item.get("implement_session_id") or execution.get("implement_session_id"),
+            "diff_paths": (item.get("diff_scope") or {}).get("accepted_paths")
+            or execution.get("touched_paths")
+            or [],
+            "diff_scope": (item.get("diff_scope") or {}).get("status"),
+            "verification": (item.get("gate_verdicts") or {}).get("verification"),
+            "ci": (item.get("gate_verdicts") or {}).get("ci"),
+            "review": (item.get("gate_verdicts") or {}).get("review"),
+            "draft_pr_only": bool(item.get("draft_pr_only")),
+            "draft_artifact": item.get("draft_artifact"),
+            "quarantined": bool(item.get("quarantined")),
+            "empty_diff": bool(item.get("empty_diff")),
+            "breaker_reason": item.get("breaker_reason"),
+            "isolation_ok": bool((isolation or {}).get("ok")),
+            "forbidden_root_writes": forbidden,
+        })
+    return {
+        "ok": bool((run or {}).get("ok")) and preflight.get("ok") and not forbidden_writes,
+        "profile": "observe",
+        "pass_count": len(passes),
+        "passes": pass_summaries,
+        "preflight_blockers": preflight.get("blockers") or [],
+        "forbidden_root_writes": forbidden_writes,
+        "ci_finalization": {
+            "before": (ci_before or {}).get("counts") or {},
+            "after": (ci_after or {}).get("counts") or {},
+        },
+        "scorecard": {
+            "before": (before.get("scorecard_summary") or {}),
+            "after": (after.get("scorecard_summary") or {}),
+        },
+        "real_outcomes": {
+            "before": before.get("real_outcome_count", 0),
+            "after": after.get("real_outcome_count", 0),
+        },
+        "state": after.get("state") or before.get("state"),
+        "advisory_only": True,
         "merge_executed": False,
         "publish_executed": False,
     }

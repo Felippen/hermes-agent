@@ -21,6 +21,7 @@ from gateway.dev_control.lab_loop import (  # noqa: E402
     enqueue_candidates,
     finalize_pending_lab_ci_outcomes,
     loop_health,
+    run_lab_observe_profile,
     run_lab_loop,
 )
 
@@ -29,7 +30,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run Hermes Lab observe-loop dogfood passes.")
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--stable-db-path", default=str(Path("~/.hermes/profiles/dev/state.db").expanduser()))
-    parser.add_argument("--max-passes", type=int, default=1)
+    parser.add_argument("--max-passes", type=int, default=None)
     parser.add_argument("--sources", default=os.getenv("HERMES_DEV_SIGNAL_DIGEST_SOURCES", "deterministic,product,reliability"))
     parser.add_argument("--enqueue-todos", action="store_true", help="Discover TODO/FIXME dogfood tasks before running.")
     parser.add_argument("--skip-approved-proposals", action="store_true", help="Do not append approved proposals to the dogfood backlog before running.")
@@ -38,6 +39,7 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="Clear a halted loop before running.")
     parser.add_argument("--health", action="store_true", help="Print loop health and exit.")
     parser.add_argument("--finalize-ci", action="store_true", help="Refresh pending CI states for draft-PR lab outcomes and exit.")
+    parser.add_argument("--observe-profile", action="store_true", help="Run the bounded manual observe-mode profile: docs/tests only, at most two passes, no proposal enqueue.")
     parser.add_argument(
         "--ao-config-path",
         default=os.getenv("ORYN_LAB_AO_CONFIG_PATH"),
@@ -72,7 +74,7 @@ def main() -> int:
         roots = args.todo_root or [Path(paths["repos_dir"]) / "hermes-agent", Path(paths["repos_dir"]) / "Oryn"]
         candidates = discover_todo_candidates(repo_roots=roots, limit=20)
         enqueue_candidates(store, candidates, auto_approve=args.auto_approve)
-    if not args.skip_approved_proposals:
+    if not args.observe_profile and not args.skip_approved_proposals:
         enqueue_approved_proposals(db_path=db_path, store=store)
     sources = [source.strip() for source in str(args.sources or "").split(",") if source.strip()]
     bridge = _lab_ao_bridge(args.ao_config_path, paths)
@@ -80,10 +82,11 @@ def main() -> int:
         *args.isolation_pid,
         *[pid.strip() for pid in str(args.extra_isolation_pids or "").split(",") if pid.strip()],
     ]
-    result = run_lab_loop(
+    runner = run_lab_observe_profile if args.observe_profile else run_lab_loop
+    result = runner(
         db_path=db_path,
         stable_db_path=Path(args.stable_db_path).expanduser(),
-        max_passes=args.max_passes,
+        max_passes=args.max_passes if args.max_passes is not None else (2 if args.observe_profile else 1),
         bridge=bridge,
         sources=sources,
         max_consecutive_failures=args.max_consecutive_failures,

@@ -15,6 +15,8 @@ from gateway.dev_control.lab_loop import (
     _touched_paths_from_worktree,
     finalize_pending_lab_ci_outcomes,
     loop_health,
+    observe_profile_preflight,
+    run_lab_observe_profile,
     run_lab_loop_pass,
 )
 from gateway.dev_control.reliability import DevReliabilityStore, scorecard
@@ -716,6 +718,155 @@ def test_lab_ci_finalizer_leaves_unknown_unmeasured_outcomes_alone(monkeypatch, 
     assert calls == []
     assert outcome["ci_state"] == "unknown"
     assert outcome["source_refs"]["gates"]["ci"] == "not_measured"
+
+
+def test_observe_profile_preflight_blocks_halted_state(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevLabLoopStore(db_path)
+    store.halt("fixture halt")
+
+    result = observe_profile_preflight(
+        db_path=db_path,
+        active_session_lister=lambda: [],
+        active_worktree_lister=lambda: [],
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"][0]["code"] == "loop_halted"
+
+
+def test_observe_profile_preflight_blocks_recent_forbidden_isolation(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevLabLoopStore(db_path)
+    store.record_pass({
+        "status": "completed",
+        "isolation": {
+            "ok": False,
+            "offending_paths": [{"path": str(tmp_path / "stable.db"), "in_forbidden_root": True}],
+        },
+    })
+
+    result = observe_profile_preflight(
+        db_path=db_path,
+        active_session_lister=lambda: [],
+        active_worktree_lister=lambda: [],
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"][0]["code"] == "recent_isolation_breach"
+
+
+def test_observe_profile_preflight_requires_docs_or_tests_candidates(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Modify implementation code.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["gateway/dev_control/lab_loop.py"],
+        "source": "todo",
+    }, approved=True)
+
+    result = observe_profile_preflight(
+        db_path=db_path,
+        active_session_lister=lambda: [],
+        active_worktree_lister=lambda: [],
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"][0]["code"] == "candidate_outside_observe_profile"
+
+
+def test_observe_profile_preflight_requires_idle_lab_processes(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+
+    result = observe_profile_preflight(
+        db_path=db_path,
+        active_session_lister=lambda: ["lab-hermes-agent-busy"],
+        active_worktree_lister=lambda: [str(tmp_path / "lab" / "worktrees" / "busy")],
+    )
+
+    assert result["ok"] is False
+    assert {item["code"] for item in result["blockers"]} == {"active_lab_sessions", "active_lab_worktrees"}
+
+
+def test_observe_profile_runs_bounded_docs_pass_and_reports_summary(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    monkeypatch.setattr("gateway.dev_control.lab_loop._active_lab_tmux_sessions", lambda: [])
+    monkeypatch.setattr("gateway.dev_control.lab_loop._active_lab_worktrees", lambda: [])
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Add an observe-profile docs note.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/observe-profile.md"],
+        "source": "docs",
+        "payload": {
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    result = run_lab_observe_profile(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        max_passes=5,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/observe-profile.md"]),
+    )
+
+    assert result["ok"] is True
+    assert result["profile"] == "observe"
+    assert result["run"]["pass_count"] == 2
+    assert result["run"]["passes"][0]["status"] == "completed"
+    assert result["run"]["passes"][1]["status"] == "idle"
+    assert result["summary"]["passes"][0]["verification"] == "verified"
+    assert result["summary"]["passes"][0]["diff_scope"] == "in_scope"
+    assert result["summary"]["forbidden_root_writes"] == []
+    assert result["summary"]["merge_executed"] is False
+
+
+def test_observe_profile_finalizes_pending_ci_before_running(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    monkeypatch.setattr("gateway.dev_control.lab_loop._active_lab_tmux_sessions", lambda: [])
+    monkeypatch.setattr("gateway.dev_control.lab_loop._active_lab_worktrees", lambda: [])
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-observe-ci",
+        "task_id": "task-observe-ci",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "pending",
+        "code_review_verdict": "approved",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "ci_status": {"repo": "Felippen/Oryn", "ref": "abc123", "state": "pending"},
+            "gates": {"verification": "completed", "ci": "pending", "review": "approved"},
+        },
+    })
+
+    result = run_lab_observe_profile(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        max_passes=1,
+        sources=["reliability"],
+        executor=lambda _candidate, _context: {"status": "completed"},
+        ci_fetcher=lambda *, repo, ref: {"state": "success", "repo": repo, "ref": ref, "warnings": []},
+    )
+
+    outcome = store.get_outcome(plan_id="plan-observe-ci", task_id="task-observe-ci")
+    assert result["ok"] is True
+    assert result["ci_finalization"]["before"]["counts"]["refreshed"] == 1
+    assert result["summary"]["ci_finalization"]["before"]["refreshed"] == 1
+    assert outcome["ci_state"] == "success"
 
 
 def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_path):
