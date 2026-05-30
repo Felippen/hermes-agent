@@ -495,11 +495,12 @@ def refresh_verification_run(
     latest_event = event_store.latest_event_for_ao_session(session_id)
     session = _verification_session(run, bridge=bridge)
     transcript = _verification_transcript(run, session=session, bridge=bridge)
+    final_message = _verification_final_message(run, session=session)
     status = str((latest_event or {}).get("status") or "").lower()
     event_type = str((latest_event or {}).get("event") or "").lower()
     event_terminal = event_type == "subagent.complete" or status in TERMINAL_SESSION_STATUSES
     event_text = _event_text(latest_event or {})
-    combined_text = "\n".join(part for part in (event_text, transcript) if str(part or "").strip())
+    combined_text = "\n".join(part for part in (event_text, transcript, final_message) if str(part or "").strip())
     warnings = list(run.get("warnings") or [])
     parsed, parse_warnings = _parse_worker_verification_output(combined_text, run.get("executable_commands") or [])
     warnings.extend(parse_warnings)
@@ -797,6 +798,7 @@ def _verification_prompt(*, plan: Dict[str, Any], task: Dict[str, Any], commands
         "Final output is mandatory: return a short summary followed by this exact fenced JSON block as your final response.",
         "The fenced block must be valid JSON. Do not paste raw multi-line command output inside a JSON string.",
         "Keep output_excerpt to one short JSON string with the real summary line or command-output tail; escape any newline as \\n.",
+        "Do not include terminal UI/progress text such as Working, esc to interrupt, or prompts in output_excerpt.",
         "Set exit_code to the real process exit code you observed. Do not leave the template exit_code or output_excerpt unchanged.",
         "```json DEV_VERIFICATION_RESULTS",
         json.dumps({
@@ -1184,6 +1186,123 @@ def _verification_transcript(run: Dict[str, Any], *, session: Any = None, bridge
             return str(router.capture_output(session, lines=120) or "")
     except Exception:
         return ""
+
+
+def _verification_final_message(run: Dict[str, Any], *, session: Any = None) -> str:
+    """Return the worker's final assistant message when Codex session JSONL is available.
+
+    Terminal captures can contain live UI redraw/progress text. The Codex JSONL
+    task_complete payload carries the final answer as the model produced it, so it
+    is the more authoritative source for fenced verification JSON.
+    """
+
+    if session is None:
+        return ""
+    workspace_path = str(getattr(session, "workspace_path", None) or "").strip()
+    if not workspace_path:
+        return ""
+    session_record = _codex_session_final_message_for_workspace(
+        workspace_path,
+        started_at=_first_float(run.get("created_at")),
+        completed_at=_first_float(run.get("completed_at")) or time.time(),
+    )
+    return str((session_record or {}).get("last_agent_message") or "")
+
+
+def _codex_session_final_message_for_workspace(
+    workspace_path: str,
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        workspace = str(Path(workspace_path).expanduser().resolve())
+    except OSError:
+        workspace = str(Path(workspace_path).expanduser())
+    sessions_root = _codex_sessions_root()
+    if not sessions_root.exists():
+        return None
+    lower_bound = float(started_at or 0) - 3600
+    upper_bound = float(completed_at or time.time()) + 3600
+    matches: list[Dict[str, Any]] = []
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if started_at is not None and (mtime < lower_bound or mtime > upper_bound):
+            continue
+        parsed = _read_codex_final_message_file(path)
+        if not parsed:
+            continue
+        cwd = str(parsed.get("cwd") or "").strip()
+        if not cwd:
+            continue
+        try:
+            resolved_cwd = str(Path(cwd).expanduser().resolve())
+        except OSError:
+            resolved_cwd = cwd
+        if resolved_cwd == workspace and parsed.get("last_agent_message"):
+            matches.append(parsed)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return matches[0]
+
+
+def _codex_sessions_root() -> Path:
+    configured = os.getenv("HERMES_DEV_VERIFICATION_CODEX_HOME") or os.getenv("HERMES_DEV_LAB_CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser() / "sessions"
+    lab_home = os.getenv("ORYN_LAB_HOME")
+    if lab_home:
+        return Path(lab_home).expanduser() / ".codex" / "sessions"
+    return Path.home() / ".codex" / "sessions"
+
+
+def _read_codex_final_message_file(path: Path) -> Optional[Dict[str, Any]]:
+    meta: dict[str, Any] = {}
+    last_agent_message = ""
+    completed_at: Optional[float] = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                if entry.get("type") == "session_meta":
+                    meta = payload
+                elif payload.get("type") == "task_complete":
+                    last_agent_message = str(payload.get("last_agent_message") or "")
+                    completed_at = _first_float(payload.get("completed_at"))
+    except OSError:
+        return None
+    if not meta:
+        return None
+    try:
+        updated_at = path.stat().st_mtime
+    except OSError:
+        updated_at = completed_at or 0
+    return {
+        "source": "codex_session_jsonl",
+        "session_id": meta.get("id"),
+        "session_path": str(path),
+        "cwd": meta.get("cwd"),
+        "last_agent_message": last_agent_message,
+        "completed_at": completed_at,
+        "updated_at": updated_at,
+    }
+
+
+def _first_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _task_workspace_path(task: Dict[str, Any]) -> str:

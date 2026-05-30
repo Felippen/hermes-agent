@@ -433,6 +433,120 @@ def test_verification_unfenced_parser_prefers_latest_results_object():
     assert "include the real" not in parsed["results"][0]["output_excerpt"]
 
 
+def test_refresh_prefers_codex_final_message_over_terminal_ui_transcript(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    verification_store = DevVerificationStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    bridge = FakeBridge()
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    session = AOSession(
+        id="verify-codex-session",
+        status="completed",
+        workspace_path=str(workspace),
+        branch="verify/codex-final",
+        agent="codex",
+        model="gpt-5.5",
+    )
+    bridge.sessions[session.id] = session
+    executable = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+        "cwd": ".",
+        "relative_cwd": ".",
+    }]
+    seed_results = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "verification_detail": executable[0]["command"],
+        "machine_checkable": True,
+        "status": "pending",
+        "passed": None,
+        "warnings": [],
+    }]
+    run = verification_store.create_run(
+        plan_id="plan",
+        task_id="task",
+        target_type="task",
+        status="launched",
+        results=seed_results,
+        executable_commands=executable,
+        verified_against={"workspace_path": str(workspace)},
+        verification_session_id=session.id,
+        verification_runtime="ao",
+        worker_launch_profile_id="workspace.test",
+    )
+    bridge.outputs[session.id] = """
+```json DEV_VERIFICATION_RESULTS
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "2.87s  tests/gateway/test_api_server_runs.py
+• Working (8s • esc to interrupt)",
+      "notes": ""
+    }
+  ]
+}
+```
+"""
+    codex_home = tmp_path / ".codex"
+    sessions_dir = codex_home / "sessions" / "2026" / "05" / "30"
+    sessions_dir.mkdir(parents=True)
+    final_message = (
+        "Verification command completed with exit code 0.\n\n"
+        "```json DEV_VERIFICATION_RESULTS\n"
+        + json.dumps({
+            "object": "hermes.dev_verification_results",
+            "results": [{
+                "criterion_id": "crit-1",
+                "command_run": executable[0]["command"],
+                "cwd": ".",
+                "exit_code": 0,
+                "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 2.9s (28 workers) ===",
+                "notes": "",
+            }],
+        }, indent=2)
+        + "\n```"
+    )
+    session_file = sessions_dir / "rollout-2026-05-30T10-10-30-test.jsonl"
+    session_file.write_text(
+        "\n".join([
+            json.dumps({"type": "session_meta", "payload": {"id": "codex-jsonl-session", "cwd": str(workspace)}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": final_message, "completed_at": time.time()}}),
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_DEV_VERIFICATION_CODEX_HOME", str(codex_home))
+    event_store.append_event({
+        "event": "subagent.complete",
+        "subagent_id": f"ao:{session.id}",
+        "ao_session_id": session.id,
+        "status": "completed",
+        "summary": "Verification session completed.",
+    })
+
+    refreshed = refresh_verification_run(
+        verification_store=verification_store,
+        verification_run_id=run["verification_run_id"],
+        event_store=event_store,
+        bridge=bridge,
+    )
+
+    assert refreshed["status"] == "completed"
+    assert refreshed["verdict"] == "verified"
+    assert refreshed["warnings"] == []
+    assert refreshed["results"][0]["output_excerpt"].startswith("=== Summary: 1 files")
+    assert "Working" not in refreshed["results"][0]["output_excerpt"]
+
+
 def test_verification_recovers_missing_fence_and_classifies_unrunnable_as_error(tmp_path):
     db_path = tmp_path / "state.db"
     execution_store = DevExecutionStore(db_path)
