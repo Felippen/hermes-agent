@@ -2386,6 +2386,13 @@ def test_lab_adversarial_fixture_proves_post_diff_quarantine(monkeypatch, tmp_pa
         "source": "docs",
         "payload": {
             "adversarial_diff_paths": ["agent/conversation_loop.py"],
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "fixture would pass if quarantine did not suppress it",
+            }],
         },
     }, approved=True)
     router = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/lab.md"])
@@ -2404,6 +2411,9 @@ def test_lab_adversarial_fixture_proves_post_diff_quarantine(monkeypatch, tmp_pa
     assert report["diff_scope"]["status"] == "out_of_scope"
     assert report["diff_scope"]["rejected_paths"] == ["agent/conversation_loop.py"]
     assert report["draft_artifact"] is None
+    assert report["execution"]["verification"]["status"] == "quarantined"
+    assert report["execution"]["verification"]["verdict"] == "unknown"
+    assert report["execution"]["verification"]["measured"] is False
     fixture = report["execution"]["adversarial_fixture"]
     assert fixture["applied"] is True
     assert fixture["paths"] == ["agent/conversation_loop.py"]

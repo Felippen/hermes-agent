@@ -1411,36 +1411,6 @@ def _measure_verification_r1(
     draft_artifact: Optional[dict[str, Any]],
     timeout_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
-    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
-    fixture_results = payload.get("verification_results")
-    if isinstance(fixture_results, list):
-        run = DevVerificationStore(db_path).create_run(
-            plan_id=plan["plan_id"],
-            task_id=task["task_id"],
-            target_type="task",
-            status="completed",
-            results=fixture_results,
-            executable_commands=[],
-            verified_against={
-                "source": "lab_loop_fixture",
-                "draft_pr_only": True,
-                "verification_relative_cwd": ".",
-                "workspace_path": implementation.get("workspace_path"),
-                "branch": implementation.get("branch"),
-                "head_sha": implementation.get("head_sha"),
-                "diff_scope": diff_scope,
-                "draft_artifact": draft_artifact,
-            },
-            warnings=[],
-        )
-        return {
-            "status": run.get("status"),
-            "verdict": run.get("verdict"),
-            "verification_run_id": run.get("verification_run_id"),
-            "counts": run.get("counts") or {},
-            "score": run.get("acceptance_verification_score"),
-            "measured": True,
-        }
     if implementation.get("status") != "completed":
         return {
             "status": "not_measured",
@@ -1473,6 +1443,36 @@ def _measure_verification_r1(
                 "Verification was not launched because the implementation produced no draft branch artifact.",
                 f"acceptance_criteria_count={len(acceptance_criteria)}",
             ],
+        }
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    fixture_results = payload.get("verification_results")
+    if isinstance(fixture_results, list):
+        run = DevVerificationStore(db_path).create_run(
+            plan_id=plan["plan_id"],
+            task_id=task["task_id"],
+            target_type="task",
+            status="completed",
+            results=fixture_results,
+            executable_commands=[],
+            verified_against={
+                "source": "lab_loop_fixture",
+                "draft_pr_only": True,
+                "verification_relative_cwd": ".",
+                "workspace_path": implementation.get("workspace_path"),
+                "branch": implementation.get("branch"),
+                "head_sha": implementation.get("head_sha"),
+                "diff_scope": diff_scope,
+                "draft_artifact": draft_artifact,
+            },
+            warnings=[],
+        )
+        return {
+            "status": run.get("status"),
+            "verdict": run.get("verdict"),
+            "verification_run_id": run.get("verification_run_id"),
+            "counts": run.get("counts") or {},
+            "score": run.get("acceptance_verification_score"),
+            "measured": True,
         }
     verification_store = DevVerificationStore(db_path)
     try:
