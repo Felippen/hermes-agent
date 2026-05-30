@@ -470,6 +470,59 @@ def test_lab_executor_derives_ci_state_from_draft_head_sha(monkeypatch, tmp_path
     assert calls == [{"repo": "Felippen/Oryn", "ref": report["execution"]["head_sha"]}]
 
 
+def test_lab_executor_uses_published_head_sha_after_author_rewrite(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_fetch_ci_status(*, repo, ref):
+        calls.append({"repo": repo, "ref": ref})
+        return {"state": "success", "repo": repo, "ref": ref, "warnings": []}
+
+    def fake_publish(*, candidate, workspace_path, branch):
+        return {
+            "ready": True,
+            "status": "created",
+            "repo": "Felippen/Oryn",
+            "branch": branch,
+            "head_sha": "published-head-after-author-rewrite",
+            "pr_url": "https://github.com/Felippen/Oryn/pull/123",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop.fetch_ci_status", fake_fetch_ci_status)
+    monkeypatch.setattr("gateway.dev_control.lab_loop._publish_lab_draft_pr", fake_publish)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure CI against the published draft PR head.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/ci-head.md"],
+        "source": "docs",
+        "payload": {
+            "ci_repo": "Felippen/Oryn",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["docs/ci-head.md"]),
+    )
+
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert report["execution"]["head_sha"] == "published-head-after-author-rewrite"
+    assert outcome["source_refs"]["head_sha"] == "published-head-after-author-rewrite"
+    assert outcome["source_refs"]["implementation_head_sha"] != "published-head-after-author-rewrite"
+    assert calls == [{"repo": "Felippen/Oryn", "ref": "published-head-after-author-rewrite"}]
+
+
 def test_lab_executor_records_approved_code_review_and_contract_score(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     DevLabLoopStore(db_path).upsert_candidate({

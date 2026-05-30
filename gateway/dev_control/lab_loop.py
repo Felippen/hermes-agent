@@ -693,6 +693,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
     if draft_artifact:
         pre_verification_cleanup = _cleanup_lab_worktree(workspace_path)
         implementation["pre_verification_cleanup"] = pre_verification_cleanup
+    effective_head_sha = (draft_artifact or {}).get("head_sha") or implementation.get("head_sha")
 
     verification = _measure_verification_r1(
         candidate=candidate,
@@ -712,7 +713,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
     ci_status = _measure_ci_r3(
         candidate=candidate,
         draft_artifact=draft_artifact,
-        head_sha=implementation.get("head_sha"),
+        head_sha=effective_head_sha,
         fetcher=context.get("ci_status_fetcher"),
     )
     ci_state = str(ci_status.get("state") or verification.get("ci_state") or "unknown")
@@ -770,7 +771,8 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
                 "draft_pr_only": True,
                 "draft_pr_ready": draft_pr_ready,
                 "branch": implementation.get("branch"),
-                "head_sha": implementation.get("head_sha"),
+                "head_sha": effective_head_sha,
+                "implementation_head_sha": implementation.get("head_sha"),
                 "implement_session_id": implementation.get("session_id"),
                 "implement_status": implementation.get("status"),
                 "workspace_path": workspace_path,
@@ -814,7 +816,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         "implementation_reason": implementation.get("reason"),
         "workspace_path": workspace_path,
         "branch": implementation.get("branch"),
-        "head_sha": implementation.get("head_sha"),
+        "head_sha": effective_head_sha,
         "touched_paths": touched_paths,
         "diff_scope": diff_scope,
         "empty_diff": empty_diff,
@@ -1670,7 +1672,7 @@ def _measure_ci_r3(
             "warnings": fixture.get("warnings") or [],
         }
     repo = str(payload.get("ci_repo") or os.getenv("HERMES_DEV_LAB_CI_REPO") or "").strip()
-    ref = str(payload.get("ci_ref") or head_sha or (draft_artifact or {}).get("head_sha") or "").strip()
+    ref = str(payload.get("ci_ref") or (draft_artifact or {}).get("head_sha") or head_sha or "").strip()
     if not draft_artifact:
         return {
             "status": "not_measured",
