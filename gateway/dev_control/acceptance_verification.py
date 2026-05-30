@@ -1265,17 +1265,33 @@ def _verification_final_message(run: Dict[str, Any], *, session: Any = None) -> 
     is the more authoritative source for fenced verification JSON.
     """
 
-    if session is None:
-        return ""
-    workspace_path = str(getattr(session, "workspace_path", None) or "").strip()
-    if not workspace_path:
-        return ""
-    session_record = _codex_session_final_message_for_workspace(
-        workspace_path,
-        started_at=_first_float(run.get("created_at")),
-        completed_at=_first_float(run.get("completed_at")) or time.time(),
-    )
+    started_at = _first_float(run.get("created_at"))
+    completed_at = _first_float(run.get("completed_at")) or time.time()
+    session_record: Optional[Dict[str, Any]] = None
+    workspace_path = str(_session_field(session, "workspace_path") or "").strip()
+    if workspace_path:
+        session_record = _codex_session_final_message_for_workspace(
+            workspace_path,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+    if not session_record:
+        session_id = str(run.get("verification_session_id") or _session_field(session, "id") or "").strip()
+        if session_id:
+            session_record = _codex_session_final_message_for_session_id(
+                session_id,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
     return str((session_record or {}).get("last_agent_message") or "")
+
+
+def _session_field(session: Any, key: str) -> Any:
+    if session is None:
+        return None
+    if isinstance(session, dict):
+        return session.get(key)
+    return getattr(session, key, None)
 
 
 def _codex_session_final_message_for_workspace(
@@ -1312,6 +1328,43 @@ def _codex_session_final_message_for_workspace(
         except OSError:
             resolved_cwd = cwd
         if resolved_cwd == workspace and parsed.get("last_agent_message"):
+            matches.append(parsed)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return matches[0]
+
+
+def _codex_session_final_message_for_session_id(
+    session_id: str,
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    sessions_root = _codex_sessions_root()
+    if not sessions_root.exists():
+        return None
+    lower_bound = float(started_at or 0) - 3600
+    upper_bound = float(completed_at or time.time()) + 3600
+    matches: list[Dict[str, Any]] = []
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if started_at is not None and (mtime < lower_bound or mtime > upper_bound):
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if session_id not in raw:
+            continue
+        parsed = _read_codex_final_message_file(path)
+        if parsed and parsed.get("last_agent_message"):
             matches.append(parsed)
     if not matches:
         return None
