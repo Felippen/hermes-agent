@@ -696,8 +696,8 @@ def compose_merge_readiness(
     blocked_by: list[Dict[str, str]] = []
     gates: Dict[str, Dict[str, Any]] = {}
 
-    draft_ok = str(draft_status or "").lower() == "approved_for_launch"
-    gates["draft"] = {"state": draft_status or "unknown", "ok": draft_ok}
+    draft_ok = True if not plan_id else str(draft_status or "").lower() == "approved_for_launch"
+    gates["draft"] = {"state": "not_applicable" if not plan_id else (draft_status or "unknown"), "ok": draft_ok}
     if not draft_ok:
         blocked_by.append({"gate": "draft", "reason": "Execution plan draft is not approved for launch."})
 
