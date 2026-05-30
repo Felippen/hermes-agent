@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Guardrail: Hermes fork PRs must not default to NousResearch upstream.
+set -euo pipefail
+
+echo "error: do not run 'gh pr create' from hermes-agent/." >&2
+echo "" >&2
+echo "Hermes changes ship through the Oryn meta-repo:" >&2
+echo "  1. commit + push to origin (Felippen/hermes-agent)" >&2
+echo "  2. cd to Oryn repo root and commit the hermes-agent submodule pointer" >&2
+echo "  3. scripts/open-oryn-pr.sh --title '...' --body '...'" >&2
+echo "" >&2
+echo "Rare fork-only PR (explicit Felipe request):" >&2
+echo "  gh pr create --repo Felippen/hermes-agent --base oryn/main-integration ..." >&2
+exit 1
