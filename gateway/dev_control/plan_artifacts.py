@@ -20,6 +20,7 @@ from gateway.dev_control.acceptance_criteria import (
     validate_and_downgrade_criteria,
 )
 from gateway.dev_control.clarifications import DevClarificationStore, get_clarification
+from gateway.dev_control.project_scope import resolve_project_id
 from gateway.dev_control.worker_output_contract import append_worker_output_contract
 from gateway.dev_execution import DevExecutionStore
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
@@ -577,6 +578,10 @@ def cancel_execution_plan_draft(
     return {**updated, "plan": execution_store.get_plan(plan_id)}
 
 
+def _artifact_project_id(artifact: Dict[str, Any], *extra: Any) -> str:
+    return resolve_project_id(artifact.get("project_id"), *extra)
+
+
 def _artifact_payload(
     *,
     clarification: Dict[str, Any],
@@ -738,7 +743,7 @@ def _generate_execution_tasks_with_llm(
                 "artifact": {
                     "plan_artifact_id": artifact.get("plan_artifact_id"),
                     "title": artifact.get("title"),
-                    "project_id": artifact.get("project_id") or "OrynWorkspace",
+                    "project_id": _artifact_project_id(artifact),
                     "markdown": artifact.get("markdown"),
                     "payload": artifact.get("payload") or {},
                 },
@@ -806,7 +811,7 @@ def _validate_execution_tasks(payload: Dict[str, Any], artifact: Dict[str, Any])
             "goal": goal[:180],
             "prompt": _task_prompt_with_contract(prompt, artifact),
             "profile_id": profile_id,
-            "project_id": str(item.get("project_id") or artifact.get("project_id") or "OrynWorkspace").strip(),
+            "project_id": resolve_project_id(item.get("project_id"), artifact.get("project_id")),
             "permissions": permissions,
             "dependencies": _string_list(item.get("dependencies")),
             "acceptance_criteria": _string_list(item.get("acceptance_criteria")) or _artifact_acceptance(artifact),
@@ -847,7 +852,7 @@ def _fallback_execution_tasks(artifact: Dict[str, Any]) -> list[Dict[str, Any]]:
             "goal": f"Implement {artifact.get('title') or 'approved planning artifact'}"[:180],
             "prompt": _task_prompt_with_contract(_artifact_context_prompt(artifact, "Implement the approved planning artifact."), artifact),
             "profile_id": "workspace.implement",
-            "project_id": artifact.get("project_id") or "OrynWorkspace",
+            "project_id": _artifact_project_id(artifact),
             "permissions": "edit",
             "dependencies": [],
             "acceptance_criteria": _artifact_acceptance(artifact),
@@ -875,7 +880,7 @@ def _task_from_slice(
         "goal": f"{prefix}: {title}"[:180],
         "prompt": _task_prompt_with_contract(prompt, artifact),
         "profile_id": profile_id,
-        "project_id": artifact.get("project_id") or "OrynWorkspace",
+        "project_id": _artifact_project_id(artifact),
         "permissions": permissions,
         "dependencies": [],
         "acceptance_criteria": _artifact_acceptance(artifact),

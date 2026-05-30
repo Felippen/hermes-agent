@@ -6,19 +6,36 @@ from tools.ao_bridge import AOBridge, AOSession
 
 
 def test_bridge_env_prepends_codex_shim(tmp_path, monkeypatch):
+    home = tmp_path / "home"
     shim_dir = tmp_path / "shims"
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     bridge = AOBridge(
+        home=str(home),
         codex_shim_dir=shim_dir,
         codex_real_bin="/opt/test/bin/codex",
     )
 
     env = bridge._bridge_env()
 
-    assert env["PATH"].split(os.pathsep)[0] == str(shim_dir)
+    assert env["PATH"].split(os.pathsep)[:2] == [str(home / "bin"), str(shim_dir)]
     assert env["CODEX_REAL_BIN"] == "/opt/test/bin/codex"
-    assert env["HOME"] == "/Users/felipelamartine"
+    assert env["HOME"] == str(home)
+    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(home / ".codex-verification")
+    assert env["HERMES_AO_CODEX_AUTH_HOME"].endswith("/.codex")
+
+
+def test_bridge_env_allows_verification_codex_home_override(tmp_path, monkeypatch):
+    override = tmp_path / "codex-verify"
+    monkeypatch.setenv("HERMES_AO_VERIFICATION_CODEX_HOME", str(override))
+    auth_home = tmp_path / "codex-auth"
+    monkeypatch.setenv("HERMES_AO_CODEX_AUTH_HOME", str(auth_home))
+
+    bridge = AOBridge(codex_real_bin="/opt/test/bin/codex")
+
+    env = bridge._bridge_env()
+    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(override)
+    assert env["HERMES_AO_CODEX_AUTH_HOME"] == str(auth_home)
 
 
 def test_bridge_env_does_not_use_shim_as_real_codex(tmp_path, monkeypatch):
@@ -351,3 +368,100 @@ def test_codex_shim_translates_ao_approval_mode(tmp_path):
         "--",
         "hello",
     ]
+
+
+def test_codex_shim_isolates_dev_verification_codex_home(tmp_path):
+    real_codex = tmp_path / "real-codex"
+    real_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'CODEX_HOME=%s\\n' \"${CODEX_HOME:-}\"\n"
+        "printf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    verification_home = tmp_path / "codex-verification"
+    auth_home = tmp_path / "codex-auth"
+    auth_home.mkdir()
+    (auth_home / "auth.json").write_text('{"token":"test"}\n', encoding="utf-8")
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+
+    shim = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "tools",
+        "ao_shims",
+        "codex",
+    )
+    proc = subprocess.run(
+        [
+            shim,
+            "--model",
+            "gpt-5.5",
+            "--",
+            "Run fixed verification commands and return DEV_VERIFICATION_RESULTS.",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=workspace,
+        env={
+            "CODEX_REAL_BIN": str(real_codex),
+            "HERMES_AO_VERIFICATION_CODEX_HOME": str(verification_home),
+            "HERMES_AO_CODEX_AUTH_HOME": str(auth_home),
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ.get("PATH", ""),
+        },
+        check=True,
+    )
+
+    assert proc.stdout.splitlines()[0] == f"CODEX_HOME={verification_home}"
+    config = verification_home / "config.toml"
+    assert config.exists()
+    assert f'[projects."{workspace}"]' in config.read_text(encoding="utf-8")
+    assert (verification_home / "auth.json").read_text(encoding="utf-8") == '{"token":"test"}\n'
+
+
+def test_codex_shim_copies_auth_for_lab_worker_home(tmp_path):
+    real_codex = tmp_path / "real-codex"
+    real_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'CODEX_HOME=%s\\n' \"${CODEX_HOME:-}\"\n"
+        "printf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    real_codex.chmod(0o755)
+    lab_home = tmp_path / ".oryn-lab"
+    workspace = lab_home / ".worktrees" / "HermesAgentLab" / "lab-hermes-agent-1"
+    workspace.mkdir(parents=True)
+    auth_home = tmp_path / "codex-auth"
+    auth_home.mkdir()
+    (auth_home / "auth.json").write_text('{"token":"lab-test"}\n', encoding="utf-8")
+
+    shim = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "tools",
+        "ao_shims",
+        "codex",
+    )
+    subprocess.run(
+        [
+            shim,
+            "--model",
+            "gpt-5.5",
+            "--",
+            "Append a docs note.",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=workspace,
+        env={
+            "CODEX_REAL_BIN": str(real_codex),
+            "HERMES_AO_CODEX_AUTH_HOME": str(auth_home),
+            "HOME": str(lab_home),
+            "PATH": os.environ.get("PATH", ""),
+        },
+        check=True,
+    )
+
+    codex_home = lab_home / ".codex"
+    assert (codex_home / "auth.json").read_text(encoding="utf-8") == '{"token":"lab-test"}\n'
+    assert f'[projects."{workspace}"]' in (codex_home / "config.toml").read_text(encoding="utf-8")

@@ -39,7 +39,18 @@ UNRUNNABLE_OUTPUT_RES = [
         r"(^|\n).*\bnot executable\b",
     )
 ]
-TRANSCRIPT_EXIT_RE = re.compile(r"\b(?:exit(?:ed)?(?:\s+with)?\s+(?:code|status)|returncode)\s*[:=]?\s*(?P<code>-?\d+)\b", re.IGNORECASE)
+TRANSCRIPT_EXIT_RE = re.compile(
+    r"(?:"
+    r'"?exit_code"?'
+    r"|exit[_ ]code"
+    r"|\b"
+    r"exit(?:ed)?(?:\s+\w+){0,4}?\s+with\s+(?:code|status)"
+    r"|exit(?:ed)?(?:\s+with)?\s+(?:code|status)"
+    r"|returncode"
+    r"|exited"
+    r")\s*[:=]?\s*(?P<code>-?\d+)\b",
+    re.IGNORECASE,
+)
 UNFENCED_RESULTS_OBJECT_RE = re.compile(r"\{[^{}]*\"object\"\s*:\s*\"hermes\.dev_verification_results\".*\}", re.IGNORECASE | re.DOTALL)
 DEFAULT_PROJECT_WORKDIRS = {
     "OrynWorkspace": "apps/oryn-workspace",
@@ -307,16 +318,14 @@ def parse_transcript_verification_results(text: Optional[str], executable_comman
     results: list[Dict[str, Any]] = []
     for command in executable_commands or []:
         command_text = str(command.get("command") or "").strip()
+        criterion_id = str(command.get("criterion_id") or "").strip()
         if not command_text:
             continue
-        window = _transcript_window_for_command(value, command_text)
-        if not window:
-            continue
-        exit_code = _exit_code_from_transcript(window)
-        if exit_code is None:
+        window, exit_code = _recover_transcript_window(value, command_text, criterion_id)
+        if not window or exit_code is None:
             continue
         results.append({
-            "criterion_id": str(command.get("criterion_id") or "").strip(),
+            "criterion_id": criterion_id,
             "command_run": command_text,
             "cwd": str(command.get("relative_cwd") or command.get("cwd") or "").strip(),
             "exit_code": exit_code,
@@ -330,6 +339,37 @@ def parse_transcript_verification_results(text: Optional[str], executable_comman
         "warning": "Recovered verification results from worker transcript because DEV_VERIFICATION_RESULTS was missing or invalid.",
         "results": results,
     }
+
+
+def _parse_worker_verification_output(
+    text: str,
+    executable_commands: Iterable[Dict[str, Any]],
+) -> tuple[Dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    parsed = parse_verification_results(text)
+    if parsed.get("warning"):
+        warnings.append(parsed["warning"])
+    if parsed.get("results") and not _parsed_results_are_prompt_template(parsed):
+        return parsed, warnings
+    recovered = parse_transcript_verification_results(text, executable_commands)
+    if recovered.get("results"):
+        if recovered.get("warning"):
+            warnings.append(recovered["warning"])
+        return recovered, warnings
+    if _parsed_results_are_prompt_template(parsed):
+        parsed = _empty_parse("invalid", "Worker output only contained the prompt's DEV_VERIFICATION_RESULTS template.")
+        warnings.append(parsed["warning"])
+    elif recovered.get("warning"):
+        warnings.append(recovered["warning"])
+    return parsed, warnings
+
+
+def _parsed_results_are_prompt_template(parsed: Dict[str, Any]) -> bool:
+    for item in parsed.get("results") or []:
+        excerpt = str(item.get("output_excerpt") or "").lower()
+        if "include the real test/build summary line" in excerpt:
+            return True
+    return False
 
 
 def reconcile_results(seed_results: list[Dict[str, Any]], worker_results: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[str]]:
@@ -441,6 +481,13 @@ def refresh_verification_run(
     if not run:
         raise KeyError(f"Dev verification run not found: {verification_run_id}")
     if run.get("status") in TERMINAL_RUN_STATUSES:
+        repaired = _repair_run_from_codex_final_message(
+            verification_store=verification_store,
+            run=run,
+            bridge=bridge,
+        )
+        if repaired is not None:
+            return repaired
         return run
     if _run_timed_out(run):
         return verification_store.update_run(verification_run_id, {
@@ -455,30 +502,22 @@ def refresh_verification_run(
     latest_event = event_store.latest_event_for_ao_session(session_id)
     session = _verification_session(run, bridge=bridge)
     transcript = _verification_transcript(run, session=session, bridge=bridge)
-    if not latest_event and not _session_is_terminal(session):
-        return run
+    final_message = _verification_final_message(run, session=session)
     status = str((latest_event or {}).get("status") or "").lower()
     event_type = str((latest_event or {}).get("event") or "").lower()
     event_terminal = event_type == "subagent.complete" or status in TERMINAL_SESSION_STATUSES
-    if not event_terminal and not _session_is_terminal(session):
-        return run
     event_text = _event_text(latest_event or {})
-    combined_text = "\n".join(part for part in (event_text, transcript) if str(part or "").strip())
-    parsed = parse_verification_results(combined_text)
+    combined_text = "\n".join(part for part in (event_text, transcript, final_message) if str(part or "").strip())
     warnings = list(run.get("warnings") or [])
-    if parsed.get("warning"):
-        warnings.append(parsed["warning"])
-    if parsed.get("status") in {"missing", "invalid"}:
-        recovered = parse_transcript_verification_results(combined_text, run.get("executable_commands") or [])
-        if recovered.get("results"):
-            parsed = recovered
-            if parsed.get("warning"):
-                warnings.append(parsed["warning"])
-        else:
-            return verification_store.update_run(verification_run_id, {
-                "status": "needs_attention",
-                "warnings": _unique([*warnings, recovered.get("warning") or parsed.get("warning") or "Verification worker output could not be parsed."]),
-            })
+    parsed, parse_warnings = _parse_worker_verification_output(combined_text, run.get("executable_commands") or [])
+    warnings.extend(parse_warnings)
+    if not event_terminal and not _session_is_terminal(session) and not parsed.get("results"):
+        return run
+    if not parsed.get("results"):
+        return verification_store.update_run(verification_run_id, {
+            "status": "needs_attention",
+            "warnings": _unique([*warnings, parsed.get("warning") or "Verification worker output could not be parsed."]),
+        })
     results, reconcile_warnings = reconcile_results(run.get("results") or [], parsed.get("results") or [])
     return verification_store.update_run(verification_run_id, {
         "status": "completed",
@@ -764,6 +803,10 @@ def _verification_prompt(*, plan: Dict[str, Any], task: Dict[str, Any], commands
         ],
         "",
         "Final output is mandatory: return a short summary followed by this exact fenced JSON block as your final response.",
+        "The fenced block must be valid JSON. Do not paste raw multi-line command output inside a JSON string.",
+        "Keep output_excerpt to one short JSON string with the real summary line or command-output tail; escape any newline as \\n.",
+        "Do not include terminal UI/progress text such as Working, esc to interrupt, or prompts in output_excerpt.",
+        "Set exit_code to the real process exit code you observed. Do not leave the template exit_code or output_excerpt unchanged.",
         "```json DEV_VERIFICATION_RESULTS",
         json.dumps({
             "object": VERIFICATION_OBJECT,
@@ -830,9 +873,9 @@ def _find_verification_block(text: str) -> Optional[re.Match[str]]:
 
 
 def _parse_unfenced_results_object(text: str) -> Optional[Dict[str, Any]]:
-    marker_index = text.find(f'"object": "{VERIFICATION_OBJECT}"')
+    marker_index = text.rfind(f'"object": "{VERIFICATION_OBJECT}"')
     if marker_index < 0:
-        marker_index = text.find(f'"object":"{VERIFICATION_OBJECT}"')
+        marker_index = text.rfind(f'"object":"{VERIFICATION_OBJECT}"')
     if marker_index < 0:
         return None
     start = text.rfind("{", 0, marker_index)
@@ -910,16 +953,39 @@ def _parse_results_json(raw_json: str) -> Dict[str, Any]:
 
 
 def _transcript_window_for_command(text: str, command: str) -> str:
-    index = text.find(command)
-    if index < 0:
-        return ""
-    return text[index : min(len(text), index + 2500)]
+    window, _exit_code = _recover_transcript_window(text, command, "")
+    return window
+
+
+def _recover_transcript_window(text: str, command: str, criterion_id: str = "") -> tuple[str, Optional[int]]:
+    for needle in (command, criterion_id):
+        if not needle:
+            continue
+        for match in reversed(list(re.finditer(re.escape(needle), text))):
+            forward_window = text[match.start() : min(len(text), match.start() + 2500)]
+            if _is_prompt_template_transcript_window(forward_window):
+                continue
+            window = text[max(0, match.start() - 1000) : min(len(text), match.start() + 2500)]
+            exit_code = _exit_code_from_transcript(window)
+            if exit_code is not None:
+                return window, exit_code
+    return "", None
+
+
+def _is_prompt_template_transcript_window(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "include the real test/build summary line" in lowered:
+        return True
+    if "set exit_code to the real process exit code" in lowered:
+        return True
+    return False
 
 
 def _exit_code_from_transcript(text: str) -> Optional[int]:
-    match = TRANSCRIPT_EXIT_RE.search(text)
-    if not match:
+    matches = list(TRANSCRIPT_EXIT_RE.finditer(text))
+    if not matches:
         return None
+    match = matches[-1]
     try:
         return int(match.group("code"))
     except Exception:
@@ -933,7 +999,7 @@ def _output_excerpt_from_transcript(text: str, command: str) -> str:
         if command not in line
         and not line.startswith("{")
         and not line.startswith("}")
-        and not line.startswith('"')
+        and (not line.startswith('"') or SUMMARY_RE.search(line))
         and "DEV_VERIFICATION_RESULTS" not in line
     ]
     if not useful:
@@ -1127,6 +1193,238 @@ def _verification_transcript(run: Dict[str, Any], *, session: Any = None, bridge
             return str(router.capture_output(session, lines=120) or "")
     except Exception:
         return ""
+
+
+def _repair_run_from_codex_final_message(
+    *,
+    verification_store: DevVerificationStore,
+    run: Dict[str, Any],
+    bridge: Any = None,
+) -> Optional[Dict[str, Any]]:
+    if not _has_transcript_recovery_warning(run.get("warnings") or []):
+        return None
+    session = _verification_session(run, bridge=bridge)
+    final_message = _verification_final_message(run, session=session)
+    if not final_message.strip():
+        return None
+    parsed = parse_verification_results(final_message)
+    if not parsed.get("results") or _parsed_results_are_prompt_template(parsed):
+        return None
+    seed = _pending_seed_for_repair(run.get("results") or [], parsed.get("results") or [])
+    results, reconcile_warnings = reconcile_results(seed, parsed.get("results") or [])
+    warnings = [
+        warning
+        for warning in (run.get("warnings") or [])
+        if not _is_transcript_recovery_warning(warning)
+    ]
+    return verification_store.update_run(str(run["verification_run_id"]), {
+        "status": "completed",
+        "results": results,
+        "warnings": _unique([*warnings, *reconcile_warnings]),
+    })
+
+
+def _pending_seed_for_repair(existing_results: list[Dict[str, Any]], worker_results: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    worker_ids = {str(item.get("criterion_id") or "") for item in worker_results}
+    seed: list[Dict[str, Any]] = []
+    for item in existing_results:
+        criterion_id = str(item.get("criterion_id") or "")
+        if criterion_id in worker_ids:
+            seed.append({
+                **item,
+                "status": "pending",
+                "exit_code": None,
+                "passed": None,
+                "output_excerpt": "",
+                "notes": "",
+                "warnings": [],
+            })
+        else:
+            seed.append(item)
+    return seed
+
+
+def _has_transcript_recovery_warning(warnings: Iterable[Any]) -> bool:
+    return any(_is_transcript_recovery_warning(warning) for warning in warnings or [])
+
+
+def _is_transcript_recovery_warning(warning: Any) -> bool:
+    text = str(warning or "")
+    return (
+        "DEV_VERIFICATION_RESULTS is not valid JSON" in text
+        or "Recovered verification results from worker transcript" in text
+        or "DEV_VERIFICATION_RESULTS marker was present but no JSON object could be extracted" in text
+    )
+
+
+def _verification_final_message(run: Dict[str, Any], *, session: Any = None) -> str:
+    """Return the worker's final assistant message when Codex session JSONL is available.
+
+    Terminal captures can contain live UI redraw/progress text. The Codex JSONL
+    task_complete payload carries the final answer as the model produced it, so it
+    is the more authoritative source for fenced verification JSON.
+    """
+
+    started_at = _first_float(run.get("created_at"))
+    completed_at = _first_float(run.get("completed_at")) or time.time()
+    session_record: Optional[Dict[str, Any]] = None
+    workspace_path = str(_session_field(session, "workspace_path") or "").strip()
+    if workspace_path:
+        session_record = _codex_session_final_message_for_workspace(
+            workspace_path,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+    if not session_record:
+        session_id = str(run.get("verification_session_id") or _session_field(session, "id") or "").strip()
+        if session_id:
+            session_record = _codex_session_final_message_for_session_id(
+                session_id,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+    return str((session_record or {}).get("last_agent_message") or "")
+
+
+def _session_field(session: Any, key: str) -> Any:
+    if session is None:
+        return None
+    if isinstance(session, dict):
+        return session.get(key)
+    return getattr(session, key, None)
+
+
+def _codex_session_final_message_for_workspace(
+    workspace_path: str,
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        workspace = str(Path(workspace_path).expanduser().resolve())
+    except OSError:
+        workspace = str(Path(workspace_path).expanduser())
+    sessions_root = _codex_sessions_root()
+    if not sessions_root.exists():
+        return None
+    lower_bound = float(started_at or 0) - 3600
+    upper_bound = float(completed_at or time.time()) + 3600
+    matches: list[Dict[str, Any]] = []
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if started_at is not None and (mtime < lower_bound or mtime > upper_bound):
+            continue
+        parsed = _read_codex_final_message_file(path)
+        if not parsed:
+            continue
+        cwd = str(parsed.get("cwd") or "").strip()
+        if not cwd:
+            continue
+        try:
+            resolved_cwd = str(Path(cwd).expanduser().resolve())
+        except OSError:
+            resolved_cwd = cwd
+        if resolved_cwd == workspace and parsed.get("last_agent_message"):
+            matches.append(parsed)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return matches[0]
+
+
+def _codex_session_final_message_for_session_id(
+    session_id: str,
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    sessions_root = _codex_sessions_root()
+    if not sessions_root.exists():
+        return None
+    lower_bound = float(started_at or 0) - 3600
+    upper_bound = float(completed_at or time.time()) + 3600
+    matches: list[Dict[str, Any]] = []
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if started_at is not None and (mtime < lower_bound or mtime > upper_bound):
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if session_id not in raw:
+            continue
+        parsed = _read_codex_final_message_file(path)
+        if parsed and parsed.get("last_agent_message"):
+            matches.append(parsed)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return matches[0]
+
+
+def _codex_sessions_root() -> Path:
+    configured = os.getenv("HERMES_DEV_VERIFICATION_CODEX_HOME") or os.getenv("HERMES_DEV_LAB_CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser() / "sessions"
+    lab_home = os.getenv("ORYN_LAB_HOME")
+    if lab_home:
+        return Path(lab_home).expanduser() / ".codex" / "sessions"
+    return Path.home() / ".codex" / "sessions"
+
+
+def _read_codex_final_message_file(path: Path) -> Optional[Dict[str, Any]]:
+    meta: dict[str, Any] = {}
+    last_agent_message = ""
+    completed_at: Optional[float] = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                if entry.get("type") == "session_meta":
+                    meta = payload
+                elif payload.get("type") == "task_complete":
+                    last_agent_message = str(payload.get("last_agent_message") or "")
+                    completed_at = _first_float(payload.get("completed_at"))
+    except OSError:
+        return None
+    if not meta:
+        return None
+    try:
+        updated_at = path.stat().st_mtime
+    except OSError:
+        updated_at = completed_at or 0
+    return {
+        "source": "codex_session_jsonl",
+        "session_id": meta.get("id"),
+        "session_path": str(path),
+        "cwd": meta.get("cwd"),
+        "last_agent_message": last_agent_message,
+        "completed_at": completed_at,
+        "updated_at": updated_at,
+    }
+
+
+def _first_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _task_workspace_path(task: Dict[str, Any]) -> str:

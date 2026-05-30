@@ -1196,6 +1196,71 @@ class TestChatCompletionsEndpoint:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_stream_emits_final_response_when_no_text_deltas(self, adapter):
+        """Codex Responses/app-server runtimes deliver the answer as a
+        completed message item, so ``stream_delta_callback`` fires only for
+        reasoning, never text.  The SSE writer must fall back to emitting
+        ``final_response`` so the client renders the answer instead of an
+        empty assistant turn (regression: thinking trace vanishes, no reply).
+        """
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                # Reasoning streams (thinking visible), but no text deltas.
+                reasoning_cb = kwargs.get("reasoning_callback")
+                if reasoning_cb:
+                    reasoning_cb("Let me think about this...")
+                return (
+                    {"final_response": "The answer is 42.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "The answer is 42." in body
+                assert '"finish_reason": "stop"' in body
+                assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_duplicate_final_response_when_text_streamed(self, adapter):
+        """When text deltas already streamed, the fallback must NOT re-emit
+        ``final_response`` (would duplicate the answer)."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hello!")
+                    cb(None)
+                return (
+                    {"final_response": "Hello!", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                # "Hello!" appears once as a streamed content delta, not twice.
+                assert body.count('"content": "Hello!"') == 1
+
+    @pytest.mark.asyncio
     async def test_stream_failed_agent_result_emits_error_finish(self, adapter):
         """A failed agent task must not look like a normal stop to SSE clients."""
         app = _create_app(adapter)

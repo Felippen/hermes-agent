@@ -18,6 +18,7 @@ from gateway.dev_control.acceptance_criteria import (
     normalize_acceptance_criteria,
     validate_and_downgrade_criteria,
 )
+from gateway.dev_control.project_scope import DEFAULT_PROJECT_ID, resolve_project_id
 from gateway.dev_control.repo_grounding import collect_repo_grounding
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
@@ -49,7 +50,6 @@ CREATE INDEX IF NOT EXISTS idx_dev_clarification_sessions_session
     ON dev_clarification_sessions(session_id, updated_at DESC);
 """
 
-DEFAULT_PROJECT_ID = "OrynWorkspace"
 DEFAULT_MAX_QUESTIONS = 5
 MIN_TARGET_QUESTIONS = 3
 MAX_QUESTION_LIMIT = 5
@@ -250,6 +250,10 @@ def start_clarification(
     generation_mode = "llm"
     warning = None
     normalized_project_context = _normalize_project_context(project_context, project_id=project_id)
+    resolved_project_id = resolve_project_id(
+        project_id,
+        (normalized_project_context or {}).get("project_id"),
+    )
     grounding_result = collect_repo_grounding(
         repositories=(normalized_project_context or {}).get("repositories") or [],
         vision_brief=brief,
@@ -271,7 +275,7 @@ def start_clarification(
     payload = {
         "object": "hermes.dev_clarification",
         "clarification_id": f"devclar-{uuid.uuid4().hex[:10]}",
-        "project_id": project_id or DEFAULT_PROJECT_ID,
+        "project_id": resolved_project_id,
         "session_id": session_id,
         "status": "active",
         "vision_brief": brief,

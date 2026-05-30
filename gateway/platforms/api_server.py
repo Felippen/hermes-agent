@@ -60,6 +60,8 @@ from gateway.dev_control.read_models import (
     build_agent_board_rows,
 )
 from gateway.dev_control.ci_status import fetch_ci_status
+from gateway.dev_control.project_scope import resolve_project_id
+from gateway.dev_control.chat_project_context import build_chat_project_context_overlay
 from gateway.dev_control.routes import (
     DevControlRouteMixin,
     dev_control_capabilities,
@@ -672,7 +674,8 @@ def _derive_chat_session_id(
 # Slash commands serviceable via POST /v1/slash on the API server.
 API_SERVER_SLASH_COMMANDS = frozenset({
     "help", "commands", "status", "profile", "yolo", "restart",
-    "new", "reset", "clear", "stop", "steer", "queue",
+    "new", "reset", "clear", "stop", "steer", "queue", "background",
+    "codex-runtime",
 })
 
 # Commands the Oryn Workspace app may handle natively (still listed in catalog).
@@ -840,6 +843,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_reliability_store: Optional[Any] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
+        self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
         self._read_model_cache = ReadModelCache()
         self._ao_snapshot_cache = AOSnapshotCache()
 
@@ -1287,6 +1291,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
+        if session_id:
+            reasoning_override = self._session_reasoning_overrides.get(session_id)
+            if reasoning_override is not None:
+                reasoning_config = reasoning_override
         model = self._request_model_override(model_override) or _resolve_gateway_model()
         model, runtime_kwargs = self._apply_session_model_override(session_id, model, runtime_kwargs)
 
@@ -1376,6 +1384,17 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             if key in override and override[key] is not None:
                 next_kwargs[key] = override[key]
         return model, next_kwargs
+
+    @staticmethod
+    def _serialize_reasoning_effort(reasoning_config: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not reasoning_config:
+            return None
+        if not reasoning_config.get("enabled", True):
+            return "none"
+        effort = reasoning_config.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            return effort.strip().lower()
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1493,6 +1512,79 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             logger.warning("Failed to list OpenRouter picker models: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    async def _handle_codex_models(self, request: "web.Request") -> "web.Response":
+        """GET /v1/providers/codex/models — browse Codex CLI catalog models."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = str(request.rel_url.query.get("q", "")).strip()
+        limit_raw = request.rel_url.query.get("limit")
+        try:
+            limit = int(limit_raw) if limit_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            limit = None
+
+        access_token = None
+        authenticated = False
+        try:
+            from hermes_cli.auth import resolve_codex_runtime_credentials
+
+            creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+            token = creds.get("api_key") if isinstance(creds, dict) else None
+            if isinstance(token, str) and token.strip():
+                access_token = token.strip()
+                authenticated = True
+        except Exception:
+            access_token = None
+
+        try:
+            from hermes_cli.codex_models import list_codex_picker_models
+
+            models = list_codex_picker_models(
+                access_token=access_token,
+                query=query,
+                limit=limit,
+            )
+            return web.json_response(
+                {
+                    "object": "hermes.provider.models",
+                    "provider": "codex",
+                    "authenticated": authenticated,
+                    "data": models,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed to list Codex picker models: %s", exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_get_session_model(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/model — read session model override."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id or len(session_id) > self._MAX_SESSION_HEADER_LEN or re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(
+                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        override = self._session_model_overrides.get(session_id, {})
+        reasoning_config = self._session_reasoning_overrides.get(session_id)
+        return web.json_response(
+            {
+                "object": "hermes.session.model",
+                "session_id": session_id,
+                "provider": override.get("provider"),
+                "model": override.get("model"),
+                "base_url": override.get("base_url"),
+                "api_mode": override.get("api_mode"),
+                "reasoning_effort": self._serialize_reasoning_effort(reasoning_config),
+            }
+        )
+
     async def _handle_set_session_model(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/model — switch one API session."""
         auth_err = self._check_auth(request)
@@ -1513,11 +1605,33 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
         model_input = str(body.get("model") or "").strip()
         explicit_provider = str(body.get("provider") or "").strip()
+        reasoning_effort_raw = body.get("reasoning_effort")
+        reasoning_effort = (
+            str(reasoning_effort_raw).strip()
+            if reasoning_effort_raw is not None
+            else None
+        )
         if not model_input or not explicit_provider:
             return web.json_response(
                 _openai_error("'provider' and 'model' are required"),
                 status=400,
             )
+
+        parsed_reasoning = None
+        if reasoning_effort is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            if not reasoning_effort:
+                self._session_reasoning_overrides.pop(session_id, None)
+            else:
+                parsed_reasoning = parse_reasoning_effort(reasoning_effort)
+                if parsed_reasoning is None:
+                    return web.json_response(
+                        _openai_error(
+                            "Invalid reasoning_effort. Valid: none, minimal, low, medium, high, xhigh."
+                        ),
+                        status=400,
+                    )
 
         try:
             from gateway.run import _resolve_gateway_model
@@ -1555,6 +1669,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if parsed_reasoning is not None:
+                self._session_reasoning_overrides[session_id] = parsed_reasoning
             return web.json_response({
                 "object": "hermes.session.model",
                 "session_id": session_id,
@@ -1562,11 +1678,331 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "provider": result.target_provider,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "reasoning_effort": self._serialize_reasoning_effort(
+                    self._session_reasoning_overrides.get(session_id)
+                ),
                 "warning": result.warning_message or "",
             })
         except Exception as exc:
             logger.warning("Session model switch failed for %s: %s", session_id, exc)
             return web.json_response(_openai_error(str(exc)), status=500)
+
+    # ── Session goals (/goal Ralph loop) ────────────────────────────────
+
+    def _goal_max_turns_from_config(self) -> int:
+        try:
+            from hermes_cli.config import load_config
+
+            goals_cfg = (load_config() or {}).get("goals") or {}
+            return int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            return 20
+
+    def _goal_manager(self, session_id: str):
+        from hermes_cli.goals import GoalManager
+
+        return GoalManager(
+            session_id=session_id,
+            default_max_turns=self._goal_max_turns_from_config(),
+        )
+
+    @staticmethod
+    def _serialize_goal_state(state) -> Optional[Dict[str, Any]]:
+        if state is None or state.status == "cleared":
+            return None
+        return {
+            "goal": state.goal,
+            "status": state.status,
+            "turns_used": state.turns_used,
+            "max_turns": state.max_turns,
+            "subgoals": list(state.subgoals or []),
+            "last_verdict": state.last_verdict,
+            "last_reason": state.last_reason,
+            "paused_reason": state.paused_reason,
+            "created_at": state.created_at,
+            "last_turn_at": state.last_turn_at,
+        }
+
+    def _goal_status_payload(
+        self,
+        session_id: str,
+        decision: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        mgr = self._goal_manager(session_id)
+        payload: Dict[str, Any] = {
+            "session_id": session_id,
+            "goal": self._serialize_goal_state(mgr.state),
+        }
+        if decision:
+            payload.update({
+                "message": decision.get("message") or "",
+                "should_continue": bool(decision.get("should_continue")),
+                "continuation_prompt": decision.get("continuation_prompt"),
+                "verdict": decision.get("verdict"),
+                "reason": decision.get("reason"),
+            })
+        return payload
+
+    def _evaluate_session_goal_after_turn(
+        self,
+        session_id: str,
+        final_response: str,
+        *,
+        user_initiated: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        if not session_id:
+            return None
+        try:
+            mgr = self._goal_manager(session_id)
+            if not mgr.is_active():
+                return None
+            decision = mgr.evaluate_after_turn(
+                final_response or "",
+                user_initiated=user_initiated,
+            )
+            return self._goal_status_payload(session_id, decision)
+        except Exception as exc:
+            logger.debug("goal evaluation failed for %s: %s", session_id, exc)
+            return None
+
+    async def _handle_get_session_goal(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+
+        try:
+            payload = self._goal_status_payload(session_id)
+            return web.json_response({
+                "object": "hermes.session.goal",
+                **payload,
+            })
+        except Exception as exc:
+            logger.warning("GET session goal failed for %s: %s", session_id, exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_post_session_goal(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID required"), status=400)
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        action = str(body.get("action") or "").strip().lower()
+        if not action:
+            return web.json_response(_openai_error("'action' is required"), status=400)
+
+        try:
+            mgr = self._goal_manager(session_id)
+            message = ""
+            kickoff_message: Optional[str] = None
+
+            if action == "set":
+                goal_text = str(body.get("goal") or "").strip()
+                if not goal_text:
+                    return web.json_response(_openai_error("goal text is required"), status=400)
+                if self._find_active_run_id_for_session(session_id):
+                    return web.json_response(
+                        _openai_error(
+                            "Agent is running — use pause/clear mid-run, or stop before setting a new goal."
+                        ),
+                        status=409,
+                    )
+                raw_max_turns = body.get("max_turns")
+                max_turns = None
+                if raw_max_turns is not None:
+                    try:
+                        max_turns = int(raw_max_turns)
+                    except (TypeError, ValueError):
+                        return web.json_response(
+                            _openai_error("max_turns must be an integer"), status=400
+                        )
+                try:
+                    state = mgr.set(goal_text, max_turns=max_turns)
+                except ValueError as exc:
+                    return web.json_response(_openai_error(str(exc)), status=400)
+                message = f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}"
+                kickoff_message = state.goal
+            elif action == "pause":
+                state = mgr.pause(reason="user-paused")
+                if state is None:
+                    return web.json_response(_openai_error("No active goal."), status=404)
+                message = f"⏸ Goal paused: {state.goal}"
+            elif action == "resume":
+                state = mgr.resume()
+                if state is None:
+                    return web.json_response(_openai_error("No goal to resume."), status=404)
+                message = f"⊙ Goal resumed ({state.max_turns}-turn budget): {state.goal}"
+            elif action == "clear":
+                had = mgr.has_goal()
+                mgr.clear()
+                message = "Goal cleared." if had else "No active goal."
+            elif action == "add_subgoal":
+                subgoal = str(body.get("text") or body.get("subgoal") or "").strip()
+                if not subgoal:
+                    return web.json_response(_openai_error("subgoal text is required"), status=400)
+                try:
+                    added = mgr.add_subgoal(subgoal)
+                except (ValueError, RuntimeError) as exc:
+                    return web.json_response(_openai_error(str(exc)), status=400)
+                idx = len(mgr.state.subgoals) if mgr.state else 0
+                message = f"✓ Added subgoal {idx}: {added}"
+            elif action == "remove_subgoal":
+                try:
+                    index = int(body.get("index"))
+                except (TypeError, ValueError):
+                    return web.json_response(_openai_error("index must be an integer"), status=400)
+                try:
+                    removed = mgr.remove_subgoal(index)
+                except (IndexError, RuntimeError) as exc:
+                    return web.json_response(_openai_error(str(exc)), status=400)
+                message = f"✓ Removed subgoal {index}: {removed}"
+            elif action == "clear_subgoals":
+                try:
+                    prev = mgr.clear_subgoals()
+                except RuntimeError as exc:
+                    return web.json_response(_openai_error(str(exc)), status=400)
+                message = (
+                    f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
+                    if prev
+                    else "No subgoals to clear."
+                )
+            elif action == "set_max_turns":
+                try:
+                    max_turns = int(body.get("max_turns"))
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        _openai_error("max_turns must be an integer"), status=400
+                    )
+                try:
+                    state = mgr.set_max_turns(max_turns)
+                except (ValueError, RuntimeError) as exc:
+                    return web.json_response(_openai_error(str(exc)), status=400)
+                message = (
+                    f"Turn budget updated to {state.max_turns} "
+                    f"({state.turns_used} used so far)."
+                )
+            else:
+                return web.json_response(_openai_error(f"Unknown action '{action}'"), status=400)
+
+            payload = self._goal_status_payload(session_id)
+            payload["message"] = message
+            if kickoff_message:
+                payload["kickoff_message"] = kickoff_message
+            return web.json_response({
+                "object": "hermes.session.goal",
+                **payload,
+            })
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.warning("POST session goal failed for %s: %s", session_id, exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    def _dispatch_goal_slash(self, session_id: str, cmd_arg: str) -> dict:
+        args = (cmd_arg or "").strip()
+        lower = args.lower()
+        mgr = self._goal_manager(session_id)
+
+        if not args or lower == "status":
+            return {"type": "text", "content": mgr.status_line()}
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return {"type": "error", "message": "No active goal."}
+            return {"type": "text", "content": f"⏸ Goal paused: {state.goal}"}
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return {"type": "error", "message": "No goal to resume."}
+            return {"type": "text", "content": f"⊙ Goal resumed ({state.max_turns}-turn budget): {state.goal}"}
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            return {
+                "type": "text",
+                "content": "Goal cleared." if had else "No active goal.",
+            }
+
+        if self._find_active_run_id_for_session(session_id):
+            return {
+                "type": "error",
+                "message": (
+                    "Agent is running — use /goal status, pause, or clear mid-run, "
+                    "or /stop before setting a new goal."
+                ),
+            }
+
+        try:
+            state = mgr.set(args)
+        except ValueError as exc:
+            return {"type": "error", "message": str(exc)}
+
+        return {
+            "type": "send",
+            "message": state.goal,
+        }
+
+    def _dispatch_subgoal_slash(self, session_id: str, cmd_arg: str) -> dict:
+        args = (cmd_arg or "").strip()
+        mgr = self._goal_manager(session_id)
+        if not mgr.has_goal():
+            return {"type": "error", "message": "No active goal. Set one with /goal <text>."}
+
+        if not args:
+            return {
+                "type": "text",
+                "content": f"{mgr.status_line()}\n{mgr.render_subgoals()}",
+            }
+
+        tokens = args.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if verb == "remove":
+            if not rest:
+                return {"type": "error", "message": "usage: /subgoal remove <n>"}
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                return {"type": "error", "message": "/subgoal remove: <n> must be an integer."}
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                return {"type": "error", "message": f"/subgoal remove: {exc}"}
+            return {"type": "text", "content": f"✓ Removed subgoal {idx}: {removed}"}
+
+        if verb == "clear":
+            try:
+                prev = mgr.clear_subgoals()
+            except RuntimeError as exc:
+                return {"type": "error", "message": f"/subgoal clear: {exc}"}
+            if prev:
+                return {
+                    "type": "text",
+                    "content": f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}.",
+                }
+            return {"type": "text", "content": "No subgoals to clear."}
+
+        try:
+            text = mgr.add_subgoal(args)
+        except (ValueError, RuntimeError) as exc:
+            return {"type": "error", "message": f"/subgoal: {exc}"}
+        idx = len(mgr.state.subgoals) if mgr.state else 0
+        return {"type": "text", "content": f"✓ Added subgoal {idx}: {text}"}
 
     @staticmethod
     def _serialize_message_content(content) -> str:
@@ -1999,6 +2435,11 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "run_subagent_events": {"method": "GET", "path": "/v1/runs/{run_id}/subagents/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "background_task_follow_up": {
+                    "method": "POST",
+                    "path": "/v1/background/tasks/{task_id}/follow-up",
+                },
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -2579,8 +3020,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         """Return the run/completion id for an in-flight agent turn on a session."""
         if not session_id:
             return None
+        normalized = session_id.casefold()
         for run_id, status in self._run_statuses.items():
-            if status.get("session_id") != session_id:
+            active_session = str(status.get("session_id") or "").casefold()
+            if active_session != normalized:
                 continue
             if status.get("status") in {"running", "waiting_for_approval", "stopping"}:
                 return run_id
@@ -2662,6 +3105,38 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001
             logger.warning("slash /model failed for %s: %s", session_id, exc)
             return False, f"Could not switch model: {exc}"
+
+    def _dispatch_codex_runtime_slash(self, cmd_arg: str, session_id: str) -> dict:
+        """Toggle or query the optional codex app-server runtime."""
+        if self._find_active_run_id_for_session(session_id):
+            return {
+                "type": "error",
+                "message": (
+                    "Agent is running — wait or /stop first, then change runtime."
+                ),
+            }
+
+        from hermes_cli import codex_runtime_switch as crs
+
+        new_value, errors = crs.parse_args(cmd_arg)
+        if errors:
+            return {"type": "error", "message": "❌ " + "\n❌ ".join(errors)}
+
+        try:
+            from hermes_cli.config import load_config, save_config
+        except Exception as exc:  # noqa: BLE001
+            return {"type": "error", "message": f"Could not load config: {exc}"}
+
+        cfg = load_config()
+        result = crs.apply(
+            cfg,
+            new_value,
+            persist_callback=(save_config if new_value is not None else None),
+        )
+        prefix = "✓" if result.success else "✗"
+        if result.success:
+            return {"type": "text", "content": f"{prefix} {result.message}"}
+        return {"type": "error", "message": f"{prefix} {result.message}"}
 
     def _dispatch_slash_command(
         self,
@@ -2782,6 +3257,15 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     logger.debug("steer failed: %s", exc)
             return {"type": "send", "message": cmd_arg}
 
+        if canonical == "background" or cmd_name in {"bg", "btw"}:
+            if not cmd_arg.strip():
+                return {"type": "error", "message": "usage: /background <prompt>"}
+            return self._dispatch_api_background_command(
+                session_id,
+                cmd_arg.strip(),
+                gateway_session_key=gateway_session_key,
+            )
+
         if canonical == "stop":
             run_id = self._find_active_run_id_for_session(session_id)
             if not run_id:
@@ -2860,6 +3344,15 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 logger.warning("yolo command failed: %s", exc)
                 return {"type": "error", "message": f"Could not toggle YOLO mode: {exc}"}
 
+        if canonical == "codex-runtime":
+            return self._dispatch_codex_runtime_slash(cmd_arg, session_id)
+
+        if canonical == "goal":
+            return self._dispatch_goal_slash(session_id, cmd_arg)
+
+        if canonical == "subgoal":
+            return self._dispatch_subgoal_slash(session_id, cmd_arg)
+
         if canonical == "restart":
             try:
                 import weakref
@@ -2918,6 +3411,268 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "commands."
             ),
         }
+
+    def _dispatch_api_background_command(
+        self,
+        parent_session_id: str,
+        prompt: str,
+        gateway_session_key: str = None,
+    ) -> dict:
+        """Start a Hermes-native /background task for an API session."""
+        from datetime import datetime
+
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+
+        self._persist_subagent_event(
+            {
+                "event": "subagent.start",
+                "subagent_id": task_id,
+                "run_id": task_id,
+                "depth": 0,
+                "goal": prompt,
+                "status": "running",
+                "runtime": "background",
+                "preview": preview,
+                "timestamp": time.time(),
+            },
+            session_id=parent_session_id,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return {
+                "type": "error",
+                "message": "Background tasks require an active API server loop.",
+            }
+
+        task = loop.create_task(
+            self._run_api_background_task(
+                parent_session_id=parent_session_id,
+                prompt=prompt,
+                task_id=task_id,
+                gateway_session_key=gateway_session_key,
+            )
+        )
+        try:
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except Exception:  # noqa: BLE001
+            pass
+
+        content = (
+            f'🔄 Background task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            f"You can keep chatting — results will appear when done."
+        )
+        return {"type": "text", "content": content}
+
+    async def _run_api_background_task(
+        self,
+        *,
+        parent_session_id: str,
+        prompt: str,
+        task_id: str,
+        gateway_session_key: str = None,
+        is_follow_up: bool = False,
+    ) -> None:
+        """Execute a background prompt in an isolated session and mirror progress to the parent."""
+        started = time.time()
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+
+        def _persist(event: Dict[str, Any]) -> None:
+            payload = dict(event)
+            payload.setdefault("subagent_id", task_id)
+            payload.setdefault("run_id", task_id)
+            payload.setdefault("goal", prompt)
+            payload.setdefault("runtime", "background")
+            payload.setdefault("depth", 0)
+            payload.setdefault("timestamp", time.time())
+            self._persist_subagent_event(payload, session_id=parent_session_id)
+
+        if is_follow_up:
+            _persist({
+                "event": "subagent.progress",
+                "subagent_id": task_id,
+                "status": "running",
+                "message": "Follow-up sent",
+                "preview": preview,
+            })
+
+        def _tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            if str(event_type).startswith("subagent."):
+                event = self._subagent_event_payload(
+                    event_type,
+                    task_id,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    extra={
+                        **kwargs,
+                        "subagent_id": task_id,
+                        "goal": prompt,
+                        "runtime": "background",
+                        "depth": 0,
+                    },
+                )
+                event["subagent_id"] = task_id
+                _persist(event)
+                return
+            if not tool_name or str(tool_name).startswith("_"):
+                return
+            if event_type == "tool.started":
+                _persist({
+                    "event": "subagent.tool",
+                    "subagent_id": task_id,
+                    "tool": tool_name,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                    "status": "running",
+                })
+            elif event_type == "tool.completed":
+                _persist({
+                    "event": "subagent.tool",
+                    "subagent_id": task_id,
+                    "tool": tool_name,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                    "status": "failed" if kwargs.get("is_error") else "completed",
+                })
+
+        status = "completed"
+        summary = ""
+        usage: Dict[str, Any] = {}
+        try:
+            result, usage = await self._run_agent(
+                user_message=prompt,
+                conversation_history=[],
+                session_id=task_id,
+                tool_progress_callback=_tool_progress,
+                gateway_session_key=gateway_session_key,
+                run_id=task_id,
+            )
+            if isinstance(result, dict) and result.get("failed"):
+                status = "failed"
+                summary = str(result.get("error") or "Background task failed.")
+            else:
+                summary = (
+                    str(result.get("final_response") or "")
+                    if isinstance(result, dict)
+                    else str(result or "")
+                )
+                if not summary.strip():
+                    summary = "Background task completed."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_server background task %s failed: %s", task_id, exc)
+            status = "failed"
+            summary = str(exc)
+        finally:
+            self._active_run_agents.pop(task_id, None)
+
+        complete_payload: Dict[str, Any] = {
+            "event": "subagent.complete",
+            "subagent_id": task_id,
+            "status": status,
+            "summary": summary[:4000],
+            "preview": preview,
+            "duration_seconds": round(time.time() - started, 2),
+        }
+        if status == "completed" and usage:
+            complete_payload["input_tokens"] = usage.get("input_tokens")
+            complete_payload["output_tokens"] = usage.get("output_tokens")
+        _persist(complete_payload)
+
+    async def _handle_background_task_follow_up(self, request: "web.Request") -> "web.Response":
+        """POST /v1/background/tasks/{task_id}/follow-up — reply to a background agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = str(request.match_info.get("task_id") or "").strip()
+        if not task_id.startswith("bg_"):
+            return web.json_response(_openai_error("Invalid background task id"), status=400)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        message = str(body.get("message") or "").strip()
+        if not message:
+            return web.json_response(_openai_error("Follow-up message required"), status=400)
+
+        parent_session_id = str(body.get("session_id") or "").strip()
+        if not parent_session_id:
+            parent_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not parent_session_id:
+            return web.json_response(_openai_error("session_id is required"), status=400)
+
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        preview = message[:80] + ("..." if len(message) > 80 else "")
+        agent = self._active_run_agents.get(task_id)
+        if agent is not None and hasattr(agent, "steer"):
+            try:
+                if agent.steer(message):
+                    event = self._persist_subagent_event(
+                        {
+                            "event": "subagent.progress",
+                            "subagent_id": task_id,
+                            "run_id": task_id,
+                            "runtime": "background",
+                            "status": "running",
+                            "message": "Follow-up steered",
+                            "preview": preview,
+                            "timestamp": time.time(),
+                        },
+                        session_id=parent_session_id,
+                    )
+                    return web.json_response({
+                        "ok": True,
+                        "task_id": task_id,
+                        "mode": "steer",
+                        "message": "Follow-up queued for the running background agent.",
+                        "event": event,
+                    })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("background follow-up steer failed for %s: %s", task_id, exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return web.json_response(
+                _openai_error("Background follow-up requires an active API server loop."),
+                status=503,
+            )
+
+        task = loop.create_task(
+            self._run_api_background_task(
+                parent_session_id=parent_session_id,
+                prompt=message,
+                task_id=task_id,
+                gateway_session_key=gateway_session_key,
+                is_follow_up=True,
+            )
+        )
+        try:
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except Exception:  # noqa: BLE001
+            pass
+
+        return web.json_response({
+            "ok": True,
+            "task_id": task_id,
+            "mode": "continue",
+            "message": "Follow-up sent to the background agent.",
+        })
 
     def _execute_api_slash_command(
         self, command_text: str, session_id: str, gateway_session_key: str = None
@@ -3060,6 +3815,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 status=400,
             )
 
+        project_overlay = build_chat_project_context_overlay(body)
+        if project_overlay:
+            system_prompt = (
+                f"{system_prompt}\n\n{project_overlay}"
+                if system_prompt
+                else project_overlay
+            )
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -3170,16 +3933,13 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             # (e.g. internal/filtered tools) is silently dropped instead of
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
-            _legacy_started_tools: set[str] = set()
-            _legacy_completed_tools: set[str] = set()
-
             def _on_tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
-                """Bridge legacy tool progress into chat-completions SSE.
+                """Bridge non-tool progress into chat-completions SSE.
 
-                Hermes still emits some user-visible tool activity through the
-                legacy progress callback before structured tool callbacks fire.
-                Prefer this path for display labels, then suppress the later
-                structured duplicate for the same tool name.
+                Tool start/complete use structured callbacks so clients receive
+                correlated ``toolCallId`` payloads (and todo arguments/results).
+                Legacy ``tool.started`` / ``tool.completed`` events must not be
+                mirrored here — they previously suppressed the structured pair.
                 """
                 if str(event_type).startswith("subagent."):
                     event = self._subagent_event_payload(
@@ -3196,23 +3956,6 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if event_type == "reasoning.available" and preview:
                     _stream_q.put(("__reasoning_delta__", {"text": preview}))
                     return
-                if not tool_name or str(tool_name).startswith("_"):
-                    return
-                if event_type == "tool.started":
-                    _legacy_started_tools.add(tool_name)
-                    from agent.display import get_tool_emoji
-                    _stream_q.put(("__tool_progress__", {
-                        "tool": tool_name,
-                        "emoji": get_tool_emoji(tool_name),
-                        "label": preview or tool_name,
-                        "status": "running",
-                    }))
-                elif event_type == "tool.completed":
-                    _legacy_completed_tools.add(tool_name)
-                    _stream_q.put(("__tool_progress__", {
-                        "tool": tool_name,
-                        "status": "failed" if kwargs.get("is_error") else "completed",
-                    }))
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Emit ``hermes.tool.progress`` with ``status: running``.
@@ -3230,17 +3973,21 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
-                if function_name in _legacy_started_tools:
-                    return
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                progress_payload = {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                }
+                if function_name == "todo" and function_args:
+                    try:
+                        progress_payload["arguments"] = json.dumps(function_args)
+                    except Exception:
+                        pass
+                _stream_q.put(("__tool_progress__", progress_payload))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -3252,13 +3999,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                if function_name in _legacy_completed_tools:
-                    return
-                _stream_q.put(("__tool_progress__", {
+                progress_payload = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
-                }))
+                }
+                if function_name == "todo" and function_result:
+                    progress_payload["result"] = function_result
+                _stream_q.put(("__tool_progress__", progress_payload))
 
             def _on_context_usage(payload: Dict[str, Any]) -> None:
                 if payload:
@@ -3476,6 +4224,17 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            # Tracks whether any assistant *text* content was streamed as
+            # ``delta.content`` chunks.  Reasoning deltas, tool progress, and
+            # other tagged events do NOT count.  When this stays False for the
+            # whole turn (e.g. the Codex Responses/app-server runtimes deliver
+            # the answer via a completed message item rather than
+            # ``output_text.delta`` events), we fall back to emitting the
+            # agent's ``final_response`` so the client renders something
+            # instead of an empty assistant turn.  See the non-streaming path
+            # which already returns ``final_response`` directly.
+            streamed_text_content = {"value": False}
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -3514,6 +4273,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                         f"event: {event_name}\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    if item:
+                        streamed_text_content["value"] = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -3552,6 +4313,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             finish_reason = "stop"
+            goal_status_payload = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
@@ -3581,13 +4343,52 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     }
                     await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
                 else:
+                    # Fallback: some runtimes (Codex Responses / app-server)
+                    # deliver the assistant answer as a completed message item
+                    # rather than ``output_text.delta`` events, so nothing was
+                    # streamed as ``delta.content`` even though the turn
+                    # succeeded.  Emit ``final_response`` now so the client
+                    # renders the answer instead of an empty assistant turn
+                    # (which makes the live reasoning panel vanish with no
+                    # replacement).
+                    final_response_text = (
+                        result.get("final_response", "") if isinstance(result, dict) else ""
+                    )
+                    if final_response_text and not streamed_text_content["value"]:
+                        fallback_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": final_response_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        await response.write(
+                            f"data: {json.dumps(fallback_chunk)}\n\n".encode()
+                        )
+                        streamed_text_content["value"] = True
                     self._set_run_status(
                         completion_id,
                         "completed",
-                        output=(result.get("final_response", "") if isinstance(result, dict) else ""),
+                        output=final_response_text,
                         usage=usage,
                         last_event="run.completed",
                     )
+                    if session_id and isinstance(result, dict) and not result.get("failed"):
+                        final_for_judge = (
+                            final_response_text
+                            or result.get("final_response")
+                            or ""
+                        )
+                        goal_status_payload = self._evaluate_session_goal_after_turn(
+                            session_id,
+                            final_for_judge,
+                        )
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
                 finish_reason = "error"
@@ -3614,6 +4415,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     ],
                 }
                 await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+
+            if goal_status_payload:
+                try:
+                    await response.write(
+                        f"event: hermes.goal.status\ndata: {json.dumps(goal_status_payload)}\n\n".encode()
+                    )
+                except Exception:
+                    logger.debug("Failed to emit goal status SSE event", exc_info=True)
 
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
@@ -6575,7 +7384,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         latest = store.latest_event_for_ao_session(source_session_id) if store else None
         prior_summary = (latest or {}).get("summary") or (latest or {}).get("message") or (latest or {}).get("preview")
         instruction = str(body.get("instruction") or "").strip()
-        project_id = str(body.get("project_id") or prompt_meta.get("project_id") or "OrynWorkspace")
+        project_id = resolve_project_id(body.get("project_id"), prompt_meta.get("project_id"))
         agent = body.get("agent") or prompt_meta.get("agent")
         model = body.get("model") or prompt_meta.get("model")
         reasoning_effort = body.get("reasoning_effort") or prompt_meta.get("reasoning_effort")
@@ -6837,6 +7646,63 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject guidance into a live run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            body = {}
+
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return web.json_response(_openai_error("'text' is required"), status=400)
+
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(
+                _openai_error(
+                    f"Run not found or not steerable: {run_id}",
+                    code="run_not_found",
+                ),
+                status=404,
+            )
+
+        if not hasattr(agent, "steer"):
+            return web.json_response(
+                _openai_error(
+                    "Active run does not support steer",
+                    code="steer_unsupported",
+                ),
+                status=409,
+            )
+
+        try:
+            accepted = bool(agent.steer(text))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("steer failed for run %s: %s", run_id, exc)
+            return web.json_response(
+                _openai_error(f"Steer failed: {exc}", code="steer_failed"),
+                status=500,
+            )
+
+        preview = text[:80] + ("..." if len(text) > 80 else "")
+        return web.json_response({
+            "object": "hermes.run.steer_result",
+            "run_id": run_id,
+            "status": "queued" if accepted else "rejected",
+            "text": text,
+            "message": (
+                f"Steer queued — arrives after the next tool call: {preview}"
+                if accepted
+                else "Steer rejected"
+            ),
+        })
+
     async def _handle_ao_session_stop(self, request: "web.Request") -> "web.Response":
         """POST /v1/ao/sessions/{session_id}/stop — stop an AO worker session."""
         auth_err = self._check_auth(request)
@@ -6997,7 +7863,14 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "/v1/providers/openrouter/models",
                 self._handle_openrouter_models,
             )
+            self._app.router.add_get(
+                "/v1/providers/codex/models",
+                self._handle_codex_models,
+            )
+            self._app.router.add_get("/v1/sessions/{session_id}/model", self._handle_get_session_model)
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
+            self._app.router.add_get("/v1/sessions/{session_id}/goal", self._handle_get_session_goal)
+            self._app.router.add_post("/v1/sessions/{session_id}/goal", self._handle_post_session_goal)
             self._app.router.add_get("/v1/sessions", self._handle_v1_list_sessions)
             self._app.router.add_get("/v1/sessions/{session_id}", self._handle_v1_get_session)
             self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_v1_get_session_messages)
@@ -7044,6 +7917,11 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             register_dev_control_routes(self._app, self)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/steer", self._handle_steer_run)
+            self._app.router.add_post(
+                "/v1/background/tasks/{task_id}/follow-up",
+                self._handle_background_task_follow_up,
+            )
             self._app.router.add_get("/v1/ao/sessions", self._handle_ao_sessions)
             self._app.router.add_get("/v1/ao/sessions/{session_id}", self._handle_ao_session_detail)
             # Store the adapter after native routes are registered. Local Hermes-Relay

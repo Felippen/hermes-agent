@@ -7,6 +7,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.dev_control.scm_lifecycle import (
     DevSCMLifecycleStore,
+    build_code_review_prompt,
     compose_merge_readiness,
     execute_merge,
     fetch_pr_state,
@@ -115,6 +116,93 @@ def test_code_review_result_parser_normalizes_structured_worker_output():
     assert parsed["verdict"] == "changes_requested"
     assert parsed["findings"][0]["file"] == "Sources/App.swift"
     assert parsed["evidence_refs"] == ["diff:Sources/App.swift:12"]
+
+
+def test_code_review_prompt_forces_direct_diff_review_only():
+    prompt = build_code_review_prompt(
+        plan={
+            "title": "Docs plan",
+            "tasks": [{"acceptance_criteria": ["Docs note exists."]}],
+        },
+        pr_state={
+            "repo": "Felippen/hermes-agent",
+            "pr_number": 26,
+            "pr_url": "https://github.com/Felippen/hermes-agent/pull/26",
+            "head_sha": "abc123",
+        },
+    )
+
+    assert "Perform a direct PR diff review only" in prompt
+    assert "gh pr view 26 --repo Felippen/hermes-agent" in prompt
+    assert "gh pr diff 26 --repo Felippen/hermes-agent --name-only" in prompt
+    assert "gh pr diff 26 --repo Felippen/hermes-agent --patch" in prompt
+    assert "Do not run slash commands such as /review" in prompt
+    assert "Do not run CodeRabbit, coderabbit" in prompt
+    assert "Do not start background tools" in prompt
+
+
+def test_code_review_result_parser_recovers_unfenced_worker_json():
+    parsed = parse_code_review_result(
+        """
+        Reviewed the PR. No findings.
+
+        {
+          "object": "hermes.dev_code_review_result",
+          "verdict": "approved",
+          "findings": [],
+          "summary": "Review approved.",
+          "evidence_refs": ["diff:docs/lab.md:1"]
+        }
+        """
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"] == "Review approved."
+    assert parsed["evidence_refs"] == ["diff:docs/lab.md:1"]
+    assert "recovered review JSON" in " ".join(parsed["warnings"])
+
+
+def test_code_review_result_parser_recovers_wrapped_unfenced_worker_json():
+    parsed = parse_code_review_result(
+        '''
+        {
+          "object": "hermes.dev_code_review_result",
+          "verdict": "approved",
+          "findings": [],
+          "summary": "Using the draft PR diff as the evidence source, PR #23 satisfies
+          the docs criterion.",
+          "evidence_refs": [
+            "Felippen/hermes-agent#23",
+            "PR diff: docs/lab-dogfood.md:1"
+          ]
+        }
+        '''
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"].startswith("Using the draft PR diff")
+    assert parsed["evidence_refs"] == ["Felippen/hermes-agent#23", "PR diff: docs/lab-dogfood.md:1"]
+
+
+def test_code_review_result_parser_recovers_marker_key_wrapped_json():
+    parsed = parse_code_review_result(
+        """
+        {
+          "hermes.dev_code_review_result": {
+            "verdict": "approved",
+            "findings": [],
+            "summary": "PR #30 was inspected using only gh pr view/diff.",
+            "evidence_refs": [
+              {"source": "gh pr diff 30 --repo Felippen/hermes-agent --patch"}
+            ]
+          }
+        }
+        """
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"].startswith("PR #30")
+    assert parsed["evidence_refs"][0]["source"].startswith("gh pr diff 30")
 
 
 @pytest.mark.parametrize(

@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gateway.dev_control.production_signals import DevProductionSignalStore, run_signal_digest  # noqa: E402
+from gateway.dev_control.product_events import DevProductEventStore  # noqa: E402
+from gateway.dev_control.production_signals import DevProductionSignalStore, run_signal_digest_sources  # noqa: E402
+from gateway.dev_control.reliability import DevReliabilityStore  # noqa: E402
+from gateway.dev_execution import DevExecutionStore  # noqa: E402
 from gateway.subagent_events import SubagentEventStore  # noqa: E402
 from hermes_state import DEFAULT_DB_PATH  # noqa: E402
 
@@ -22,7 +25,11 @@ from hermes_state import DEFAULT_DB_PATH  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the advisory Dev production-signal digest.")
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH))
-    parser.add_argument("--source", choices=("deterministic", "laminar"), default=os.getenv("HERMES_DEV_SIGNAL_SOURCE", "deterministic"))
+    parser.add_argument(
+        "--sources",
+        default=os.getenv("HERMES_DEV_SIGNAL_DIGEST_SOURCES", "deterministic,product,reliability"),
+        help="Comma-separated signal sources to run. Defaults to deterministic,product,reliability.",
+    )
     parser.add_argument("--window-days", type=float, default=None)
     parser.add_argument("--project-id", default=None)
     parser.add_argument("--lock-path", default=os.getenv("HERMES_DEV_SIGNAL_DIGEST_LOCK", "/tmp/hermes_dev_signal_digest.lock"))
@@ -41,11 +48,18 @@ def main() -> int:
         db_path = Path(args.db_path)
         signal_store = DevProductionSignalStore(db_path)
         event_store = SubagentEventStore(db_path)
+        product_event_store = DevProductEventStore(db_path)
+        reliability_store = DevReliabilityStore(db_path)
+        execution_store = DevExecutionStore(db_path)
         filters = {"project_id": args.project_id} if args.project_id else {}
-        result = run_signal_digest(
+        sources = [source.strip() for source in str(args.sources or "").split(",") if source.strip()]
+        result = run_signal_digest_sources(
             signal_store=signal_store,
             event_store=event_store,
-            source=args.source,
+            product_event_store=product_event_store,
+            reliability_store=reliability_store,
+            execution_store=execution_store,
+            sources=sources,
             window_days=args.window_days,
             filters=filters,
             persist=True,

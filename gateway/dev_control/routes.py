@@ -78,6 +78,7 @@ from gateway.dev_control.incidents import (
     detect_incidents,
     resolve_incident,
 )
+from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health
 from gateway.dev_control.plan_artifacts import (
     DevPlanArtifactStore,
     approve_execution_plan_draft,
@@ -93,6 +94,7 @@ from gateway.dev_control.plan_artifacts import (
     revise_execution_plan_draft,
     revise_plan_artifact,
 )
+from gateway.dev_control.project_scope import project_id_from_payload, resolve_project_id
 from gateway.dev_control.product_events import DevProductEventStore
 from gateway.dev_control.production_signals import (
     DevProductionSignalStore,
@@ -234,6 +236,7 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_reliability_recompute": {"method": "POST", "path": "/v1/dev/reliability/recompute"},
         "dev_reliability_weakest": {"method": "GET", "path": "/v1/dev/reliability/weakest"},
         "dev_reliability_category": {"method": "GET", "path": "/v1/dev/reliability/{category}"},
+        "dev_lab_loop_health": {"method": "GET", "path": "/v1/dev/lab-loop/health"},
     }
 
 
@@ -297,6 +300,7 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/reliability/recompute", adapter._handle_dev_reliability_recompute)
     app.router.add_get("/v1/dev/reliability/weakest", adapter._handle_dev_reliability_weakest)
     app.router.add_get("/v1/dev/reliability/{category:.+}", adapter._handle_dev_reliability_category)
+    app.router.add_get("/v1/dev/lab-loop/health", adapter._handle_dev_lab_loop_health)
     app.router.add_post("/v1/dev/execution-plans/supervise", adapter._handle_dev_execution_plans_supervise)
     app.router.add_get("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
     app.router.add_post("/v1/dev/supervisor/loop", adapter._handle_dev_supervisor_loop)
@@ -354,6 +358,7 @@ class DevControlRouteMixin:
         incident_store = self._ensure_dev_incident_store()
         scm_store = self._ensure_dev_scm_store()
         reliability_store = self._ensure_dev_reliability_store()
+        lab_loop_store = self._ensure_dev_lab_loop_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
@@ -452,6 +457,7 @@ class DevControlRouteMixin:
                 "dev_incidents": (incident_store.list_incidents(limit=5) if incident_store else []),
                 "dev_merge_readiness": (scm_store.latest_readiness(limit=5) if scm_store else []),
                 "dev_reliability": (reliability_scorecard(reliability_store.list_outcomes(limit=500)) if reliability_store else None),
+                "dev_lab_loop_health": (loop_health(db_path=lab_loop_store.db_path) if lab_loop_store else None),
             }
 
         cached = await self._read_model_cache.get_or_compute(
@@ -628,6 +634,20 @@ class DevControlRouteMixin:
             return None
         return self._dev_reliability_store
 
+    def _ensure_dev_lab_loop_store(self) -> Optional[DevLabLoopStore]:
+        """Create the Dev Lab loop store on the same state.db as execution plans."""
+        if getattr(self, "_dev_lab_loop_store", None) is not None:
+            return self._dev_lab_loop_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_lab_loop_store = DevLabLoopStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev Lab loop store unavailable: %s", exc)
+            return None
+        return self._dev_lab_loop_store
+
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
         auth_err = self._check_auth(request)
@@ -653,7 +673,7 @@ class DevControlRouteMixin:
             result = start_clarification(
                 store=store,
                 vision_brief=body.get("vision_brief") or body.get("brief") or "",
-                project_id=body.get("project_id") or "OrynWorkspace",
+                project_id=project_id_from_payload(body),
                 session_id=body.get("session_id"),
                 project_context=body.get("project_context"),
                 max_questions=body.get("max_questions") or 5,
@@ -1113,7 +1133,7 @@ class DevControlRouteMixin:
                 cases=body.get("cases"),
                 mode=body.get("mode"),
                 live=_coerce_request_bool(body.get("live"), default=False),
-                project_id=body.get("project_id") or "OrynWorkspace",
+                project_id=resolve_project_id(body.get("project_id")),
                 max_cases=body.get("max_cases") or 3,
                 iterations=body.get("iterations") or 1,
                 timeout_seconds=body.get("timeout_seconds") or 180,
@@ -1828,6 +1848,7 @@ class DevControlRouteMixin:
                     signal_store=signal_store,
                     event_store=event_store,
                     product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    reliability_store=self._ensure_dev_reliability_store() if str(body.get("source") or "").lower() == "reliability" else None,
                     source=body.get("source") or "deterministic",
                     window_days=body.get("window_days"),
                     filters=body.get("filters") if isinstance(body.get("filters"), dict) else {},
@@ -1838,6 +1859,7 @@ class DevControlRouteMixin:
                     signal_store=signal_store,
                     event_store=event_store,
                     product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    reliability_store=self._ensure_dev_reliability_store() if str(body.get("source") or "").lower() == "reliability" else None,
                     source=body.get("source") or "deterministic",
                     window_days=body.get("window_days"),
                     filters=body.get("filters") if isinstance(body.get("filters"), dict) else {},
@@ -2268,6 +2290,7 @@ class DevControlRouteMixin:
                     signal_store=signal_store,
                     event_store=event_store,
                     product_event_store=self._ensure_dev_product_event_store() if str(body.get("source") or "").lower() == "product" else None,
+                    reliability_store=self._ensure_dev_reliability_store() if str(body.get("source") or "").lower() == "reliability" else None,
                     proposal_id=request.match_info["proposal_id"],
                     window_days=body.get("window_days"),
                     source=body.get("source") or "deterministic",
@@ -2390,6 +2413,16 @@ class DevControlRouteMixin:
             "outcomes": outcomes,
             "measurements": reliability_store.list_improvement_measurements(category=category),
         })
+
+    async def _handle_dev_lab_loop_health(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/lab-loop/health — advisory lab observe-loop health."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        loop_store = self._ensure_dev_lab_loop_store()
+        if loop_store is None:
+            return web.json_response(_openai_error("Dev Lab loop store unavailable"), status=503)
+        return web.json_response(loop_health(db_path=loop_store.db_path))
 
     async def _run_dev_supervisor_loop(self) -> None:
         """Run the project-opt-in Dev supervisor loop while the gateway is alive."""

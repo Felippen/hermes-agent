@@ -7,6 +7,7 @@ from gateway.dev_control.acceptance_verification import (
     allowlisted_command,
     classify_acceptance_criteria,
     launch_verification_run,
+    parse_transcript_verification_results,
     parse_verification_results,
     reconcile_results,
     refresh_verification_run,
@@ -244,6 +245,423 @@ def test_verification_reconciles_when_runtime_terminal_even_with_nonterminal_eve
     assert refreshed["verdict"] == "verified"
 
 
+def test_verification_refresh_recovers_transcript_before_runtime_terminal(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    bridge = FakeBridge()
+    criteria = acceptance_criteria_to_strings([{
+        "statement": "The verification command runs.",
+        "verification_method": "test",
+        "verification_detail": "make test",
+        "machine_checkable": True,
+    }])
+    plan = execution_store.create_plan(
+        title="Running verification transcript recovery",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Implemented task",
+            "prompt": "Do the implementation.",
+            "profile_id": "workspace.implement",
+            "project_id": "OrynWorkspace",
+            "permissions": "edit",
+            "acceptance_criteria": criteria,
+        }],
+    )
+    task_id = plan["tasks"][0]["task_id"]
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        state="completed_ok",
+        event_store=event_store,
+        ao_session_id="implemented-session",
+    )
+    run = launch_verification_run(
+        execution_store=execution_store,
+        verification_store=verification_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        bridge=bridge,
+        event_store=event_store,
+    )
+    session = bridge.sessions[run["verification_session_id"]]
+    session.status = "running"
+    bridge.outputs[session.id] = "\n".join([
+        "Final output is mandatory: return this template:",
+        "```json DEV_VERIFICATION_RESULTS",
+        '{"object":"hermes.dev_verification_results","results":[{"criterion_id":"crit-1","command_run":"make test","exit_code":0,"output_excerpt":"include the real test/build summary line","notes":""}]}',
+        "```",
+        "Ran make test",
+        "1 failed in 0.1s",
+        "make test exited with code 1.",
+    ])
+
+    refreshed = refresh_verification_run(
+        verification_store=verification_store,
+        verification_run_id=run["verification_run_id"],
+        event_store=event_store,
+        bridge=bridge,
+    )
+    assert refreshed["status"] == "completed"
+    assert refreshed["verdict"] == "failed"
+    assert refreshed["counts"]["failed"] == 1
+    assert refreshed["results"][0]["exit_code"] == 1
+
+
+def test_verification_recovers_wrapped_command_from_criterion_exit_line():
+    transcript = """
+Verification completed. crit-1 exited 0; summary line confirms 22 tests
+passed.
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/
+test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0%
+complete) in 3.7s (28 workers) ===",
+      "notes": ""
+    }
+  ]
+}
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "22 tests" in parsed["results"][0]["output_excerpt"]
+
+
+def test_verification_recovers_successful_exit_code_phrase():
+    transcript = """
+• Ran scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+• Verification completed. The allowed command exited successfully with code 0.
+
+=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 3.0s (28 workers) ===
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "22 tests passed" in parsed["results"][0]["output_excerpt"]
+
+
+def test_verification_transcript_recovery_skips_prompt_template_and_reads_json_exit_code():
+    transcript = """
+Allowed commands:
+- crit-1: scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+
+Final output is mandatory. Set exit_code to the real process exit code.
+```json DEV_VERIFICATION_RESULTS
+{"object":"hermes.dev_verification_results","results":[{"criterion_id":"crit-1","command_run":"scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q","exit_code":0,"output_excerpt":"include the real test/build summary line","notes":""}]}
+```
+
+• Ran scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+  └ error: no virtualenv found in /Users/felipelamartine/.oryn-lab/.worktrees/
+    HermesAgentLab/lab-hermes-agent-90/.venv or /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/venv
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/
+test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 1,
+      "output_excerpt": "error: no virtualenv found in /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/.venv or /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/venv",
+      "notes": ""
+    }
+  ]
+}
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 1
+    assert "no virtualenv found" in parsed["results"][0]["output_excerpt"]
+
+
+def test_verification_unfenced_parser_prefers_latest_results_object():
+    transcript = """
+{
+  "object": "hermes.dev_verification_results",
+  "results": [{
+    "criterion_id": "crit-1",
+    "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+    "cwd": ".",
+    "exit_code": 0,
+    "output_excerpt": "include the real test/build summary line",
+    "notes": ""
+  }]
+}
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [{
+    "criterion_id": "crit-1",
+    "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+    "cwd": ".",
+    "exit_code": 0,
+    "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 3.0s (28 workers) ===",
+    "notes": ""
+  }]
+}
+"""
+
+    parsed = parse_verification_results(transcript)
+
+    assert parsed["results"][0]["exit_code"] == 0
+    assert "include the real" not in parsed["results"][0]["output_excerpt"]
+
+
+def test_refresh_prefers_codex_final_message_over_terminal_ui_transcript(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    verification_store = DevVerificationStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    bridge = FakeBridge()
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    session = AOSession(
+        id="verify-codex-session",
+        status="completed",
+        workspace_path=str(workspace),
+        branch="verify/codex-final",
+        agent="codex",
+        model="gpt-5.5",
+    )
+    bridge.sessions[session.id] = session
+    executable = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+        "cwd": ".",
+        "relative_cwd": ".",
+    }]
+    seed_results = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "verification_detail": executable[0]["command"],
+        "machine_checkable": True,
+        "status": "pending",
+        "passed": None,
+        "warnings": [],
+    }]
+    run = verification_store.create_run(
+        plan_id="plan",
+        task_id="task",
+        target_type="task",
+        status="launched",
+        results=seed_results,
+        executable_commands=executable,
+        verified_against={"workspace_path": str(workspace)},
+        verification_session_id=session.id,
+        verification_runtime="ao",
+        worker_launch_profile_id="workspace.test",
+    )
+    bridge.outputs[session.id] = """
+```json DEV_VERIFICATION_RESULTS
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "2.87s  tests/gateway/test_api_server_runs.py
+• Working (8s • esc to interrupt)",
+      "notes": ""
+    }
+  ]
+}
+```
+"""
+    codex_home = tmp_path / ".codex"
+    sessions_dir = codex_home / "sessions" / "2026" / "05" / "30"
+    sessions_dir.mkdir(parents=True)
+    final_message = (
+        "Verification command completed with exit code 0.\n\n"
+        "```json DEV_VERIFICATION_RESULTS\n"
+        + json.dumps({
+            "object": "hermes.dev_verification_results",
+            "results": [{
+                "criterion_id": "crit-1",
+                "command_run": executable[0]["command"],
+                "cwd": ".",
+                "exit_code": 0,
+                "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 2.9s (28 workers) ===",
+                "notes": "",
+            }],
+        }, indent=2)
+        + "\n```"
+    )
+    session_file = sessions_dir / "rollout-2026-05-30T10-10-30-test.jsonl"
+    session_file.write_text(
+        "\n".join([
+            json.dumps({"type": "session_meta", "payload": {"id": "codex-jsonl-session", "cwd": str(workspace)}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": final_message, "completed_at": time.time()}}),
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_DEV_VERIFICATION_CODEX_HOME", str(codex_home))
+    event_store.append_event({
+        "event": "subagent.complete",
+        "subagent_id": f"ao:{session.id}",
+        "ao_session_id": session.id,
+        "status": "completed",
+        "summary": "Verification session completed.",
+    })
+
+    refreshed = refresh_verification_run(
+        verification_store=verification_store,
+        verification_run_id=run["verification_run_id"],
+        event_store=event_store,
+        bridge=bridge,
+    )
+
+    assert refreshed["status"] == "completed"
+    assert refreshed["verdict"] == "verified"
+    assert refreshed["warnings"] == []
+    assert refreshed["results"][0]["output_excerpt"].startswith("=== Summary: 1 files")
+    assert "Working" not in refreshed["results"][0]["output_excerpt"]
+
+
+def test_refresh_falls_back_to_codex_final_message_by_ao_session_id(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    verification_store = DevVerificationStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    bridge = FakeBridge()
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    session = AOSession(
+        id="verify-ao-session-id-only",
+        status="completed",
+        workspace_path="",
+        branch="verify/codex-final",
+        agent="codex",
+        model="gpt-5.5",
+    )
+    bridge.sessions[session.id] = session
+    executable = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+        "cwd": ".",
+        "relative_cwd": ".",
+    }]
+    seed_results = [{
+        "criterion_id": "crit-1",
+        "statement": "Smoke tests pass.",
+        "verification_method": "test",
+        "verification_detail": executable[0]["command"],
+        "machine_checkable": True,
+        "status": "pending",
+        "passed": None,
+        "warnings": [],
+    }]
+    run = verification_store.create_run(
+        plan_id="plan",
+        task_id="task",
+        target_type="task",
+        status="launched",
+        results=seed_results,
+        executable_commands=executable,
+        verified_against={"workspace_path": str(workspace)},
+        verification_session_id=session.id,
+        verification_runtime="ao",
+        worker_launch_profile_id="workspace.test",
+    )
+    bridge.outputs[session.id] = """
+```json DEV_VERIFICATION_RESULTS
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "2.87s  tests/gateway/test_api_server_runs.py
+• Working (8s • esc to interrupt)",
+      "notes": ""
+    }
+  ]
+}
+```
+"""
+    codex_home = tmp_path / ".codex"
+    sessions_dir = codex_home / "sessions" / "2026" / "05" / "30"
+    sessions_dir.mkdir(parents=True)
+    final_message = (
+        f"AO verification session {session.id} completed with exit code 0.\n\n"
+        "```json DEV_VERIFICATION_RESULTS\n"
+        + json.dumps({
+            "object": "hermes.dev_verification_results",
+            "results": [{
+                "criterion_id": "crit-1",
+                "command_run": executable[0]["command"],
+                "cwd": ".",
+                "exit_code": 0,
+                "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed (0% complete) in 2.9s (28 workers) ===",
+                "notes": "",
+            }],
+        }, indent=2)
+        + "\n```"
+    )
+    session_file = sessions_dir / "rollout-2026-05-30T10-11-30-test.jsonl"
+    session_file.write_text(
+        "\n".join([
+            json.dumps({"type": "session_meta", "payload": {"id": "codex-jsonl-session", "cwd": str(tmp_path / "other-worktree")}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "message", "message": f"tracking {session.id}"}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": final_message, "completed_at": time.time()}}),
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_DEV_VERIFICATION_CODEX_HOME", str(codex_home))
+    event_store.append_event({
+        "event": "subagent.complete",
+        "subagent_id": f"ao:{session.id}",
+        "ao_session_id": session.id,
+        "status": "completed",
+        "summary": "Verification session completed.",
+    })
+
+    refreshed = refresh_verification_run(
+        verification_store=verification_store,
+        verification_run_id=run["verification_run_id"],
+        event_store=event_store,
+        bridge=bridge,
+    )
+
+    assert refreshed["status"] == "completed"
+    assert refreshed["verdict"] == "verified"
+    assert refreshed["warnings"] == []
+    assert refreshed["results"][0]["output_excerpt"].startswith("=== Summary: 1 files")
+    assert "Working" not in refreshed["results"][0]["output_excerpt"]
+
+
 def test_verification_recovers_missing_fence_and_classifies_unrunnable_as_error(tmp_path):
     db_path = tmp_path / "state.db"
     execution_store = DevExecutionStore(db_path)
@@ -452,6 +870,9 @@ def test_verification_launch_uses_verify_profile_and_refreshes_from_worker_outpu
     assert "apps/oryn-workspace" in bridge.spawned[0]["kwargs"]["prompt"]
     assert "/Users/" not in bridge.spawned[0]["kwargs"]["prompt"]
     assert "Do not edit source files" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "valid JSON" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "Do not paste raw multi-line command output inside a JSON string" in bridge.spawned[0]["kwargs"]["prompt"]
+    assert "escape any newline as \\n" in bridge.spawned[0]["kwargs"]["prompt"]
     prompt_meta = event_store.get_ao_prompt(run["verification_session_id"])
     assert prompt_meta["permissions"] == "verify"
     assert prompt_meta["launch_profile_id"] == "workspace.test"

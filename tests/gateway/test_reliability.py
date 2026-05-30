@@ -5,6 +5,7 @@ from gateway.dev_control.reliability import (
     ReliabilityConfig,
     classify_trust_tier,
     compose_task_outcome,
+    normalize_outcome,
     measure_category_improvement,
     scorecard,
     weakest_categories,
@@ -118,6 +119,68 @@ def test_tier_gating_unproven_for_insufficient_samples_and_escape_demotes():
     tier, reasons = classify_trust_tier(escaped, config=_config())
     assert tier == "unproven"
     assert "escape" in reasons[0]
+
+
+def test_draft_pr_only_success_excludes_unmeasured_ci_and_review():
+    outcome = normalize_outcome({
+        "plan_id": "lab-plan",
+        "task_id": "lab-task",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "unknown",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "gates": {"ci": "not_measured", "review": "not_measured"},
+        },
+    })
+
+    assert outcome["success"] is True
+
+
+def test_draft_pr_only_success_fails_when_measured_gate_is_red():
+    ci_failed = normalize_outcome({
+        "plan_id": "lab-plan-ci",
+        "task_id": "lab-task-ci",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "failure",
+        "code_review_verdict": "unknown",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "gates": {"ci": "failure", "review": "not_measured"},
+        },
+    })
+    review_failed = normalize_outcome({
+        "plan_id": "lab-plan-review",
+        "task_id": "lab-task-review",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "unknown",
+        "code_review_verdict": "changes_requested",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "gates": {"ci": "not_measured", "review": "changes_requested"},
+        },
+    })
+
+    assert ci_failed["success"] is False
+    assert review_failed["success"] is False
 
 
 def test_weakest_categories_and_before_after_measurement(tmp_path):
