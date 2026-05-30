@@ -22,6 +22,7 @@ from gateway.status import _pid_exists, terminate_pid
 DEFAULT_AO_CONFIG_PATH = "/Users/felipelamartine/projects/Oryn/agent-orchestrator.yaml"
 DEFAULT_AO_HOME = "/Users/felipelamartine"
 DEFAULT_CODEX_BIN = "/opt/homebrew/bin/codex"
+DEFAULT_AGENT = "codex"
 TERMINAL_STATUSES = {"done", "merged", "killed", "errored", "terminated"}
 FAILED_STATUSES = {"killed", "errored", "terminated"}
 
@@ -130,7 +131,7 @@ class AOBridge:
         minimal_worker_prompt: bool = False,
     ) -> AOSession:
         defaults = self._project_agent_defaults.get(project_id) or {}
-        resolved_agent = agent or defaults.get("agent")
+        resolved_agent = agent or defaults.get("agent") or DEFAULT_AGENT
         resolved_model = model or defaults.get("model")
         resolved_reasoning_effort = reasoning_effort or defaults.get("reasoning_effort")
         payload = self._call(
@@ -654,7 +655,7 @@ class AOBridge:
             return {}
 
         defaults = raw.get("defaults") or {}
-        default_agent = defaults.get("agent")
+        default_agent = defaults.get("agent") or DEFAULT_AGENT
         projects = raw.get("projects") or {}
         result: Dict[str, Dict[str, Optional[str]]] = {}
         for project_id, project in projects.items():
