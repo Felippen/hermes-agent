@@ -2398,7 +2398,15 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
             "status": "failed",
             "warnings": [f"Workspace path does not exist: {workspace}"],
         }
-    author = _normalize_lab_commit_author_for_ci(workspace)
+    branch_base = _prepare_lab_branch_base_for_publish(workspace, config.get("branch_base_ref"))
+    if branch_base.get("status") == "failed":
+        return {
+            "ready": False,
+            "status": "branch_base_failed",
+            "warnings": branch_base.get("warnings") or ["Lab branch base preparation failed."],
+            "branch_base": branch_base,
+        }
+    author = _normalize_lab_commit_author_for_ci(workspace, base_ref_name=branch_base.get("base_ref"))
     if author.get("status") == "failed":
         return {
             "ready": False,
@@ -2428,9 +2436,11 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
             "remote": remote,
             "branch": branch,
             "warnings": [
+                *(branch_base.get("warnings") or []),
                 *(author.get("warnings") or []),
                 push.get("stderr") or push.get("stdout") or "git push failed",
             ],
+            "branch_base": branch_base,
             "author": author,
         }
     pr = _run_command(
@@ -2461,9 +2471,11 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
             "branch": branch,
             "head": head,
             "warnings": [
+                *(branch_base.get("warnings") or []),
                 *(author.get("warnings") or []),
                 pr.get("stderr") or pr.get("stdout") or "gh pr create failed",
             ],
+            "branch_base": branch_base,
             "author": author,
         }
     head_sha = _git_head_sha(workspace)
@@ -2478,18 +2490,46 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
         "branch": branch,
         "head_sha": head_sha,
         "pr_url": pr_url,
-        "warnings": author.get("warnings") or [],
+        "warnings": [*(branch_base.get("warnings") or []), *(author.get("warnings") or [])],
+        "branch_base": branch_base,
         "author": author,
     }
 
 
-def _normalize_lab_commit_author_for_ci(workspace: Path) -> dict[str, Any]:
+def _prepare_lab_branch_base_for_publish(workspace: Path, base_ref: Any) -> dict[str, Any]:
+    """Rebase the lab task branch onto the active lab base before publishing."""
+
+    ref = str(base_ref or "").strip()
+    if not ref:
+        return {"status": "skipped", "base_ref": None, "warnings": []}
+    verify = _run_command(["git", "-C", str(workspace), "rev-parse", "--verify", f"{ref}^{{commit}}"], timeout=10)
+    if verify.get("returncode") != 0:
+        return {
+            "status": "failed",
+            "base_ref": ref,
+            "warnings": [verify.get("stderr") or verify.get("stdout") or f"Lab branch base ref not found: {ref}"],
+        }
+    ancestor = _run_command(["git", "-C", str(workspace), "merge-base", "--is-ancestor", ref, "HEAD"], timeout=10)
+    if ancestor.get("returncode") == 0:
+        return {"status": "already_based", "base_ref": ref, "warnings": []}
+    rebase = _run_command(["git", "-C", str(workspace), "rebase", ref], timeout=120)
+    if rebase.get("returncode") != 0:
+        return {
+            "status": "failed",
+            "base_ref": ref,
+            "warnings": [rebase.get("stderr") or rebase.get("stdout") or f"git rebase {ref} failed"],
+        }
+    return {"status": "rebased", "base_ref": ref, "warnings": []}
+
+
+def _normalize_lab_commit_author_for_ci(workspace: Path, *, base_ref_name: Any = None) -> dict[str, Any]:
     """Make lab-generated PR commits pass the upstream contributor-attribution check."""
 
     head_before = _git_head_sha(workspace)
     if not head_before:
         return {"status": "skipped", "reason": "missing_head", "changed": False, "warnings": []}
-    base_ref = _git_scalar(workspace, ["merge-base", "origin/main", "HEAD"])
+    configured_base_ref = str(base_ref_name or "").strip() or "origin/main"
+    base_ref = _git_scalar(workspace, ["merge-base", configured_base_ref, "HEAD"])
     previous_emails = (
         _git_lines(workspace, ["log", f"{base_ref}..HEAD", "--format=%ae"])
         if base_ref
@@ -2501,6 +2541,7 @@ def _normalize_lab_commit_author_for_ci(workspace: Path) -> dict[str, Any]:
         return {
             "status": "already_safe",
             "changed": False,
+            "base_ref": configured_base_ref,
             "previous_author_emails": previous_emails,
             "head_sha": head_before,
             "warnings": [],
@@ -2511,6 +2552,7 @@ def _normalize_lab_commit_author_for_ci(workspace: Path) -> dict[str, Any]:
         return {
             "status": "failed",
             "changed": False,
+            "base_ref": configured_base_ref,
             "previous_author_emails": previous_emails,
             "warnings": [f"Configured lab commit author email is not CI-safe: {email}"],
         }
@@ -2543,6 +2585,7 @@ def _normalize_lab_commit_author_for_ci(workspace: Path) -> dict[str, Any]:
         return {
             "status": "failed",
             "changed": False,
+            "base_ref": configured_base_ref,
             "previous_author_emails": previous_emails,
             "warnings": warnings,
         }
@@ -2550,6 +2593,7 @@ def _normalize_lab_commit_author_for_ci(workspace: Path) -> dict[str, Any]:
         "status": "normalized",
         "changed": True,
         "mode": mode,
+        "base_ref": configured_base_ref,
         "previous_author_emails": previous_emails,
         "unsafe_author_emails": unsafe_emails,
         "author_name": name,
@@ -2581,11 +2625,49 @@ def _lab_draft_pr_config(candidate: dict[str, Any]) -> dict[str, Any]:
     remote = str(payload.get("draft_pr_remote") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_REMOTE") or "").strip()
     base = str(payload.get("draft_pr_base") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_BASE") or "main").strip()
     head = str(payload.get("draft_pr_head") or os.getenv("HERMES_DEV_LAB_DRAFT_PR_HEAD") or "").strip()
+    branch_base_ref = str(
+        payload.get("branch_base_ref")
+        or payload.get("draft_pr_branch_base_ref")
+        or os.getenv("HERMES_DEV_LAB_BRANCH_BASE_REF")
+        or os.getenv("HERMES_DEV_LAB_DRAFT_PR_BRANCH_BASE_REF")
+        or _active_lab_project_base_ref(candidate)
+        or base
+    ).strip()
     if not repo:
         return {"enabled": False, "reason": "Lab draft PR repo is not configured."}
     if not remote:
         return {"enabled": False, "repo": repo, "reason": "Lab draft PR remote is not configured."}
-    return {"enabled": True, "repo": repo, "remote": remote, "base": base or "main", "head": head}
+    return {
+        "enabled": True,
+        "repo": repo,
+        "remote": remote,
+        "base": base or "main",
+        "head": head,
+        "branch_base_ref": branch_base_ref or base or "main",
+    }
+
+
+def _active_lab_project_base_ref(candidate: dict[str, Any]) -> str:
+    repo = _lab_project_repo_path(candidate)
+    if not repo or not repo.exists():
+        return ""
+    branch = _git_scalar(repo, ["branch", "--show-current"])
+    if branch and not branch.startswith("lab/dogfood/"):
+        return branch
+    return ""
+
+
+def _lab_project_repo_path(candidate: dict[str, Any]) -> Optional[Path]:
+    payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    if payload.get("project_repo_path"):
+        return Path(str(payload["project_repo_path"])).expanduser()
+    repos_dir = Path(lab_paths_from_env()["repos_dir"]).expanduser()
+    project_id = _lab_project_id(candidate)
+    if project_id == "HermesAgentLab":
+        return repos_dir / "hermes-agent"
+    if project_id in {"OrynPlatformLab", "OrynWorkspaceLab"}:
+        return repos_dir / "Oryn"
+    return None
 
 
 def _lab_terminal_status(

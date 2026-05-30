@@ -16,6 +16,7 @@ from gateway.dev_control.lab_loop import (
     _candidate_acceptance_criteria,
     _await_review_terminal,
     _normalize_lab_commit_author_for_ci,
+    _prepare_lab_branch_base_for_publish,
     _recover_lab_verification_from_transcript,
     _touched_paths_from_worktree,
     _verification_timeout_seconds,
@@ -1196,6 +1197,8 @@ def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_p
 
     def fake_run_command(args, *, timeout=30.0):
         commands.append(args)
+        if args[:6] == ["git", "-C", str(Path(args[2])), "merge-base", "--is-ancestor", "codex/fixed-lab-base"]:
+            return {"returncode": 1, "stdout": "", "stderr": ""}
         if args[:2] == ["gh", "pr"]:
             return {"returncode": 0, "stdout": "https://github.com/Felippen/Oryn/pull/123\n", "stderr": ""}
         return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -1216,6 +1219,7 @@ def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_p
             "ci_repo": "Felippen/Oryn",
             "draft_pr_remote": "lab-origin",
             "draft_pr_base": "main",
+            "branch_base_ref": "codex/fixed-lab-base",
             "verification_results": [{
                 "criterion_id": "crit-1",
                 "status": "passed",
@@ -1238,8 +1242,67 @@ def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_p
     assert artifact["type"] == "draft_pr"
     assert artifact["pr_url"] == "https://github.com/Felippen/Oryn/pull/123"
     assert artifact["publish"]["status"] == "created"
+    assert artifact["publish"]["branch_base"]["base_ref"] == "codex/fixed-lab-base"
     assert any(command[:4] == ["git", "-C", str(Path(report["execution"]["workspace_path"])), "push"] for command in commands)
+    assert any(command[:4] == ["git", "-C", str(Path(report["execution"]["workspace_path"])), "rebase"] and command[-1] == "codex/fixed-lab-base" for command in commands)
     assert any(command[:3] == ["gh", "pr", "create"] and "--draft" in command for command in commands)
+
+
+def test_prepare_lab_branch_base_rebases_before_publish(monkeypatch, tmp_path):
+    commands = []
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def fake_run_command(args, *, timeout=30.0):
+        commands.append(args)
+        if args[3:6] == ["merge-base", "--is-ancestor", "codex/fixed-lab-base"]:
+            return {"returncode": 1, "stdout": "", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+
+    result = _prepare_lab_branch_base_for_publish(workspace, "codex/fixed-lab-base")
+
+    assert result == {"status": "rebased", "base_ref": "codex/fixed-lab-base", "warnings": []}
+    assert commands == [
+        ["git", "-C", str(workspace), "rev-parse", "--verify", "codex/fixed-lab-base^{commit}"],
+        ["git", "-C", str(workspace), "merge-base", "--is-ancestor", "codex/fixed-lab-base", "HEAD"],
+        ["git", "-C", str(workspace), "rebase", "codex/fixed-lab-base"],
+    ]
+
+
+def test_normalize_lab_commit_author_uses_configured_base_ref(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    commands = []
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._git_head_sha", lambda _workspace: "head-sha")
+
+    def fake_git_scalar(_workspace, args):
+        if args == ["merge-base", "codex/fixed-lab-base", "HEAD"]:
+            return "base-sha"
+        if args == ["log", "-1", "--format=%s"]:
+            return "test: lab change"
+        return ""
+
+    def fake_git_lines(_workspace, args):
+        if args == ["log", "base-sha..HEAD", "--format=%ae"]:
+            return ["felipe@mac.home"]
+        return []
+
+    def fake_run_command(args, *, timeout=30.0):
+        commands.append(args)
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._git_scalar", fake_git_scalar)
+    monkeypatch.setattr("gateway.dev_control.lab_loop._git_lines", fake_git_lines)
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+
+    result = _normalize_lab_commit_author_for_ci(workspace, base_ref_name="codex/fixed-lab-base")
+
+    assert result["status"] == "normalized"
+    assert result["base_ref"] == "codex/fixed-lab-base"
+    assert ["git", "-C", str(workspace), "reset", "--soft", "base-sha"] in commands
 
 
 def test_lab_executor_keeps_local_branch_when_draft_pr_remote_missing(monkeypatch, tmp_path):
