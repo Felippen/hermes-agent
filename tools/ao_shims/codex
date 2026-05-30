@@ -13,18 +13,24 @@ for arg in "$@"; do
   esac
 done
 
+copy_codex_auth() {
+  local target_home="$1"
+  if [[ -n "${HERMES_AO_CODEX_AUTH_HOME:-}" && -f "$HERMES_AO_CODEX_AUTH_HOME/auth.json" ]]; then
+    mkdir -p "$target_home"
+    cp "$HERMES_AO_CODEX_AUTH_HOME/auth.json" "$target_home/auth.json"
+    chmod 600 "$target_home/auth.json" 2>/dev/null || true
+  fi
+}
+
 if [[ "$is_dev_verification" == "1" && -n "${HERMES_AO_VERIFICATION_CODEX_HOME:-}" ]]; then
   export CODEX_HOME="$HERMES_AO_VERIFICATION_CODEX_HOME"
-  if [[ -n "${HERMES_AO_CODEX_AUTH_HOME:-}" && -f "$HERMES_AO_CODEX_AUTH_HOME/auth.json" ]]; then
-    mkdir -p "$CODEX_HOME"
-    cp "$HERMES_AO_CODEX_AUTH_HOME/auth.json" "$CODEX_HOME/auth.json"
-    chmod 600 "$CODEX_HOME/auth.json" 2>/dev/null || true
-  fi
+  copy_codex_auth "$CODEX_HOME"
 fi
 
 codex_home="${CODEX_HOME:-${HOME:-}/.codex}"
 
 if [[ "$is_dev_verification" == "1" || ( "${HOME:-}" == *"/.oryn-lab" && "${PWD:-}" == "$HOME"* ) ]]; then
+  copy_codex_auth "$codex_home"
   config="$codex_home/config.toml"
   mkdir -p "$(dirname "$config")"
   if ! grep -Fq "[projects.\"$PWD\"]" "$config" 2>/dev/null; then
