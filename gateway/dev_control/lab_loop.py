@@ -1498,6 +1498,12 @@ def _measure_verification_r1(
                     f"Lab verification worker did not complete before timeout ({verify_timeout:.1f}s).",
                 ]),
             })
+    run = _await_lab_verification_final_message_repair(
+        verification_store=verification_store,
+        run=run,
+        event_store=event_store,
+        bridge=bridge,
+    )
     return {
         "status": run.get("status"),
         "verdict": run.get("verdict") or "unknown",
@@ -1507,6 +1513,42 @@ def _measure_verification_r1(
         "measured": run.get("status") in {"completed", "skipped", "needs_attention"},
         "warnings": run.get("warnings") or [],
     }
+
+
+def _await_lab_verification_final_message_repair(
+    *,
+    verification_store: DevVerificationStore,
+    run: dict[str, Any],
+    event_store: Any,
+    bridge: Any,
+) -> dict[str, Any]:
+    if run.get("status") != "completed" or not _verification_has_transcript_recovery_warning(run):
+        return run
+    deadline = time.monotonic() + _env_float("HERMES_DEV_LAB_VERIFY_FINAL_MESSAGE_GRACE_SECONDS", 5.0)
+    while time.monotonic() < deadline:
+        refreshed = refresh_verification_run(
+            verification_store=verification_store,
+            verification_run_id=run["verification_run_id"],
+            event_store=event_store,
+            bridge=bridge,
+        )
+        run = refreshed
+        if not _verification_has_transcript_recovery_warning(run):
+            return run
+        time.sleep(0.5)
+    return run
+
+
+def _verification_has_transcript_recovery_warning(run: dict[str, Any]) -> bool:
+    for warning in run.get("warnings") or []:
+        text = str(warning or "")
+        if (
+            "DEV_VERIFICATION_RESULTS is not valid JSON" in text
+            or "Recovered verification results from worker transcript" in text
+            or "DEV_VERIFICATION_RESULTS marker was present but no JSON object could be extracted" in text
+        ):
+            return True
+    return False
 
 
 def _recover_lab_verification_from_transcript(

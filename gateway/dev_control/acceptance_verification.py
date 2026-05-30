@@ -481,6 +481,13 @@ def refresh_verification_run(
     if not run:
         raise KeyError(f"Dev verification run not found: {verification_run_id}")
     if run.get("status") in TERMINAL_RUN_STATUSES:
+        repaired = _repair_run_from_codex_final_message(
+            verification_store=verification_store,
+            run=run,
+            bridge=bridge,
+        )
+        if repaired is not None:
+            return repaired
         return run
     if _run_timed_out(run):
         return verification_store.update_run(verification_run_id, {
@@ -1186,6 +1193,68 @@ def _verification_transcript(run: Dict[str, Any], *, session: Any = None, bridge
             return str(router.capture_output(session, lines=120) or "")
     except Exception:
         return ""
+
+
+def _repair_run_from_codex_final_message(
+    *,
+    verification_store: DevVerificationStore,
+    run: Dict[str, Any],
+    bridge: Any = None,
+) -> Optional[Dict[str, Any]]:
+    if not _has_transcript_recovery_warning(run.get("warnings") or []):
+        return None
+    session = _verification_session(run, bridge=bridge)
+    final_message = _verification_final_message(run, session=session)
+    if not final_message.strip():
+        return None
+    parsed = parse_verification_results(final_message)
+    if not parsed.get("results") or _parsed_results_are_prompt_template(parsed):
+        return None
+    seed = _pending_seed_for_repair(run.get("results") or [], parsed.get("results") or [])
+    results, reconcile_warnings = reconcile_results(seed, parsed.get("results") or [])
+    warnings = [
+        warning
+        for warning in (run.get("warnings") or [])
+        if not _is_transcript_recovery_warning(warning)
+    ]
+    return verification_store.update_run(str(run["verification_run_id"]), {
+        "status": "completed",
+        "results": results,
+        "warnings": _unique([*warnings, *reconcile_warnings]),
+    })
+
+
+def _pending_seed_for_repair(existing_results: list[Dict[str, Any]], worker_results: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    worker_ids = {str(item.get("criterion_id") or "") for item in worker_results}
+    seed: list[Dict[str, Any]] = []
+    for item in existing_results:
+        criterion_id = str(item.get("criterion_id") or "")
+        if criterion_id in worker_ids:
+            seed.append({
+                **item,
+                "status": "pending",
+                "exit_code": None,
+                "passed": None,
+                "output_excerpt": "",
+                "notes": "",
+                "warnings": [],
+            })
+        else:
+            seed.append(item)
+    return seed
+
+
+def _has_transcript_recovery_warning(warnings: Iterable[Any]) -> bool:
+    return any(_is_transcript_recovery_warning(warning) for warning in warnings or [])
+
+
+def _is_transcript_recovery_warning(warning: Any) -> bool:
+    text = str(warning or "")
+    return (
+        "DEV_VERIFICATION_RESULTS is not valid JSON" in text
+        or "Recovered verification results from worker transcript" in text
+        or "DEV_VERIFICATION_RESULTS marker was present but no JSON object could be extracted" in text
+    )
 
 
 def _verification_final_message(run: Dict[str, Any], *, session: Any = None) -> str:
