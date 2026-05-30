@@ -16,6 +16,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from gateway.status import _pid_exists, terminate_pid
+
 
 DEFAULT_AO_CONFIG_PATH = "/Users/felipelamartine/projects/Oryn/agent-orchestrator.yaml"
 DEFAULT_AO_HOME = "/Users/felipelamartine"
@@ -413,14 +415,10 @@ class AOBridge:
             time.sleep(0.25)
 
         for pid in pids:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
-            except Exception:
+            if not _pid_exists(pid):
                 continue
             try:
-                os.kill(pid, signal.SIGKILL)
+                terminate_pid(pid, force=True)
             except ProcessLookupError:
                 pass
             except Exception:

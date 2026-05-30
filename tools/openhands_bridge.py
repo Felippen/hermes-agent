@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin
 
+from gateway.status import _pid_exists, terminate_pid
+
 
 DEFAULT_SERVER_PORT = 3000
 DEFAULT_SERVER_URL = f"http://127.0.0.1:{DEFAULT_SERVER_PORT}"
@@ -627,10 +629,13 @@ def stop_openhands_server(*, metadata_path: Optional[Path] = None) -> Dict[str, 
         }
     if _pid_running(pid):
         try:
-            os.killpg(os.getpgid(int(pid)), signal.SIGINT)
+            if os.name != "nt":
+                os.killpg(os.getpgid(int(pid)), signal.SIGINT)  # windows-footgun: ok — POSIX-only process group signal
+            else:
+                terminate_pid(int(pid))
         except Exception:
             try:
-                os.kill(int(pid), signal.SIGINT)
+                terminate_pid(int(pid))
             except Exception:
                 pass
         deadline = time.time() + 8.0
@@ -638,10 +643,13 @@ def stop_openhands_server(*, metadata_path: Optional[Path] = None) -> Dict[str, 
             time.sleep(0.25)
         if _pid_running(pid):
             try:
-                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+                if os.name != "nt":
+                    os.killpg(os.getpgid(int(pid)), signal.SIGTERM)  # windows-footgun: ok — POSIX-only process group signal
+                else:
+                    terminate_pid(int(pid), force=True)
             except Exception:
                 try:
-                    os.kill(int(pid), signal.SIGTERM)
+                    terminate_pid(int(pid), force=True)
                 except Exception:
                     pass
     clear_openhands_server_metadata(metadata_path=metadata_path)
@@ -727,7 +735,6 @@ def _server_port_from_url(server_url: Optional[str]) -> int:
 
 def _pid_running(pid: Any) -> bool:
     try:
-        os.kill(int(pid), 0)
-        return True
+        return _pid_exists(int(pid))
     except Exception:
         return False
