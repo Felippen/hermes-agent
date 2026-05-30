@@ -51,12 +51,15 @@ from gateway.dev_control.acceptance_verification import (
 )
 from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.clarifications import (
+    DEFAULT_CLARIFICATION_KIND,
     DevClarificationStore,
     answer_clarification,
+    approve_clarification_brief,
     cancel_clarification,
     complete_clarification,
     get_clarification,
     list_clarifications,
+    revise_clarification_brief,
     start_clarification,
 )
 from gateway.dev_control.harness_benchmarks import (
@@ -206,6 +209,8 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_answer_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/answer"},
         "dev_complete_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/complete"},
         "dev_cancel_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/cancel"},
+        "dev_approve_clarification_brief": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/approve-brief"},
+        "dev_revise_clarification_brief": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/revise-brief"},
         "dev_plan_artifacts": {"method": "GET", "path": "/v1/dev/plan-artifacts"},
         "dev_create_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts"},
         "dev_revise_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/revise"},
@@ -271,6 +276,8 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/answer", adapter._handle_dev_clarification_answer)
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/complete", adapter._handle_dev_clarification_complete)
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/cancel", adapter._handle_dev_clarification_cancel)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/approve-brief", adapter._handle_dev_clarification_approve_brief)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/revise-brief", adapter._handle_dev_clarification_revise_brief)
     app.router.add_get("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
     app.router.add_post("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
     app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}", adapter._handle_dev_plan_artifact_detail)
@@ -696,6 +703,7 @@ class DevControlRouteMixin:
                 project_id=request.rel_url.query.get("project_id") or None,
                 session_id=request.rel_url.query.get("session_id") or None,
                 status=request.rel_url.query.get("status") or None,
+                clarification_kind=request.rel_url.query.get("clarification_kind") or None,
                 limit=request.rel_url.query.get("limit") or 50,
             )
             return web.json_response(result)
@@ -711,6 +719,7 @@ class DevControlRouteMixin:
                 session_id=body.get("session_id"),
                 project_context=body.get("project_context"),
                 max_questions=body.get("max_questions") or 5,
+                clarification_kind=body.get("clarification_kind") or DEFAULT_CLARIFICATION_KIND,
             )
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
@@ -798,6 +807,51 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_approve_brief(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/approve-brief."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            result = approve_clarification_brief(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_revise_brief(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/revise-brief."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = revise_clarification_brief(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+                feedback=body.get("feedback") or "",
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Discovery brief revision failed: {exc}"}}, status=500)
         return web.json_response(result)
 
     async def _handle_dev_plan_artifacts(self, request: "web.Request") -> "web.Response":
