@@ -1685,10 +1685,25 @@ def _measure_code_review_r4(
         "- If the diff satisfies the task intent and has no blocking code-review findings, return verdict approved.",
         "- Return verdict commented only when the PR diff cannot be inspected, and include at least one finding explaining why.",
         "",
+        "Required final response format:",
+        "- End with exactly one fenced block whose info string is: json DEV_CODE_REVIEW_RESULT.",
+        "- The fenced block must contain valid JSON only; no unescaped literal newlines inside JSON string values.",
+        "- Hermes will not count the review as measured if this fenced block is missing or invalid.",
+        "```json DEV_CODE_REVIEW_RESULT",
+        "{",
+        '  "object": "hermes.dev_code_review_result",',
+        '  "verdict": "approved",',
+        '  "findings": [],',
+        '  "summary": "One sentence explaining the review decision.",',
+        '  "evidence_refs": ["gh pr diff <number> --repo <owner/repo> --patch"]',
+        "}",
+        "```",
+        "",
         "Lab R4 constraints:",
         "- Review only. Do not edit files, commit, push, merge, approve, or publish.",
         "- Use the draft PR diff as the evidence source; do not inspect unrelated local changes.",
         "- Do not invoke slash commands, /review, CodeRabbit, coderabbit, review agents, tests, builds, or interactive review modes.",
+        "- Do not use GitHub connector/MCP tools; use only the listed gh pr view/diff commands if shell evidence is needed.",
         "- If shell evidence is needed, run only the exact gh pr view/diff commands listed above.",
         "- Do not start background terminals or long-running tools; answer directly.",
         "- If there are no blocking findings, return verdict approved.",
@@ -1714,20 +1729,26 @@ def _measure_code_review_r4(
         transcript = terminal.get("transcript") or ""
         parsed = parse_code_review_result(transcript)
         actionable = _code_review_result_is_actionable(parsed)
-        status = "completed" if actionable else "needs_attention"
-        if not actionable and parsed.get("verdict") != "unknown":
+        contract_clean = _code_review_result_has_clean_contract(parsed)
+        status = "completed" if actionable and contract_clean else "needs_attention"
+        if (not actionable or not contract_clean) and parsed.get("verdict") != "unknown":
+            extra_warning = (
+                "Code-review result did not satisfy the fenced DEV_CODE_REVIEW_RESULT contract; recovered transcript JSON is advisory only."
+                if not contract_clean
+                else "Code-review result was not actionable: commented/empty review requires concrete findings or summary."
+            )
             parsed = {
                 **parsed,
                 "verdict": "unknown",
                 "warnings": [
                     *(parsed.get("warnings") or []),
-                    "Code-review result was not actionable: commented/empty review requires concrete findings or summary.",
+                    extra_warning,
                 ],
             }
         return {
             **parsed,
             "status": status,
-            "measured": actionable,
+            "measured": actionable and contract_clean,
             "source": "ao",
             "review_session_id": _session_value(session, "id"),
             "review_status": terminal.get("status"),
@@ -1810,7 +1831,7 @@ def _await_review_terminal(*, bridge: Any, runtime: str, session: Any, timeout_s
     while True:
         transcript = _capture_lab_output(bridge, runtime, latest)
         parsed = parse_code_review_result(transcript)
-        if _code_review_result_is_actionable(parsed):
+        if _code_review_result_is_actionable(parsed) and _code_review_result_has_clean_contract(parsed):
             return {
                 "status": "completed_from_transcript",
                 "session": latest,
@@ -1856,6 +1877,16 @@ def _code_review_result_is_actionable(review: dict[str, Any]) -> bool:
     if verdict == "commented":
         return bool((review or {}).get("findings") or (review or {}).get("summary") or (review or {}).get("evidence_refs"))
     return True
+
+
+def _code_review_result_has_clean_contract(review: dict[str, Any]) -> bool:
+    warning_text = " ".join(str(item) for item in (review or {}).get("warnings") or []).lower()
+    contract_failures = (
+        "dev_code_review_result block was missing",
+        "dev_code_review_result json was invalid",
+        "unexpected code-review result object type",
+    )
+    return not any(item in warning_text for item in contract_failures)
 
 
 def _capture_lab_output(bridge: Any, runtime: str, session: Any) -> str:

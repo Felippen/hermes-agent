@@ -506,6 +506,9 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     assert "gh pr diff 456 --repo Felippen/Oryn --patch" in review_spawn["kwargs"]["prompt"]
     assert "run only the exact gh pr view/diff commands listed above" in review_spawn["kwargs"]["prompt"]
     assert "Do not start background terminals or long-running tools" in review_spawn["kwargs"]["prompt"]
+    assert "```json DEV_CODE_REVIEW_RESULT" in review_spawn["kwargs"]["prompt"]
+    assert "Hermes will not count the review as measured if this fenced block is missing or invalid" in review_spawn["kwargs"]["prompt"]
+    assert "Do not use GitHub connector/MCP tools" in review_spawn["kwargs"]["prompt"]
     assert "Measured gate evidence supplied by Hermes:" in review_spawn["kwargs"]["prompt"]
     assert "Verification verdict: verified" in review_spawn["kwargs"]["prompt"]
     assert "CI state: success" in review_spawn["kwargs"]["prompt"]
@@ -545,7 +548,7 @@ def test_lab_review_await_ignores_empty_commented_result(monkeypatch, tmp_path):
     assert terminal["timed_out"] is True
 
 
-def test_lab_review_await_completes_when_plain_review_json_appears(tmp_path):
+def test_lab_review_await_requires_fenced_review_json_contract(tmp_path):
     transcript = """
 {
   "object": "hermes.dev_code_review_result",
@@ -568,12 +571,108 @@ def test_lab_review_await_completes_when_plain_review_json_appears(tmp_path):
         bridge=bridge,
         runtime="ao",
         session=session,
+        timeout_seconds=0.01,
+    )
+
+    assert terminal["status"] == "timed_out"
+    assert terminal["timed_out"] is True
+    assert "hermes.dev_code_review_result" in terminal["transcript"]
+
+
+def test_lab_review_await_completes_when_fenced_review_json_appears(tmp_path):
+    transcript = """
+```json DEV_CODE_REVIEW_RESULT
+{
+  "object": "hermes.dev_code_review_result",
+  "verdict": "approved",
+  "findings": [],
+  "summary": "Review approved.",
+  "evidence_refs": ["docs/review-live.md:1"]
+}
+```
+"""
+    bridge = _FakeLabRouter(
+        tmp_path / "lab",
+        status="working",
+        status_sequence=["working", "working", "working"],
+        transcript=transcript,
+    )
+    session = AOSession(id="review-session-fenced", status="working", workspace_path=str(tmp_path / "lab" / "review"))
+    bridge.sessions[session.id] = session
+
+    terminal = _await_review_terminal(
+        bridge=bridge,
+        runtime="ao",
+        session=session,
         timeout_seconds=30.0,
     )
 
     assert terminal["status"] == "completed_from_transcript"
     assert terminal["timed_out"] is False
-    assert "hermes.dev_code_review_result" in terminal["transcript"]
+    assert "DEV_CODE_REVIEW_RESULT" in terminal["transcript"]
+
+
+def test_lab_executor_marks_recovered_review_json_unmeasured(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    commands = []
+
+    def fake_run_command(args, *, timeout=30.0):
+        commands.append(args)
+        if args[:2] == ["gh", "pr"]:
+            return {"returncode": 0, "stdout": "https://github.com/Felippen/Oryn/pull/457\n", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+    transcript = """
+```json DEV_WORKER_EVIDENCE
+{"structured_summary":"Implemented docs task.","findings":[],"verification_status":"passed","verification_evidence":["fixture"],"files_changed":["docs/review-unfenced.md"],"commands_run":[]}
+```
+{
+  "object": "hermes.dev_code_review_result",
+  "verdict": "approved",
+  "findings": [],
+  "summary": "Review approved.",
+  "evidence_refs": ["docs/review-unfenced.md"]
+}
+"""
+    bridge = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/review-unfenced.md"], transcript=transcript)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure recovered R4 review output.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/review-unfenced.md"],
+        "source": "docs",
+        "payload": {
+            "branch": "lab/dogfood/review-unfenced",
+            "ci_status": {"state": "success", "repo": "Felippen/Oryn"},
+            "draft_pr_repo": "Felippen/Oryn",
+            "draft_pr_remote": "lab-origin",
+            "draft_pr_base": "main",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=bridge,
+    )
+
+    review = report["execution"]["code_review"]
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert review["status"] == "needs_attention"
+    assert review["measured"] is False
+    assert review["verdict"] == "unknown"
+    assert "recovered transcript JSON is advisory only" in " ".join(review["warnings"])
+    assert report["gate_verdicts"]["review"] == "unknown"
+    assert outcome["code_review_verdict"] == "unknown"
 
 
 def test_lab_executor_marks_changes_requested_review_as_failed_outcome(monkeypatch, tmp_path):
