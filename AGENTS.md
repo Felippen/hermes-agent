@@ -879,8 +879,13 @@ execution plan → tasks → verification/CI`) and links down via subgoal
 - **API:** `/v1/dev/goals`, `/v1/dev/goals/tree`, `/v1/dev/goals/{id}/reevaluate`,
   `/v1/dev/goals/{id}/abandon` (registered in `gateway/dev_control/routes.py`).
 - **CLI:** `hermes dev goals {create,list,tree,abandon}` (`hermes_cli/dev_goals.py`).
+- **Slash (v2):** `/project`, `/vision`, `/milestone`, `/pgoal`, `/psubgoal`
+  via `gateway/dev_control/project_goal_slash.py` (session `/goal` unchanged).
+- **Config (v2):** `dev.project_goals.tick_enabled` and
+  `dev.project_goals.auto_subgoal_on_approve` in `cli-config.yaml` (env fallbacks).
+- **Dashboard (v2):** `GET /v1/oryn/project-dashboard` includes `project_goals` tree.
 - **Lab loop tick:** end of each `run_lab_loop_pass()` when
-  `HERMES_DEV_PROJECT_GOALS_TICK=1` (default off). Fail-open judge semantics
+  `dev.project_goals.tick_enabled` or `HERMES_DEV_PROJECT_GOALS_TICK=1` (default off). Fail-open judge semantics
   match session goals (`hermes_cli/goals.py`).
 - **Tests:** `scripts/run_tests.sh tests/gateway/dev_control/test_project_goals.py`
   `tests/gateway/dev_control/test_project_goal_eval.py`

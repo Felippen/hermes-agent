@@ -1,6 +1,6 @@
 # Dev Project Goals — Feature Spec
 
-Status: **Implemented (v1)** · Owner: Dev (Hermes dev profile) · Created: 2026-05-30
+Status: **Implemented (v2)** · Owner: Dev (Hermes dev profile) · Created: 2026-05-30
 
 A project-level goal system for the Dev workspace: a durable, hierarchical
 spine of **vision → goal → milestone → subgoal** that gives every
@@ -239,7 +239,13 @@ assembly, machine gate, judge fail-open, tick idempotency, API create/tree.
 
 ## 16. Follow-ups (post-v1)
 
-- Auto-create subgoals from approved `plan_artifact` builds.
-- Fold `production_signals` / `reliability` into evidence digest.
-- Slash commands (`/vision`, `/goal`, …) for gateway parity with session `/goal`.
-- Dashboard / project-dashboard read model inclusion.
+Implemented in **v2**:
+
+- Gateway slash commands: `/project`, `/vision`, `/milestone`, `/pgoal`, `/psubgoal`
+  (session `/goal` remains session-scoped; use `/pgoal` for project goals).
+- `cli-config.yaml` toggles under `dev.project_goals` (`tick_enabled`,
+  `auto_subgoal_on_approve`) with env fallbacks.
+- Auto-create subgoals when plan artifacts are approved (single active milestone
+  or explicit `payload.milestone_goal_id`).
+- `production_signals` and `reliability` folded into evidence digest.
+- Project dashboard read model includes `project_goals` tree.

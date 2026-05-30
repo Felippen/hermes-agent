@@ -8,9 +8,9 @@ from gateway.dev_control.project_goal_eval import (
     format_evidence_digest,
     goals_tick,
     judge_project_goal,
-    project_goals_tick_enabled,
     reevaluate_project_goal,
 )
+from gateway.dev_control.project_goals_config import project_goals_tick_enabled
 from gateway.dev_control.project_goals import DevProjectGoalStore, create_project_goal
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from gateway.dev_control.acceptance_criteria import normalize_acceptance_criteria
+from gateway.dev_control.project_goals_config import project_goals_auto_subgoal_enabled
 from gateway.dev_control.project_scope import DEFAULT_PROJECT_ID, resolve_project_id
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
@@ -292,6 +293,96 @@ def get_project_goal_tree(
     include_abandoned: bool = False,
 ) -> Dict[str, Any]:
     return store.tree(project_id, include_abandoned=include_abandoned)
+
+
+def find_subgoal_by_plan_artifact(
+    store: DevProjectGoalStore,
+    plan_artifact_id: str,
+) -> Optional[Dict[str, Any]]:
+    artifact_id = str(plan_artifact_id or "").strip()
+    if not artifact_id:
+        return None
+    row = store._conn.execute(
+        """
+        SELECT *
+        FROM dev_project_goals
+        WHERE plan_artifact_id = ? AND status != 'abandoned'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (artifact_id,),
+    ).fetchone()
+    return _row_to_payload(row) if row else None
+
+
+def resolve_parent_milestone_for_artifact(
+    store: DevProjectGoalStore,
+    *,
+    project_id: str,
+    artifact_payload: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    payload = artifact_payload if isinstance(artifact_payload, dict) else {}
+    explicit = str(
+        payload.get("milestone_goal_id")
+        or payload.get("parent_milestone_goal_id")
+        or ""
+    ).strip()
+    if explicit:
+        parent = store.get(explicit)
+        if parent and parent.get("kind") == "milestone" and parent.get("status") != "abandoned":
+            return explicit
+    milestones = store.list(
+        project_id=project_id,
+        kind="milestone",
+        include_abandoned=False,
+        limit=50,
+    )
+    active = [
+        milestone for milestone in milestones
+        if str(milestone.get("status") or "") in {"active", "proposed", "blocked"}
+    ]
+    if len(active) == 1:
+        return str(active[0]["goal_id"])
+    return None
+
+
+def maybe_create_subgoal_for_approved_artifact(
+    *,
+    store: DevProjectGoalStore,
+    artifact: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Create a linked subgoal when auto-subgoal is enabled (idempotent)."""
+    if not project_goals_auto_subgoal_enabled():
+        return None
+    artifact_id = str(artifact.get("plan_artifact_id") or "").strip()
+    if not artifact_id:
+        return None
+    existing = find_subgoal_by_plan_artifact(store, artifact_id)
+    if existing:
+        return existing
+    project_id = resolve_project_id(artifact.get("project_id"))
+    artifact_payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+    parent_id = resolve_parent_milestone_for_artifact(
+        store,
+        project_id=project_id,
+        artifact_payload=artifact_payload,
+    )
+    if not parent_id:
+        return None
+    criteria_source = artifact_payload
+    acceptance = normalize_acceptance_criteria(criteria_source.get("acceptance_criteria"))
+    return create_project_goal(
+        store=store,
+        kind="subgoal",
+        title=str(artifact.get("title") or "Approved plan artifact"),
+        project_id=project_id,
+        parent_goal_id=parent_id,
+        status="active",
+        markdown=str(artifact.get("markdown") or ""),
+        acceptance_criteria=acceptance,
+        plan_artifact_id=artifact_id,
+        payload={"auto_created_from_artifact": True},
+    )
 
 
 def abandon_project_goal(*, store: DevProjectGoalStore, goal_id: str) -> Dict[str, Any]:

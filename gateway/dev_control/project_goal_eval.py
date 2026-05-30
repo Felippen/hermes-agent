@@ -57,9 +57,7 @@ class MachineCriteriaReport:
     manual_criteria: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def project_goals_tick_enabled() -> bool:
-    raw = str(os.getenv("HERMES_DEV_PROJECT_GOALS_TICK") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+from gateway.dev_control.project_goals_config import project_goals_tick_enabled
 
 
 def resolve_plan_id(
@@ -86,6 +84,8 @@ def assemble_evidence(
     verification_store: Optional[DevVerificationStore] = None,
     execution_store: Optional[DevExecutionStore] = None,
     plan_artifact_store: Optional[DevPlanArtifactStore] = None,
+    signal_store: Any = None,
+    reliability_store: Any = None,
     ci_fetcher: Callable[..., Dict[str, Any]] = fetch_ci_status,
 ) -> Dict[str, Any]:
     plan_id = resolve_plan_id(subgoal, plan_artifact_store=plan_artifact_store)
@@ -138,6 +138,39 @@ def assemble_evidence(
                 "results": latest.get("results") or [],
                 "warnings": latest.get("warnings") or [],
             }
+
+    if signal_store is not None:
+        try:
+            from gateway.dev_control.production_signals import list_backlog_proposals
+
+            proposals = list_backlog_proposals(signal_store=signal_store, limit=5).get("data", [])
+            evidence["production_signals"] = {
+                "open_proposal_count": sum(
+                    1 for item in proposals if str(item.get("status") or "") not in {"closed", "dismissed"}
+                ),
+                "recent_proposals": [
+                    {
+                        "proposal_id": item.get("proposal_id"),
+                        "status": item.get("status"),
+                        "cluster_key": item.get("cluster_key"),
+                    }
+                    for item in proposals[:3]
+                ],
+            }
+        except Exception:
+            evidence["production_signals"] = {}
+
+    if reliability_store is not None and plan_id:
+        try:
+            from gateway.dev_control.reliability import scorecard
+
+            outcomes = [
+                outcome for outcome in reliability_store.list_outcomes(limit=500)
+                if str(outcome.get("plan_id") or "") == str(plan_id)
+            ]
+            evidence["reliability"] = scorecard(outcomes)
+        except Exception:
+            evidence["reliability"] = {}
 
     return evidence
 
@@ -249,6 +282,8 @@ def reevaluate_project_goal(
     verification_store: Optional[DevVerificationStore] = None,
     execution_store: Optional[DevExecutionStore] = None,
     plan_artifact_store: Optional[DevPlanArtifactStore] = None,
+    signal_store: Any = None,
+    reliability_store: Any = None,
     ci_fetcher: Callable[..., Dict[str, Any]] = fetch_ci_status,
 ) -> Dict[str, Any]:
     goal = store.get(goal_id)
@@ -278,6 +313,8 @@ def reevaluate_project_goal(
         verification_store=verification_store,
         execution_store=execution_store,
         plan_artifact_store=plan_artifact_store,
+        signal_store=signal_store,
+        reliability_store=reliability_store,
         ci_fetcher=ci_fetcher,
     )
     digest = format_evidence_digest(evidence)
@@ -342,6 +379,8 @@ def goals_tick(
     verification_store: Optional[DevVerificationStore] = None,
     execution_store: Optional[DevExecutionStore] = None,
     plan_artifact_store: Optional[DevPlanArtifactStore] = None,
+    signal_store: Any = None,
+    reliability_store: Any = None,
     ci_fetcher: Callable[..., Dict[str, Any]] = fetch_ci_status,
 ) -> Dict[str, Any]:
     project_ids = [resolve_project_id(project_id)] if project_id else _project_ids_with_active_subgoals(store)
@@ -356,6 +395,8 @@ def goals_tick(
                 verification_store=verification_store,
                 execution_store=execution_store,
                 plan_artifact_store=plan_artifact_store,
+                signal_store=signal_store,
+                reliability_store=reliability_store,
                 ci_fetcher=ci_fetcher,
             )
             transition = outcome.get("transition")
@@ -377,6 +418,16 @@ def maybe_run_goals_tick(*, db_path: Path, project_id: Optional[str] = None) -> 
         verification_store = DevVerificationStore(db_path=db_path)
         execution_store = DevExecutionStore(db_path=db_path)
         plan_artifact_store = DevPlanArtifactStore(db_path=db_path)
+        signal_store = None
+        reliability_store = None
+        try:
+            from gateway.dev_control.production_signals import DevProductionSignalStore
+            from gateway.dev_control.reliability import DevReliabilityStore
+
+            signal_store = DevProductionSignalStore(db_path=db_path)
+            reliability_store = DevReliabilityStore(db_path=db_path)
+        except Exception:
+            pass
         try:
             return goals_tick(
                 store=store,
@@ -384,11 +435,17 @@ def maybe_run_goals_tick(*, db_path: Path, project_id: Optional[str] = None) -> 
                 verification_store=verification_store,
                 execution_store=execution_store,
                 plan_artifact_store=plan_artifact_store,
+                signal_store=signal_store,
+                reliability_store=reliability_store,
             )
         finally:
             plan_artifact_store.close()
             execution_store.close()
             verification_store.close()
+            if reliability_store is not None:
+                reliability_store.close()
+            if signal_store is not None:
+                signal_store.close()
     finally:
         store.close()
 

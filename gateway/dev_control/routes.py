@@ -108,6 +108,7 @@ from gateway.dev_control.project_goals import (
     create_project_goal,
     get_project_goal_tree,
     list_project_goals,
+    maybe_create_subgoal_for_approved_artifact,
 )
 from gateway.dev_control.project_goal_eval import reevaluate_project_goal
 from gateway.dev_control.project_scope import project_id_from_payload, resolve_project_id
@@ -392,6 +393,7 @@ class DevControlRouteMixin:
         pr_automation_store = self._ensure_dev_github_pr_automation_store()
         reliability_store = self._ensure_dev_reliability_store()
         lab_loop_store = self._ensure_dev_lab_loop_store()
+        goal_store = self._ensure_dev_project_goal_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
@@ -481,6 +483,14 @@ class DevControlRouteMixin:
                 "project_id": project_id,
                 "clarifications": clarifications.get("data", []),
                 "plan_artifacts": artifacts.get("data", []),
+                "project_goals": (
+                    get_project_goal_tree(
+                        store=goal_store,
+                        project_id=resolve_project_id(project_id),
+                    )
+                    if goal_store is not None
+                    else None
+                ),
                 "subagent_board": build_agent_board_response(board_rows),
                 "dev_plans": plans,
                 "latest_plan_artifact_build": latest_build,
@@ -918,8 +928,13 @@ class DevControlRouteMixin:
         store = self._ensure_dev_plan_artifact_store()
         if store is None:
             return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        goal_store = self._ensure_dev_project_goal_store()
         try:
             result = approve_plan_artifact(store=store, plan_artifact_id=request.match_info["plan_artifact_id"])
+            if goal_store is not None:
+                subgoal = maybe_create_subgoal_for_approved_artifact(store=goal_store, artifact=result)
+                if subgoal:
+                    result = {**result, "linked_project_subgoal": subgoal}
         except KeyError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
@@ -1067,6 +1082,8 @@ class DevControlRouteMixin:
         verification_store = self._ensure_dev_verification_store()
         execution_store = self._ensure_dev_execution_store()
         plan_artifact_store = self._ensure_dev_plan_artifact_store()
+        signal_store = self._ensure_dev_signal_store()
+        reliability_store = self._ensure_dev_reliability_store()
         try:
             result = reevaluate_project_goal(
                 store=store,
@@ -1074,6 +1091,8 @@ class DevControlRouteMixin:
                 verification_store=verification_store,
                 execution_store=execution_store,
                 plan_artifact_store=plan_artifact_store,
+                signal_store=signal_store,
+                reliability_store=reliability_store,
             )
         except KeyError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
