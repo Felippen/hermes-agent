@@ -14,7 +14,6 @@ from run_agent import (
     _sanitize_messages_surrogates,
     _sanitize_messages_control_chars,
     _sanitize_structure_surrogates,
-    _SURROGATE_RE,
 )
 from agent.tool_dispatch_helpers import make_tool_result_message
 

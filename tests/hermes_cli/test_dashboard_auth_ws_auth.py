@@ -14,7 +14,6 @@ pre-existing regression unrelated to dashboard-auth.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -29,7 +28,6 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.ws_tickets import (
-    TicketInvalid,
     _reset_for_tests,
     consume_ticket,
     mint_ticket,
@@ -75,6 +73,25 @@ def loopback_app():
     web_server.app.state.bound_port = 8080
     web_server.app.state.auth_required = False
     client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
+    yield client
+    _reset_for_tests()
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+
+
+@pytest.fixture
+def insecure_public_app():
+    """web_server.app configured for all-interfaces insecure mode."""
+    _reset_for_tests()
+    clear_providers()
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "0.0.0.0"
+    web_server.app.state.bound_port = 9120
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app, base_url="http://192.168.0.222:9120")
     yield client
     _reset_for_tests()
     web_server.app.state.bound_host = prev_host
@@ -281,6 +298,21 @@ class TestWsRequestIsAllowedGated:
     def test_loopback_peer_allowed_in_loopback_mode(self, loopback_app):
         ws = _fake_ws(query={}, client_host="127.0.0.1")
         ws.headers = {"host": "127.0.0.1:8080"}
+        assert web_server._ws_request_is_allowed(ws) is True
+
+    def test_non_loopback_peer_allowed_in_insecure_public_mode(self, insecure_public_app):
+        """`--host 0.0.0.0 --insecure` is an explicit LAN/public opt-in.
+
+        Regression coverage for the dashboard `/chat` breakage where the
+        HTML shell loaded on 9120 but every WebSocket upgrade was rejected
+        with 403 because the loopback-only peer guard still ran even though
+        the operator intentionally exposed the dashboard on all interfaces.
+        """
+        ws = _fake_ws(query={}, client_host="192.168.0.55")
+        ws.headers = {
+            "host": "192.168.0.222:9120",
+            "origin": "http://192.168.0.222:9120",
+        }
         assert web_server._ws_request_is_allowed(ws) is True
 
     def test_host_origin_guard_still_runs_in_gated_mode(self, gated_app):

@@ -86,6 +86,11 @@ class BulkTaskBody(BaseModel):
     reclaim_first: bool = False
 
 
+def _set_status_direct(conn: Any, task_id: str, status_value: str) -> bool:
+    """Compatibility shim for tests/importers after moving logic to kanban_http."""
+    return kh._set_status_direct(conn, task_id, status_value)
+
+
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
 
