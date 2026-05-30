@@ -1,6 +1,6 @@
 # Dev Project Goals — Feature Spec
 
-Status: **Implemented (v2)** · Owner: Dev (Hermes dev profile) · Created: 2026-05-30
+Status: **Implemented (v3)** · Owner: Dev (Hermes dev profile) · Created: 2026-05-30
 
 A project-level goal system for the Dev workspace: a durable, hierarchical
 spine of **vision → goal → milestone → subgoal** that gives every
@@ -212,9 +212,9 @@ decision kept separate from this goal **data model**.
 
 ```bash
 scripts/run_tests.sh \
-  tests/gateway/dev_control/test_project_goals.py \
-  tests/gateway/dev_control/test_project_goal_eval.py \
-  tests/gateway/dev_control/test_project_goals_api.py
+  tests/gateway/dev_control/test_project_goal*.py \
+  tests/gateway/dev_control/test_project_goals*.py \
+  tests/gateway/test_chat_project_context.py
 ```
 
 Covers: CRUD, hierarchy validation, rollup, abandon, persistence, evidence
@@ -249,3 +249,20 @@ Implemented in **v2**:
   or explicit `payload.milestone_goal_id`).
 - `production_signals` and `reliability` folded into evidence digest.
 - Project dashboard read model includes `project_goals` tree.
+
+Implemented in **v3**:
+
+- Execution sync: `sync_subgoal_plan_id()` on build/launch writes `payload.plan_id`.
+- Blocked transitions from failed tasks / verification / CI when
+  `auto_block_on_execution_failure` is enabled (defaults on when tick is enabled).
+- Coordinator overlay accepts `project_goal_tree_digest`; Workspace snapshot includes goal tree.
+- Dashboard cache invalidation on dev goal/plan mutations (`_invalidate_ao_read_models`).
+- `PATCH /v1/dev/goals/{id}`, `hermes dev goals update`, `/project update`.
+- Oryn Workspace dashboard renders Hermes goal tree (after Vision, before Work items).
+
+## 17. Follow-ups (post-v3)
+
+- SSE/WebSocket push for dashboard (stay on ETag poll + invalidation for now).
+- Full goal editor UI (rich markdown / criteria editing).
+- Link local Vision card to Hermes vision node (both remain visible today).
+- Multi-milestone picker UI for auto-subgoal routing.

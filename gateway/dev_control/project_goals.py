@@ -315,6 +315,104 @@ def find_subgoal_by_plan_artifact(
     return _row_to_payload(row) if row else None
 
 
+def find_subgoal_by_plan_id(
+    store: DevProjectGoalStore,
+    plan_id: str,
+) -> Optional[Dict[str, Any]]:
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return None
+    row = store._conn.execute(
+        """
+        SELECT *
+        FROM dev_project_goals
+        WHERE kind = 'subgoal'
+          AND status != 'abandoned'
+          AND json_extract(payload, '$.plan_id') = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (plan,),
+    ).fetchone()
+    return _row_to_payload(row) if row else None
+
+
+def sync_subgoal_plan_id(
+    store: DevProjectGoalStore,
+    plan_id: str,
+    *,
+    plan_artifact_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Idempotently attach an execution plan id to a linked subgoal."""
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return None
+    subgoal = None
+    artifact_id = str(plan_artifact_id or "").strip()
+    if artifact_id:
+        subgoal = find_subgoal_by_plan_artifact(store, artifact_id)
+    if subgoal is None:
+        subgoal = find_subgoal_by_plan_id(store, plan)
+    if subgoal is None:
+        return None
+    payload = dict(subgoal.get("payload") or {})
+    if str(payload.get("plan_id") or "").strip() == plan:
+        return subgoal
+    payload["plan_id"] = plan
+    return store.update(str(subgoal["goal_id"]), {"payload": payload})
+
+
+def update_project_goal(
+    *,
+    store: DevProjectGoalStore,
+    goal_id: str,
+    title: Optional[str] = None,
+    markdown: Optional[str] = None,
+    status: Optional[str] = None,
+    acceptance_criteria: Optional[List[Any]] = None,
+    plan_artifact_id: Optional[str] = None,
+    parent_goal_id: Optional[str] = None,
+    ordering: Optional[int] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    current = store.get(goal_id)
+    if not current:
+        raise KeyError(f"Project goal not found: {goal_id}")
+
+    updates: Dict[str, Any] = {}
+    if title is not None:
+        updates["title"] = str(title).strip()
+        if not updates["title"]:
+            raise ValueError("title cannot be empty")
+    if markdown is not None:
+        updates["markdown"] = str(markdown)
+    if status is not None:
+        normalized = str(status).strip().lower()
+        if normalized not in GOAL_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(GOAL_STATUSES)}")
+        updates["status"] = normalized
+    if acceptance_criteria is not None:
+        updates["acceptance_criteria"] = acceptance_criteria
+    if plan_artifact_id is not None:
+        updates["plan_artifact_id"] = str(plan_artifact_id).strip() or None
+    if parent_goal_id is not None:
+        parent_text = str(parent_goal_id).strip()
+        updates["parent_goal_id"] = parent_text or None
+        _validate_parent_kind(store, current.get("kind"), updates.get("parent_goal_id"))
+    if ordering is not None:
+        updates["ordering"] = int(ordering)
+    if payload is not None:
+        merged = dict(current.get("payload") or {})
+        merged.update(payload)
+        updates["payload"] = merged
+    if not updates:
+        raise ValueError("no updatable fields provided")
+    updated = store.update(goal_id, updates)
+    if updated.get("parent_goal_id"):
+        recompute_rollup(store, updated["parent_goal_id"])
+    return updated
+
+
 def resolve_parent_milestone_for_artifact(
     store: DevProjectGoalStore,
     *,
