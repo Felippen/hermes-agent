@@ -37,6 +37,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -1600,7 +1601,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             )
 
         try:
-            body = await request.json()
+            maybe_body = request.json()
+            body = await maybe_body if inspect.isawaitable(maybe_body) else maybe_body
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
@@ -3936,6 +3938,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             # (e.g. internal/filtered tools) is silently dropped instead of
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
+            _legacy_started_tools: set[str] = set()
             def _on_tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
                 """Bridge non-tool progress into chat-completions SSE.
 

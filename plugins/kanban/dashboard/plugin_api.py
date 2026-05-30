@@ -10,10 +10,16 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
 from pydantic import BaseModel, Field
 
+from hermes_cli import kanban_db
 from hermes_cli import kanban_http as kh
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None  # type: ignore[assignment]
 
 
 def _check_ws_token(provided: Optional[str]) -> bool:
@@ -92,6 +98,10 @@ def _set_status_direct(conn: Any, task_id: str, status_value: str) -> bool:
 
 
 class ReclaimBody(BaseModel):
+    reason: Optional[str] = None
+
+
+class TerminateRunBody(BaseModel):
     reason: Optional[str] = None
 
 
@@ -257,7 +267,36 @@ def get_run_endpoint(run_id: int, board: Optional[str] = Query(None)):
 @router.get("/runs/{run_id}/inspect")
 def inspect_run_endpoint(run_id: int, board: Optional[str] = Query(None)):
     try:
+        kh._psutil = _psutil  # type: ignore[attr-defined]
         return kh.http_inspect_run_endpoint(run_id, board)
+    except Exception as exc:
+        _map_error(exc)
+
+
+@router.post("/runs/{run_id}/terminate")
+def terminate_run_endpoint(
+    run_id: int,
+    payload: TerminateRunBody,
+    board: Optional[str] = Query(None),
+):
+    try:
+        resolved_board = kh.resolve_board(board)
+        conn = kh._conn(board=resolved_board)
+        try:
+            run = kanban_db.get_run(conn, run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+            if run.ended_at is not None:
+                raise HTTPException(status_code=409, detail=f"run {run_id} already ended")
+            ok = kanban_db.reclaim_task(conn, run.task_id, reason=payload.reason)
+            if not ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run {run_id} task is not reclaimable",
+                )
+            return {"ok": True, "run_id": run_id, "task_id": run.task_id}
+        finally:
+            conn.close()
     except Exception as exc:
         _map_error(exc)
 
