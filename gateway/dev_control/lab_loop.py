@@ -1524,8 +1524,8 @@ def _await_lab_verification_final_message_repair(
 ) -> dict[str, Any]:
     if run.get("status") != "completed" or not _verification_has_transcript_recovery_warning(run):
         return run
-    deadline = time.monotonic() + _env_float("HERMES_DEV_LAB_VERIFY_FINAL_MESSAGE_GRACE_SECONDS", 5.0)
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + _env_float("HERMES_DEV_LAB_VERIFY_FINAL_MESSAGE_GRACE_SECONDS", 20.0)
+    while True:
         refreshed = refresh_verification_run(
             verification_store=verification_store,
             verification_run_id=run["verification_run_id"],
@@ -1535,6 +1535,8 @@ def _await_lab_verification_final_message_repair(
         run = refreshed
         if not _verification_has_transcript_recovery_warning(run):
             return run
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.5)
     return run
 
