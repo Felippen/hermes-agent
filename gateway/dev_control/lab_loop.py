@@ -726,6 +726,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
     output_contract_score = code_review.get("output_contract_score")
     if output_contract_score is None:
         output_contract_score = verification.get("output_contract_score")
+    cost = _cost_measurement(implementation.get("cost_usd"), runtime=implementation.get("runtime"))
     draft_pr_ready = bool(draft_artifact and draft_artifact.get("ready"))
     terminal_status = _lab_terminal_status(
         implementation=implementation,
@@ -768,6 +769,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
                 "draft_artifact": draft_artifact,
                 "ci_status": ci_status,
                 "code_review": code_review,
+                "cost": cost,
                 "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
                 "gates": {
                     "verification": verification.get("status") or "unknown",
@@ -817,7 +819,11 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         "draft_pr_ready": draft_pr_ready,
         "merge_executed": False,
         "publish_executed": False,
-        "cost_usd": implementation.get("cost_usd"),
+        "cost_usd": cost.get("cost_usd"),
+        "cost_status": cost.get("status"),
+        "cost_measured": cost.get("measured"),
+        "cost_warnings": cost.get("warnings") or [],
+        "cost": cost,
         "duration_seconds": implementation.get("duration_seconds"),
         "pre_verification_cleanup": pre_verification_cleanup,
         "adversarial_fixture": adversarial_fixture if adversarial_fixture.get("requested") else None,
@@ -2408,6 +2414,27 @@ def _first_numeric(*values: Any) -> Optional[float]:
     return None
 
 
+def _cost_measurement(value: Any, *, runtime: Any = None) -> dict[str, Any]:
+    cost_usd = _first_numeric(value)
+    if cost_usd is not None:
+        return {
+            "status": "measured",
+            "measured": True,
+            "cost_usd": cost_usd,
+            "runtime": runtime,
+            "warnings": [],
+        }
+    return {
+        "status": "unavailable",
+        "measured": False,
+        "cost_usd": None,
+        "runtime": runtime,
+        "warnings": [
+            "Worker runtime did not report cost_usd; cost budgets cannot be enforced from this pass.",
+        ],
+    }
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name) or default)
@@ -2529,8 +2556,17 @@ def _apply_breakers(
         report["breaker_reason"] = f"consecutive_out_of_scope:{after_skip_count}"
     elif elapsed > max_seconds:
         report["breaker_reason"] = f"time_budget_exceeded:{elapsed:.1f}s"
-    elif max_cost_usd is not None and float((report.get("execution") or {}).get("cost_usd") or 0.0) > float(max_cost_usd):
-        report["breaker_reason"] = f"cost_budget_exceeded:{float((report.get('execution') or {}).get('cost_usd') or 0.0):.4f}"
+    elif max_cost_usd is not None:
+        execution = report.get("execution") or {}
+        cost_usd = _first_numeric(execution.get("cost_usd"), (execution.get("cost") or {}).get("cost_usd"))
+        if cost_usd is None:
+            report["breaker_reason"] = "cost_unavailable"
+            report["warnings"] = _unique_strings([
+                *(report.get("warnings") or []),
+                "Cost budget was configured, but worker runtime did not report cost_usd; halting instead of treating missing cost as zero.",
+            ])
+        elif cost_usd > float(max_cost_usd):
+            report["breaker_reason"] = f"cost_budget_exceeded:{cost_usd:.4f}"
     else:
         before = float((report.get("scorecard_before") or {}).get("average_success_rate") or 0.0)
         after = float((report.get("scorecard_after") or {}).get("average_success_rate") or before)

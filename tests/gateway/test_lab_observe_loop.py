@@ -1129,6 +1129,33 @@ def test_circuit_breaker_halts_on_cost_budget(monkeypatch, tmp_path):
     assert report["breaker_reason"] == "cost_budget_exceeded:3.0000"
 
 
+def test_circuit_breaker_halts_when_cost_budget_requires_missing_cost(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    store = DevLabLoopStore(db_path)
+    store.upsert_candidate({
+        "prompt": "Exercise unavailable cost breaker.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["gateway/dev_control/lab_loop.py"],
+        "source": "todo",
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        executor=lambda _candidate, _context: {
+            "status": "completed",
+            "cost_status": "unavailable",
+            "cost": {"status": "unavailable", "measured": False, "cost_usd": None},
+        },
+        max_cost_usd=1.0,
+    )
+
+    assert report["status"] == "loop_halted"
+    assert report["breaker_reason"] == "cost_unavailable"
+    assert "missing cost as zero" in report["warnings"][0]
+
+
 def test_seeded_data_remains_distinguishable_from_real_outcomes(monkeypatch, tmp_path):
     db_path, stable_db = _env(monkeypatch, tmp_path)
     seed = seed_lab_data(db_path)
