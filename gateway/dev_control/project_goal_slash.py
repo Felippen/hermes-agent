@@ -12,6 +12,7 @@ from gateway.dev_control.project_goals import (
     create_project_goal,
     get_project_goal_tree,
     list_project_goals,
+    update_project_goal,
 )
 from gateway.dev_control.project_scope import DEFAULT_PROJECT_ID, resolve_project_id
 
@@ -135,6 +136,7 @@ def dispatch_project_goal_slash(
                 "- `/project list [kind]` — flat list\n"
                 "- `/project create <kind> <title> [--parent ID]`\n"
                 "- `/project abandon <goal_id>`\n"
+                "- `/project update <goal_id> [--title T] [--status S]`\n"
                 "- `/project reevaluate <goal_id>`\n"
                 "- `/vision`, `/milestone`, `/pgoal`, `/psubgoal <title>` — quick create\n\n"
                 "Session `/goal` is separate (turn loop). Use `/pgoal` for project goals."
@@ -199,6 +201,33 @@ def dispatch_project_goal_slash(
         except KeyError:
             return {"type": "error", "message": f"Project goal not found: {goal_id}"}
         return {"type": "text", "content": f"✓ Abandoned `{abandoned.get('goal_id')}`: {abandoned.get('title')}"}
+
+    if subcommand == "update":
+        goal_id = (rest[0] if rest else flags.get("goal_id") or "").strip()
+        if not goal_id:
+            return {"type": "error", "message": "Usage: /project update <goal_id> [--title T] [--status S]"}
+        try:
+            updated = update_project_goal(
+                store=goal_store,
+                goal_id=goal_id,
+                title=flags.get("title"),
+                status=flags.get("status"),
+                markdown=flags.get("markdown"),
+                parent_goal_id=flags.get("parent") or flags.get("parent_goal_id"),
+                plan_artifact_id=flags.get("plan_artifact_id") or flags.get("plan_artifact"),
+                ordering=int(flags["ordering"]) if flags.get("ordering") else None,
+            )
+        except KeyError:
+            return {"type": "error", "message": f"Project goal not found: {goal_id}"}
+        except ValueError as exc:
+            return {"type": "error", "message": str(exc)}
+        return {
+            "type": "text",
+            "content": (
+                f"✓ Updated `{updated.get('goal_id')}`: {updated.get('title')} "
+                f"[{updated.get('status')}, {float(updated.get('progress') or 0.0):.0%}]"
+            ),
+        }
 
     if subcommand == "reevaluate":
         goal_id = (rest[0] if rest else flags.get("goal_id") or "").strip()

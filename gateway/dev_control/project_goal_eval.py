@@ -57,7 +57,10 @@ class MachineCriteriaReport:
     manual_criteria: List[Dict[str, Any]] = field(default_factory=list)
 
 
-from gateway.dev_control.project_goals_config import project_goals_tick_enabled
+from gateway.dev_control.project_goals_config import (
+    project_goals_auto_block_on_execution_failure,
+    project_goals_tick_enabled,
+)
 
 
 def resolve_plan_id(
@@ -329,6 +332,23 @@ def reevaluate_project_goal(
         "transition": None,
     }
 
+    block_reason = _execution_block_reason(evidence)
+    if block_reason and project_goals_auto_block_on_execution_failure():
+        updated = store.update(goal_id, {"status": "blocked"})
+        if updated.get("parent_goal_id"):
+            recompute_rollup(store, updated["parent_goal_id"])
+        store.append_judge_audit(goal_id, {
+            "verdict": "blocked",
+            "reason": block_reason,
+            "machine_criteria": machine.results,
+        })
+        result.update({
+            "verdict": "blocked",
+            "reason": block_reason,
+            "transition": {"goal_id": goal_id, "to": "blocked", "reason": block_reason},
+        })
+        return result
+
     if not machine.all_passed:
         result["reason"] = "machine-checkable criteria not satisfied"
         store.append_judge_audit(goal_id, {
@@ -525,3 +545,18 @@ def _project_ids_with_active_subgoals(store: DevProjectGoalStore) -> List[str]:
 def resolve_project_id(value: Optional[str]) -> str:
     text = str(value or "").strip()
     return text or DEFAULT_PROJECT_ID
+
+
+def _execution_block_reason(evidence: Dict[str, Any]) -> Optional[str]:
+    failed = int(evidence.get("failed_task_count") or 0)
+    if failed > 0:
+        return f"{failed} failed execution task(s)"
+    verification = evidence.get("verification") if isinstance(evidence.get("verification"), dict) else {}
+    verdict = str(verification.get("verdict") or "").strip().lower()
+    if verdict in {"failed", "fail", "error"}:
+        return f"verification verdict: {verdict}"
+    ci = evidence.get("ci") if isinstance(evidence.get("ci"), dict) else {}
+    ci_status = str(ci.get("status") or "").strip().lower()
+    if ci_status in {"failure", "failed", "error"}:
+        return f"CI status: {ci_status}"
+    return None

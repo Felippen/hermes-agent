@@ -109,6 +109,8 @@ from gateway.dev_control.project_goals import (
     get_project_goal_tree,
     list_project_goals,
     maybe_create_subgoal_for_approved_artifact,
+    sync_subgoal_plan_id,
+    update_project_goal,
 )
 from gateway.dev_control.project_goal_eval import reevaluate_project_goal
 from gateway.dev_control.project_scope import project_id_from_payload, resolve_project_id
@@ -227,6 +229,7 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_project_goal_tree": {"method": "GET", "path": "/v1/dev/goals/tree"},
         "dev_project_goal_reevaluate": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/reevaluate"},
         "dev_abandon_project_goal": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/abandon"},
+        "dev_update_project_goal": {"method": "PATCH", "path": "/v1/dev/goals/{goal_id}"},
         "dev_execution_plan_draft_review": {"method": "GET", "path": "/v1/dev/execution-plans/{plan_id}/draft-review"},
         "dev_revise_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/revise-draft"},
         "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
@@ -298,6 +301,7 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/goals", adapter._handle_dev_project_goals)
     app.router.add_post("/v1/dev/goals/{goal_id}/reevaluate", adapter._handle_dev_project_goal_reevaluate)
     app.router.add_post("/v1/dev/goals/{goal_id}/abandon", adapter._handle_dev_project_goal_abandon)
+    app.router.add_patch("/v1/dev/goals/{goal_id}", adapter._handle_dev_project_goal_update)
     app.router.add_get("/v1/dev/runtimes/openhands/server", adapter._handle_dev_openhands_server_status)
     app.router.add_post("/v1/dev/runtimes/openhands/server/start", adapter._handle_dev_openhands_server_start)
     app.router.add_post("/v1/dev/runtimes/openhands/server/stop", adapter._handle_dev_openhands_server_stop)
@@ -611,6 +615,29 @@ class DevControlRouteMixin:
             logger.warning("Dev project goal store unavailable: %s", exc)
             return None
         return self._dev_project_goal_store
+
+    def _invalidate_dev_dashboard_read_models(self) -> None:
+        invalidate = getattr(self, "_invalidate_ao_read_models", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _sync_subgoal_plan_id_for_build(
+        self,
+        *,
+        plan_id: str,
+        plan_artifact_id: Optional[str] = None,
+    ) -> None:
+        goal_store = self._ensure_dev_project_goal_store()
+        if goal_store is None:
+            return
+        try:
+            sync_subgoal_plan_id(
+                goal_store,
+                plan_id,
+                plan_artifact_id=plan_artifact_id,
+            )
+        except Exception as exc:
+            logger.warning("Dev project goal plan_id sync failed: %s", exc)
 
     def _ensure_dev_verification_store(self) -> Optional[DevVerificationStore]:
         """Create the Dev verification store on the same state.db as execution plans."""
@@ -939,6 +966,7 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_plan_artifact_cancel(self, request: "web.Request") -> "web.Response":
@@ -986,6 +1014,13 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev plan artifact build failed: {exc}"}}, status=500)
+        plan_id = str(result.get("plan_id") or "").strip()
+        if plan_id:
+            self._sync_subgoal_plan_id_for_build(
+                plan_id=plan_id,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+            )
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_plan_artifact_builds(self, request: "web.Request") -> "web.Response":
@@ -1050,6 +1085,7 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev project goal creation failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_project_goal_tree(self, request: "web.Request") -> "web.Response":
@@ -1100,6 +1136,42 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev project goal re-evaluation failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response(result)
+
+    async def _handle_dev_project_goal_update(self, request: "web.Request") -> "web.Response":
+        """PATCH /v1/dev/goals/{goal_id} — update durable project goal fields."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = update_project_goal(
+                store=store,
+                goal_id=request.match_info["goal_id"],
+                title=body.get("title"),
+                markdown=body.get("markdown"),
+                status=body.get("status"),
+                acceptance_criteria=body.get("acceptance_criteria"),
+                plan_artifact_id=body.get("plan_artifact_id"),
+                parent_goal_id=body.get("parent_goal_id"),
+                ordering=body.get("ordering"),
+                payload=body.get("payload"),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev project goal update failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_project_goal_abandon(self, request: "web.Request") -> "web.Response":
@@ -1114,6 +1186,7 @@ class DevControlRouteMixin:
             result = abandon_project_goal(store=store, goal_id=request.match_info["goal_id"])
         except KeyError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_execution_plan_draft_review(self, request: "web.Request") -> "web.Response":
@@ -1178,6 +1251,7 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_execution_plan_cancel_draft(self, request: "web.Request") -> "web.Response":
@@ -1941,6 +2015,8 @@ class DevControlRouteMixin:
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
+        self._sync_subgoal_plan_id_for_build(plan_id=plan_id)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_verification_runs(self, request: "web.Request") -> "web.Response":

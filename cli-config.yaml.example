@@ -1177,3 +1177,6 @@ dev:
     # Auto-create a linked subgoal when a plan artifact is approved.
     # Env override: HERMES_DEV_PROJECT_GOALS_AUTO_SUBGOAL=1
     auto_subgoal_on_approve: false
+    # Mark active subgoals blocked when execution tasks fail or verification/CI fails.
+    # Defaults on when tick_enabled is true. Env: HERMES_DEV_PROJECT_GOALS_AUTO_BLOCK=1
+    auto_block_on_execution_failure: false

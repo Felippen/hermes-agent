@@ -28,3 +28,14 @@ def test_build_chat_project_context_overlay_includes_snapshot_and_structured_con
 def test_build_chat_project_context_overlay_returns_none_without_payload():
     assert build_chat_project_context_overlay(None) is None
     assert build_chat_project_context_overlay({}) is None
+
+
+def test_build_chat_project_context_overlay_includes_goal_digest():
+    overlay = build_chat_project_context_overlay({
+        "project_id": "OrynWorkspace",
+        "project_goal_tree_digest": "## Project goals\n\n- **vision** North star [active, 50%]",
+    })
+
+    assert overlay is not None
+    assert "## Project goals" in overlay
+    assert "North star" in overlay

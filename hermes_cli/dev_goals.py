@@ -13,7 +13,9 @@ from gateway.dev_control.project_goals import (
     create_project_goal,
     get_project_goal_tree,
     list_project_goals,
+    update_project_goal,
 )
+from gateway.dev_control.project_goal_eval import reevaluate_project_goal
 from gateway.dev_control.project_scope import DEFAULT_PROJECT_ID, resolve_project_id
 from hermes_constants import get_hermes_home
 
@@ -76,13 +78,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     abandon.add_argument("goal_id")
     abandon.add_argument("--json", action="store_true")
 
+    update = goals_sub.add_parser("update", help="Update a project goal")
+    update.add_argument("goal_id")
+    update.add_argument("--title", default=None)
+    update.add_argument("--status", default=None)
+    update.add_argument("--markdown", default=None)
+    update.add_argument("--parent-goal-id", default=None)
+    update.add_argument("--plan-artifact-id", default=None)
+    update.add_argument("--ordering", type=int, default=None)
+    update.add_argument("--json", action="store_true")
+
+    reevaluate = goals_sub.add_parser("reevaluate", help="Re-evaluate a project goal")
+    reevaluate.add_argument("goal_id")
+    reevaluate.add_argument("--json", action="store_true")
+
     return goals
 
 
 def dev_goals_command(args: argparse.Namespace) -> int:
     command = getattr(args, "goals_command", None)
     if not command:
-        print("Usage: hermes dev goals {create,list,tree,abandon} …", file=sys.stderr)
+        print("Usage: hermes dev goals {create,list,tree,abandon,update,reevaluate} …", file=sys.stderr)
         return 2
 
     store = _goal_store()
@@ -132,6 +148,23 @@ def dev_goals_command(args: argparse.Namespace) -> int:
 
         if command == "abandon":
             result = abandon_project_goal(store=store, goal_id=args.goal_id)
+            return _emit(result, as_json=args.json)
+
+        if command == "update":
+            result = update_project_goal(
+                store=store,
+                goal_id=args.goal_id,
+                title=args.title,
+                markdown=args.markdown,
+                status=args.status,
+                parent_goal_id=args.parent_goal_id,
+                plan_artifact_id=args.plan_artifact_id,
+                ordering=args.ordering,
+            )
+            return _emit(result, as_json=args.json)
+
+        if command == "reevaluate":
+            result = reevaluate_project_goal(store=store, goal_id=args.goal_id)
             return _emit(result, as_json=args.json)
     except (ValueError, KeyError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
