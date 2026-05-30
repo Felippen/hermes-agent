@@ -140,6 +140,40 @@ def test_openhands_bridge_server_methods_normalize_session_and_events():
     assert create_request["initial_message"]["run"] is True
 
 
+def test_openhands_bridge_treats_final_response_as_completed_when_status_stays_running():
+    class FakeServerBridge(OpenHandsBridge):
+        def __init__(self):
+            super().__init__(server_url="http://127.0.0.1:3000")
+            self.requests = []
+
+        def _request(self, method, path, payload=None, *, timeout=None):
+            self.requests.append((method, path, payload))
+            if method == "GET" and path == "/conversations/oh-running":
+                return {"id": "oh-running", "project_id": "OrynWorkspace", "status": "running"}
+            if method == "GET" and path == "/conversations/oh-running/agent_final_response":
+                return {
+                    "final_response": (
+                        "```json DEV_WORKER_EVIDENCE\n"
+                        "{\"summary\":\"Repository readable.\",\"findings\":[],"
+                        "\"files_read\":[\"README.md\"],\"files_changed\":[],"
+                        "\"commands_run\":[],\"verification\":{\"status\":\"not_run\","
+                        "\"evidence\":[\"Read-only README.md inspection completed.\"]},"
+                        "\"unresolved_gaps\":[],\"confidence\":0.8,\"final_marker\":null}\n"
+                        "```"
+                    )
+                }
+            if method == "GET" and path == "/conversations/oh-running/events/search?limit=80":
+                return {"items": [{"message": "worker log"}]}
+            raise AssertionError((method, path, payload))
+
+    status = FakeServerBridge().status("oh-running")
+
+    assert status is not None
+    assert status.display_status == "completed"
+    assert status.summary and "DEV_WORKER_EVIDENCE" in status.summary
+    assert status.output_tail and "DEV_WORKER_EVIDENCE" in status.output_tail
+
+
 @pytest.mark.parametrize(
     ("raw_status", "display_status"),
     [

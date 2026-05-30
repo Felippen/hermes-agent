@@ -244,10 +244,20 @@ class OpenHandsBridge:
             return None
         session_payload = payload.get("conversation") or payload
         session = OpenHandsSession.from_payload(session_payload)
-        if session.id and session.is_terminal:
-            final_response = self._agent_final_response(session.id)
-            if final_response and not session.summary:
+        final_response = self._agent_final_response(session.id) if session.id else ""
+        if final_response:
+            if not session.summary:
                 session.summary = final_response
+            if not session.is_terminal and session.display_status != "failed":
+                session.status = "completed"
+        elif (
+            session.id
+            and not session.is_terminal
+            and session.display_status != "failed"
+            and "DEV_WORKER_EVIDENCE" in str(session.summary or "")
+        ):
+            session.status = "completed"
+        if session.id and session.is_terminal:
             output_tail = self.capture_output(session, lines=80)
             if output_tail:
                 session.output_tail = output_tail

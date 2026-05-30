@@ -12,7 +12,7 @@ EVIDENCE_BLOCK_RE = re.compile(
     r"```(?:json)?\s*(?:DEV_WORKER_EVIDENCE|dev_worker_evidence)?\s*(\{.*?\})\s*```",
     re.IGNORECASE | re.DOTALL,
 )
-VALID_VERIFICATION_STATUSES = {"passed", "failed", "not_run", "partial"}
+VALID_VERIFICATION_STATUSES = {"passed", "failed", "not_run", "partial", "unknown"}
 
 
 WORKER_OUTPUT_CONTRACT_V2_PROMPT = """\
@@ -41,7 +41,7 @@ Use this evidence block shape:
 
 Rules:
 - Use valid JSON in the fenced block.
-- Use verification.status as one of: passed, failed, not_run, partial.
+- Use verification.status as one of: passed, failed, not_run, partial, unknown.
 - If no files, commands, changes, gaps, or evidence exist, use an empty array.
 - If a final marker is required, set final_marker to that exact marker and make
   the final output line exactly: FINAL_MARKER: <marker>.
@@ -67,23 +67,32 @@ def parse_worker_output_contract(text: Optional[str]) -> Dict[str, Any]:
     """
 
     value = str(text or "")
-    empty = _empty_result("missing", "Worker output did not include a DEV_WORKER_EVIDENCE JSON block.")
+    empty = _empty_result("warning", "Worker output did not include a DEV_WORKER_EVIDENCE JSON block.")
     if not value.strip():
         return empty
-    match = _find_evidence_block(value)
-    if not match:
+    raw_json = _extract_evidence_json(value)
+    if raw_json is None:
         if "DEV_WORKER_EVIDENCE" in value.upper():
-            return _empty_result("invalid", "Worker evidence block marker was present but no valid JSON object could be extracted.")
+            return _empty_result("warning", "Worker evidence block marker was present but no valid JSON object could be extracted.")
         return empty
-    raw_json = match.group(1).strip()
     try:
         payload = json.loads(raw_json)
     except Exception as exc:
-        result = _empty_result("invalid", f"Worker evidence block is not valid JSON: {exc}")
-        result["output_contract_raw"] = raw_json
+        repaired_json = _escape_control_characters_in_strings(raw_json)
+        try:
+            payload = json.loads(repaired_json)
+        except Exception:
+            result = _empty_result("warning", f"Worker evidence block is not valid JSON: {exc}")
+            result["output_contract_raw"] = raw_json
+            return result
+        result = normalize_worker_evidence(payload, raw_json=raw_json)
+        warning = result.get("output_contract_warning")
+        repair_warning = "raw control characters in JSON strings were escaped"
+        result["output_contract_status"] = "warning" if result.get("output_contract_status") == "ok" else result.get("output_contract_status")
+        result["output_contract_warning"] = f"{warning}; {repair_warning}" if warning else repair_warning
         return result
     if not isinstance(payload, dict):
-        result = _empty_result("invalid", "Worker evidence block must be a JSON object.")
+        result = _empty_result("warning", "Worker evidence block must be a JSON object.")
         result["output_contract_raw"] = raw_json
         return result
     return normalize_worker_evidence(payload, raw_json=raw_json)
@@ -91,7 +100,7 @@ def parse_worker_output_contract(text: Optional[str]) -> Dict[str, Any]:
 
 def normalize_worker_evidence(payload: Dict[str, Any], *, raw_json: Optional[str] = None) -> Dict[str, Any]:
     warnings: list[str] = []
-    summary = _string(payload.get("summary"))
+    summary = _string(payload.get("summary") or payload.get("structured_summary"))
     findings = _string_list(payload.get("findings"))
     files_read = _string_list(payload.get("files_read"))
     files_changed = _string_list(payload.get("files_changed"))
@@ -100,9 +109,11 @@ def normalize_worker_evidence(payload: Dict[str, Any], *, raw_json: Optional[str
     verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
     verification_status = _string((verification or {}).get("status")).lower() or "not_run"
     if verification_status not in VALID_VERIFICATION_STATUSES:
-        warnings.append("verification.status is not one of passed, failed, not_run, partial")
-        verification_status = "not_run"
+        warnings.append("verification.status is not one of passed, failed, not_run, partial, unknown")
+        verification_status = "unknown"
     verification_evidence = _string_list((verification or {}).get("evidence"))
+    if not verification_evidence and _string((verification or {}).get("reason")):
+        verification_evidence = [_string((verification or {}).get("reason"))]
     confidence = _confidence(payload.get("confidence"), warnings)
     final_marker = _string(payload.get("final_marker")) or None
 
@@ -121,7 +132,7 @@ def normalize_worker_evidence(payload: Dict[str, Any], *, raw_json: Optional[str
     if not isinstance((verification or {}).get("evidence"), list):
         warnings.append("verification.evidence must be an array")
 
-    status = "warning" if warnings else "ok"
+    status = "failed" if verification_status == "failed" else ("warning" if warnings else "ok")
     result = {
         "output_contract_version": OUTPUT_CONTRACT_VERSION,
         "output_contract_status": status,
@@ -171,6 +182,7 @@ def output_contract_fields_from_event(event: Optional[Dict[str, Any]]) -> Dict[s
         "output_contract_warning",
         "structured_summary",
         "findings",
+        "files_read",
         "files_changed",
         "commands_run",
         "verification_status",
@@ -191,6 +203,79 @@ def _find_evidence_block(text: str) -> Optional[re.Match[str]]:
         preferred = [match for match in matches if "DEV_WORKER_EVIDENCE" in match.group(0).upper()]
         return preferred[-1] if preferred else matches[-1]
     return None
+
+
+def _extract_evidence_json(text: str) -> Optional[str]:
+    match = _find_evidence_block(text)
+    if match:
+        return match.group(1).strip()
+    marker = re.search(r"DEV_WORKER_EVIDENCE", text, re.IGNORECASE)
+    if not marker:
+        return None
+    start = text.find("{", marker.end())
+    if start < 0:
+        return None
+    return _balanced_json_object(text, start)
+
+
+def _balanced_json_object(text: str, start: int) -> Optional[str]:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1].strip()
+    return None
+
+
+def _escape_control_characters_in_strings(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                result.append(char)
+                escape = False
+                continue
+            if char == "\\":
+                result.append(char)
+                escape = True
+                continue
+            if char == '"':
+                result.append(char)
+                in_string = False
+                continue
+            if char == "\n":
+                result.append("\\n")
+                continue
+            if char == "\r":
+                result.append("\\r")
+                continue
+            if char == "\t":
+                result.append("\\t")
+                continue
+            result.append(char)
+            continue
+        result.append(char)
+        if char == '"':
+            in_string = True
+    return "".join(result)
 
 
 def _empty_result(status: str, warning: str) -> Dict[str, Any]:
