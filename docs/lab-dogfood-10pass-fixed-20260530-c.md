@@ -1,0 +1,1 @@
+2026-05-30: Supervised fixed 10-pass docs item 3 recorded.
