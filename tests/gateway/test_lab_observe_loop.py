@@ -670,7 +670,70 @@ def test_lab_executor_marks_recovered_review_json_unmeasured(monkeypatch, tmp_pa
     assert review["status"] == "needs_attention"
     assert review["measured"] is False
     assert review["verdict"] == "unknown"
-    assert "recovered transcript JSON is advisory only" in " ".join(review["warnings"])
+    assert "parsed review JSON is advisory only" in " ".join(review["warnings"])
+    assert report["gate_verdicts"]["review"] == "unknown"
+    assert outcome["code_review_verdict"] == "unknown"
+
+
+def test_lab_executor_marks_template_review_json_unmeasured(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+
+    def fake_run_command(args, *, timeout=30.0):
+        if args[:2] == ["gh", "pr"]:
+            return {"returncode": 0, "stdout": "https://github.com/Felippen/Oryn/pull/458\n", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("gateway.dev_control.lab_loop._run_command", fake_run_command)
+    transcript = """
+```json DEV_WORKER_EVIDENCE
+{"structured_summary":"Implemented docs task.","findings":[],"verification_status":"passed","verification_evidence":["fixture"],"files_changed":["docs/review-template.md"],"commands_run":[]}
+```
+```json DEV_CODE_REVIEW_RESULT
+{
+  "object": "hermes.dev_code_review_result",
+  "verdict": "approved",
+  "findings": [],
+  "summary": "One sentence explaining the review decision.",
+  "evidence_refs": ["gh pr diff <number> --repo <owner/repo> --patch"]
+}
+```
+"""
+    bridge = _FakeLabRouter(tmp_path / "lab", diff_paths=["docs/review-template.md"], transcript=transcript)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Measure templated R4 review output.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/review-template.md"],
+        "source": "docs",
+        "payload": {
+            "branch": "lab/dogfood/review-template",
+            "ci_status": {"state": "success", "repo": "Felippen/Oryn"},
+            "draft_pr_repo": "Felippen/Oryn",
+            "draft_pr_remote": "lab-origin",
+            "draft_pr_base": "main",
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "make test",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        sources=["reliability"],
+        bridge=bridge,
+    )
+
+    review = report["execution"]["code_review"]
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert review["status"] == "needs_attention"
+    assert review["measured"] is False
+    assert review["verdict"] == "unknown"
+    assert "parsed review JSON is advisory only" in " ".join(review["warnings"])
     assert report["gate_verdicts"]["review"] == "unknown"
     assert outcome["code_review_verdict"] == "unknown"
 

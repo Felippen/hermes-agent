@@ -1694,10 +1694,11 @@ def _measure_code_review_r4(
         '  "object": "hermes.dev_code_review_result",',
         '  "verdict": "approved",',
         '  "findings": [],',
-        '  "summary": "One sentence explaining the review decision.",',
-        '  "evidence_refs": ["gh pr diff <number> --repo <owner/repo> --patch"]',
+        '  "summary": "PR diff satisfies the plan intent with no blocking findings.",',
+        f'  "evidence_refs": ["gh pr diff {pr_number} --repo {repo} --patch"]',
         "}",
         "```",
+        "- Replace the example verdict/summary/findings with the real review decision; do not copy placeholder text.",
         "",
         "Lab R4 constraints:",
         "- Review only. Do not edit files, commit, push, merge, approve, or publish.",
@@ -1733,7 +1734,7 @@ def _measure_code_review_r4(
         status = "completed" if actionable and contract_clean else "needs_attention"
         if (not actionable or not contract_clean) and parsed.get("verdict") != "unknown":
             extra_warning = (
-                "Code-review result did not satisfy the fenced DEV_CODE_REVIEW_RESULT contract; recovered transcript JSON is advisory only."
+                "Code-review result did not satisfy the fenced DEV_CODE_REVIEW_RESULT contract; parsed review JSON is advisory only."
                 if not contract_clean
                 else "Code-review result was not actionable: commented/empty review requires concrete findings or summary."
             )
@@ -1880,13 +1881,29 @@ def _code_review_result_is_actionable(review: dict[str, Any]) -> bool:
 
 
 def _code_review_result_has_clean_contract(review: dict[str, Any]) -> bool:
+    return not _code_review_contract_issues(review)
+
+
+def _code_review_contract_issues(review: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
     warning_text = " ".join(str(item) for item in (review or {}).get("warnings") or []).lower()
     contract_failures = (
         "dev_code_review_result block was missing",
         "dev_code_review_result json was invalid",
         "unexpected code-review result object type",
     )
-    return not any(item in warning_text for item in contract_failures)
+    if any(item in warning_text for item in contract_failures):
+        issues.append("missing_or_invalid_fenced_block")
+    summary = str((review or {}).get("summary") or "").strip().lower()
+    if summary in {"one sentence explaining the review decision.", "one sentence explaining the review decision"}:
+        issues.append("template_summary")
+    for ref in (review or {}).get("evidence_refs") or []:
+        text = json.dumps(ref, sort_keys=True) if isinstance(ref, dict) else str(ref)
+        lowered = text.lower()
+        if "<number>" in lowered or "<owner/repo>" in lowered or "<repo>" in lowered:
+            issues.append("template_evidence_ref")
+            break
+    return issues
 
 
 def _capture_lab_output(bridge: Any, runtime: str, session: Any) -> str:
