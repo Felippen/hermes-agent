@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 from gateway.dev_control.acceptance_verification import (
     DevVerificationStore,
     launch_verification_run,
@@ -726,7 +727,15 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
     output_contract_score = code_review.get("output_contract_score")
     if output_contract_score is None:
         output_contract_score = verification.get("output_contract_score")
-    cost = _cost_measurement(implementation.get("cost_usd"), runtime=implementation.get("runtime"))
+    cost = _cost_measurement(
+        implementation.get("cost_usd"),
+        runtime=implementation.get("runtime"),
+        session_usage_cost=_worker_session_usage_cost(
+            implementation,
+            started_at=now,
+            completed_at=time.time(),
+        ),
+    )
     draft_pr_ready = bool(draft_artifact and draft_artifact.get("ready"))
     terminal_status = _lab_terminal_status(
         implementation=implementation,
@@ -2462,7 +2471,7 @@ def _first_numeric(*values: Any) -> Optional[float]:
     return None
 
 
-def _cost_measurement(value: Any, *, runtime: Any = None) -> dict[str, Any]:
+def _cost_measurement(value: Any, *, runtime: Any = None, session_usage_cost: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     cost_usd = _first_numeric(value)
     if cost_usd is not None:
         return {
@@ -2470,8 +2479,13 @@ def _cost_measurement(value: Any, *, runtime: Any = None) -> dict[str, Any]:
             "measured": True,
             "cost_usd": cost_usd,
             "runtime": runtime,
+            "source": "worker_runtime",
             "warnings": [],
         }
+    if session_usage_cost:
+        payload = dict(session_usage_cost)
+        payload.setdefault("runtime", runtime)
+        return payload
     return {
         "status": "unavailable",
         "measured": False,
@@ -2480,6 +2494,179 @@ def _cost_measurement(value: Any, *, runtime: Any = None) -> dict[str, Any]:
         "warnings": [
             "Worker runtime did not report cost_usd; cost budgets cannot be enforced from this pass.",
         ],
+    }
+
+
+def _worker_session_usage_cost(
+    implementation: dict[str, Any],
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    workspace_path = str(implementation.get("workspace_path") or "").strip()
+    if not workspace_path:
+        return None
+    launch_session = ((implementation.get("launch") or {}).get("session") or {})
+    agent = str(launch_session.get("agent") or implementation.get("agent") or "").strip().lower()
+    model = str(launch_session.get("model") or implementation.get("model") or "").strip()
+    session = _codex_session_usage_for_workspace(
+        workspace_path,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    if not session:
+        return None
+    usage_payload = session.get("usage") or {}
+    provider = str(session.get("provider") or "").strip()
+    if agent == "codex" or session.get("source") == "codex_session_jsonl":
+        provider = "openai-codex"
+    model = model or str(session.get("model") or "").strip() or "unknown"
+    usage = _canonical_usage_from_codex_tokens(usage_payload)
+    token_total = int(usage_payload.get("total_tokens") or usage.total_tokens or 0)
+    base = {
+        "source": "codex_session_jsonl",
+        "status": "unavailable",
+        "measured": False,
+        "cost_usd": None,
+        "runtime": implementation.get("runtime"),
+        "provider": provider or None,
+        "model": model,
+        "session_id": session.get("session_id"),
+        "session_path": session.get("session_path"),
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "output_tokens": usage.output_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "total_tokens": token_total,
+            "raw": usage_payload,
+        },
+        "warnings": [],
+    }
+    if not token_total:
+        base["warnings"] = ["Codex session was found, but it did not contain token_count usage."]
+        return base
+    cost = estimate_usage_cost(model, usage, provider=provider or None)
+    if cost.amount_usd is None:
+        base["warnings"] = [
+            f"Codex session usage was found, but pricing is unavailable for provider/model {provider or 'unknown'}/{model}; cost budgets cannot be enforced from this pass.",
+        ]
+        base["pricing_status"] = cost.status
+        base["pricing_source"] = cost.source
+        return base
+    base.update({
+        "status": cost.status,
+        "measured": True,
+        "cost_usd": float(cost.amount_usd),
+        "pricing_status": cost.status,
+        "pricing_source": cost.source,
+        "pricing_version": cost.pricing_version,
+    })
+    if cost.notes:
+        base["warnings"] = list(cost.notes)
+    return base
+
+
+def _canonical_usage_from_codex_tokens(usage: dict[str, Any]) -> CanonicalUsage:
+    input_total = int(_first_numeric(usage.get("input_tokens")) or 0)
+    cache_read = int(_first_numeric(usage.get("cached_input_tokens"), usage.get("cache_read_tokens")) or 0)
+    output = int(_first_numeric(usage.get("output_tokens")) or 0)
+    reasoning = int(_first_numeric(usage.get("reasoning_output_tokens"), usage.get("reasoning_tokens")) or 0)
+    return CanonicalUsage(
+        input_tokens=max(0, input_total - cache_read),
+        cache_read_tokens=max(0, cache_read),
+        output_tokens=max(0, output),
+        reasoning_tokens=max(0, reasoning),
+    )
+
+
+def _codex_session_usage_for_workspace(
+    workspace_path: str,
+    *,
+    started_at: Optional[float] = None,
+    completed_at: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    workspace = str(Path(workspace_path).expanduser().resolve())
+    sessions_root = _codex_sessions_root()
+    if not sessions_root.exists():
+        return None
+    matches: list[dict[str, Any]] = []
+    lower_bound = float(started_at or 0) - 3600
+    upper_bound = float(completed_at or time.time()) + 3600
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if started_at is not None and (mtime < lower_bound or mtime > upper_bound):
+            continue
+        parsed = _read_codex_session_usage_file(path)
+        if not parsed:
+            continue
+        cwd = str(parsed.get("cwd") or "").strip()
+        if not cwd:
+            continue
+        try:
+            resolved_cwd = str(Path(cwd).expanduser().resolve())
+        except OSError:
+            resolved_cwd = cwd
+        if resolved_cwd == workspace:
+            matches.append(parsed)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return matches[0]
+
+
+def _codex_sessions_root() -> Path:
+    configured = os.getenv("HERMES_DEV_LAB_CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser() / "sessions"
+    lab_home = os.getenv("ORYN_LAB_HOME")
+    if lab_home:
+        return Path(lab_home).expanduser() / ".codex" / "sessions"
+    return Path.home() / ".codex" / "sessions"
+
+
+def _read_codex_session_usage_file(path: Path) -> Optional[dict[str, Any]]:
+    meta: dict[str, Any] = {}
+    usage: dict[str, Any] = {}
+    completed_at: Optional[float] = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                if entry.get("type") == "session_meta":
+                    meta = payload
+                elif payload.get("type") == "token_count":
+                    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                    total = info.get("total_token_usage")
+                    if isinstance(total, dict):
+                        usage = total
+                elif payload.get("type") == "task_complete":
+                    completed_at = _first_numeric(payload.get("completed_at"))
+    except OSError:
+        return None
+    if not meta:
+        return None
+    try:
+        updated_at = path.stat().st_mtime
+    except OSError:
+        updated_at = completed_at or 0
+    return {
+        "source": "codex_session_jsonl",
+        "session_id": meta.get("id"),
+        "session_path": str(path),
+        "cwd": meta.get("cwd"),
+        "provider": meta.get("model_provider"),
+        "model": meta.get("model"),
+        "usage": usage,
+        "completed_at": completed_at,
+        "updated_at": updated_at,
     }
 
 

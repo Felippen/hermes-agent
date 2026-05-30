@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pytest
 import shutil
@@ -17,6 +18,7 @@ from gateway.dev_control.lab_loop import (
     _recover_lab_verification_from_transcript,
     _touched_paths_from_worktree,
     _verification_timeout_seconds,
+    _worker_session_usage_cost,
     finalize_pending_lab_ci_outcomes,
     loop_health,
     observe_profile_preflight,
@@ -123,6 +125,20 @@ class _FakeLabRouter:
         return self.transcript or "PHASE16_FIXTURE_OK_DONE Completed the lab dogfood task with scoped evidence."
 
 
+class _CostReportingFakeLabRouter(_FakeLabRouter):
+    def spawn(self, *args, **kwargs):
+        session = super().spawn(*args, **kwargs)
+        _write_codex_usage_session(
+            self.lab_home,
+            workspace_path=Path(session.workspace_path or ""),
+            input_tokens=1000,
+            cached_input_tokens=400,
+            output_tokens=120,
+            total_tokens=1120,
+        )
+        return session
+
+
 def _init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -131,6 +147,55 @@ def _init_git_repo(path: Path) -> None:
     (path / "README.md").write_text("seed\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=path, check=True)
+
+
+def _write_codex_usage_session(
+    lab_home: Path,
+    *,
+    workspace_path: Path,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+) -> Path:
+    session_dir = lab_home / ".codex" / "sessions" / "2026" / "05" / "30"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = session_dir / f"rollout-test-{workspace_path.name}.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-05-30T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": f"codex-{workspace_path.name}",
+                "cwd": str(workspace_path),
+                "model_provider": "openai",
+                "model": None,
+            },
+        },
+        {
+            "timestamp": "2026-05-30T00:00:01.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
+                        "reasoning_output_tokens": 25,
+                        "total_tokens": total_tokens,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-05-30T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "completed_at": 1780099202},
+        },
+    ]
+    path.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    return path
 
 
 def test_preapproved_dogfood_pass_writes_real_outcome_and_keeps_stable_db(monkeypatch, tmp_path):
@@ -1289,6 +1354,69 @@ def test_circuit_breaker_halts_on_cost_budget(monkeypatch, tmp_path):
 
     assert report["status"] == "loop_halted"
     assert report["breaker_reason"] == "cost_budget_exceeded:3.0000"
+
+
+def test_lab_cost_telemetry_reads_codex_session_usage(monkeypatch, tmp_path):
+    lab_home = tmp_path / "lab"
+    monkeypatch.setenv("ORYN_LAB_HOME", str(lab_home))
+    workspace = lab_home / "worktrees" / "dogfood-usage"
+    workspace.mkdir(parents=True)
+    session_file = _write_codex_usage_session(
+        lab_home,
+        workspace_path=workspace,
+        input_tokens=1200,
+        cached_input_tokens=500,
+        output_tokens=150,
+        total_tokens=1350,
+    )
+
+    cost = _worker_session_usage_cost({
+        "runtime": "ao",
+        "workspace_path": str(workspace),
+        "launch": {"session": {"agent": "codex", "model": "gpt-5.5"}},
+    })
+
+    assert cost is not None
+    assert cost["source"] == "codex_session_jsonl"
+    assert cost["status"] == "included"
+    assert cost["measured"] is True
+    assert cost["cost_usd"] == 0.0
+    assert cost["provider"] == "openai-codex"
+    assert cost["model"] == "gpt-5.5"
+    assert cost["session_path"] == str(session_file)
+    assert cost["usage"]["input_tokens"] == 700
+    assert cost["usage"]["cache_read_tokens"] == 500
+    assert cost["usage"]["output_tokens"] == 150
+    assert cost["usage"]["total_tokens"] == 1350
+
+
+def test_lab_loop_uses_codex_session_cost_for_budget(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Exercise Codex session cost telemetry.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["docs/cost.md"],
+        "source": "docs",
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        bridge=_CostReportingFakeLabRouter(tmp_path / "lab", diff_paths=["docs/cost.md"]),
+        sources=["reliability"],
+        max_cost_usd=0.0,
+    )
+
+    assert report["status"] == "completed"
+    assert report.get("breaker_reason") is None
+    cost = report["execution"]["cost"]
+    assert cost["status"] == "included"
+    assert cost["measured"] is True
+    assert cost["cost_usd"] == 0.0
+    assert cost["usage"]["total_tokens"] == 1120
+    outcome = DevReliabilityStore(db_path).list_outcomes(limit=1)[0]
+    assert outcome["source_refs"]["cost"]["status"] == "included"
 
 
 def test_circuit_breaker_halts_when_cost_budget_requires_missing_cost(monkeypatch, tmp_path):
