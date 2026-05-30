@@ -40,7 +40,10 @@ UNRUNNABLE_OUTPUT_RES = [
     )
 ]
 TRANSCRIPT_EXIT_RE = re.compile(
-    r"\b(?:"
+    r"(?:"
+    r'"?exit_code"?'
+    r"|exit[_ ]code"
+    r"|\b"
     r"exit(?:ed)?(?:\s+\w+){0,4}?\s+with\s+(?:code|status)"
     r"|exit(?:ed)?(?:\s+with)?\s+(?:code|status)"
     r"|returncode"
@@ -318,13 +321,8 @@ def parse_transcript_verification_results(text: Optional[str], executable_comman
         criterion_id = str(command.get("criterion_id") or "").strip()
         if not command_text:
             continue
-        window = _transcript_window_for_command(value, command_text)
-        if not window and criterion_id:
-            window = _transcript_window_for_command(value, criterion_id)
-        if not window:
-            continue
-        exit_code = _exit_code_from_transcript(window)
-        if exit_code is None:
+        window, exit_code = _recover_transcript_window(value, command_text, criterion_id)
+        if not window or exit_code is None:
             continue
         results.append({
             "criterion_id": criterion_id,
@@ -946,16 +944,39 @@ def _parse_results_json(raw_json: str) -> Dict[str, Any]:
 
 
 def _transcript_window_for_command(text: str, command: str) -> str:
-    index = text.find(command)
-    if index < 0:
-        return ""
-    return text[index : min(len(text), index + 2500)]
+    window, _exit_code = _recover_transcript_window(text, command, "")
+    return window
+
+
+def _recover_transcript_window(text: str, command: str, criterion_id: str = "") -> tuple[str, Optional[int]]:
+    for needle in (command, criterion_id):
+        if not needle:
+            continue
+        for match in reversed(list(re.finditer(re.escape(needle), text))):
+            forward_window = text[match.start() : min(len(text), match.start() + 2500)]
+            if _is_prompt_template_transcript_window(forward_window):
+                continue
+            window = text[max(0, match.start() - 1000) : min(len(text), match.start() + 2500)]
+            exit_code = _exit_code_from_transcript(window)
+            if exit_code is not None:
+                return window, exit_code
+    return "", None
+
+
+def _is_prompt_template_transcript_window(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "include the real test/build summary line" in lowered:
+        return True
+    if "set exit_code to the real process exit code" in lowered:
+        return True
+    return False
 
 
 def _exit_code_from_transcript(text: str) -> Optional[int]:
-    match = TRANSCRIPT_EXIT_RE.search(text)
-    if not match:
+    matches = list(TRANSCRIPT_EXIT_RE.finditer(text))
+    if not matches:
         return None
+    match = matches[-1]
     try:
         return int(match.group("code"))
     except Exception:

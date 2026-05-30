@@ -360,6 +360,46 @@ def test_verification_recovers_successful_exit_code_phrase():
     assert "22 tests passed" in parsed["results"][0]["output_excerpt"]
 
 
+def test_verification_transcript_recovery_skips_prompt_template_and_reads_json_exit_code():
+    transcript = """
+Allowed commands:
+- crit-1: scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+
+Final output is mandatory. Set exit_code to the real process exit code.
+```json DEV_VERIFICATION_RESULTS
+{"object":"hermes.dev_verification_results","results":[{"criterion_id":"crit-1","command_run":"scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q","exit_code":0,"output_excerpt":"include the real test/build summary line","notes":""}]}
+```
+
+• Ran scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q
+  └ error: no virtualenv found in /Users/felipelamartine/.oryn-lab/.worktrees/
+    HermesAgentLab/lab-hermes-agent-90/.venv or /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/venv
+
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/
+test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 1,
+      "output_excerpt": "error: no virtualenv found in /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/.venv or /Users/felipelamartine/.oryn-lab/.worktrees/HermesAgentLab/lab-hermes-agent-90/venv",
+      "notes": ""
+    }
+  ]
+}
+"""
+
+    parsed = parse_transcript_verification_results(
+        transcript,
+        [{"criterion_id": "crit-1", "command": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"}],
+    )
+
+    assert parsed["results"][0]["criterion_id"] == "crit-1"
+    assert parsed["results"][0]["exit_code"] == 1
+    assert "no virtualenv found" in parsed["results"][0]["output_excerpt"]
+
+
 def test_verification_unfenced_parser_prefers_latest_results_object():
     transcript = """
 {
