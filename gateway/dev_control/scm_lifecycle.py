@@ -554,6 +554,7 @@ def parse_code_review_result(text_or_payload: Any) -> Dict[str, Any]:
                 else:
                     payload = {}
                     warnings.append(f"DEV_CODE_REVIEW_RESULT JSON was invalid: {exc}")
+    payload = _unwrap_code_review_payload(payload)
     verdict = _normalize_review_verdict(payload.get("verdict"))
     findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
     if payload.get("object") and payload.get("object") != CODE_REVIEW_OBJECT:
@@ -577,7 +578,7 @@ def _extract_unfenced_code_review_payload(text: str) -> Dict[str, Any]:
         return {}
     payload = _extract_json_object_containing(text, CODE_REVIEW_OBJECT)
     if payload:
-        return payload
+        return _unwrap_code_review_payload(payload)
     verdict_match = re.search(r'"verdict"\s*:\s*"(approved|changes_requested|commented|unknown)"', text, re.IGNORECASE)
     if not verdict_match:
         return {}
@@ -604,6 +605,13 @@ def _extract_unfenced_code_review_payload(text: str) -> Dict[str, Any]:
         "summary": summary,
         "evidence_refs": evidence_refs,
     }
+
+
+def _unwrap_code_review_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    wrapped = payload.get(CODE_REVIEW_OBJECT)
+    if isinstance(wrapped, dict):
+        return {"object": CODE_REVIEW_OBJECT, **wrapped}
+    return payload
 
 
 def _extract_json_object_containing(text: str, marker: str) -> Dict[str, Any]:
@@ -637,7 +645,7 @@ def _extract_json_object_containing(text: str, marker: str) -> Dict[str, Any]:
                         payload = json.loads(candidate)
                     except Exception:
                         break
-                    if payload.get("object") == marker:
+                    if payload.get("object") == marker or isinstance(payload.get(marker), dict):
                         return payload
                     break
     return {}

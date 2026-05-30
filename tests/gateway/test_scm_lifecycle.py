@@ -184,6 +184,27 @@ def test_code_review_result_parser_recovers_wrapped_unfenced_worker_json():
     assert parsed["evidence_refs"] == ["Felippen/hermes-agent#23", "PR diff: docs/lab-dogfood.md:1"]
 
 
+def test_code_review_result_parser_recovers_marker_key_wrapped_json():
+    parsed = parse_code_review_result(
+        """
+        {
+          "hermes.dev_code_review_result": {
+            "verdict": "approved",
+            "findings": [],
+            "summary": "PR #30 was inspected using only gh pr view/diff.",
+            "evidence_refs": [
+              {"source": "gh pr diff 30 --repo Felippen/hermes-agent --patch"}
+            ]
+          }
+        }
+        """
+    )
+
+    assert parsed["verdict"] == "approved"
+    assert parsed["summary"].startswith("PR #30")
+    assert parsed["evidence_refs"][0]["source"].startswith("gh pr diff 30")
+
+
 @pytest.mark.parametrize(
     ("name", "kwargs", "gate"),
     [
