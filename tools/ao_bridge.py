@@ -544,9 +544,12 @@ class AOBridge:
             or str(Path.home() / ".codex")
         )
         shim_path = str(self.codex_shim_dir)
+        user_bin = str(self.user_bin_dir)
         current_path = env.get("PATH", "")
-        if shim_path not in current_path.split(os.pathsep):
-            env["PATH"] = f"{shim_path}{os.pathsep}{current_path}" if current_path else shim_path
+        path_parts = current_path.split(os.pathsep) if current_path else []
+        prepend = [part for part in (user_bin, shim_path) if part and part not in path_parts]
+        if prepend:
+            env["PATH"] = os.pathsep.join([*prepend, current_path] if current_path else prepend)
         return env
 
     def _resolve_codex_real_bin(self, explicit: Optional[str]) -> str:

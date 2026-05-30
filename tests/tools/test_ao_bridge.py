@@ -6,20 +6,22 @@ from tools.ao_bridge import AOBridge, AOSession
 
 
 def test_bridge_env_prepends_codex_shim(tmp_path, monkeypatch):
+    home = tmp_path / "home"
     shim_dir = tmp_path / "shims"
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     bridge = AOBridge(
+        home=str(home),
         codex_shim_dir=shim_dir,
         codex_real_bin="/opt/test/bin/codex",
     )
 
     env = bridge._bridge_env()
 
-    assert env["PATH"].split(os.pathsep)[0] == str(shim_dir)
+    assert env["PATH"].split(os.pathsep)[:2] == [str(home / "bin"), str(shim_dir)]
     assert env["CODEX_REAL_BIN"] == "/opt/test/bin/codex"
-    assert env["HOME"] == "/Users/felipelamartine"
-    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == "/Users/felipelamartine/.codex-verification"
+    assert env["HOME"] == str(home)
+    assert env["HERMES_AO_VERIFICATION_CODEX_HOME"] == str(home / ".codex-verification")
     assert env["HERMES_AO_CODEX_AUTH_HOME"].endswith("/.codex")
 
 
