@@ -241,6 +241,31 @@ class DevGitHubPRAutomationStore:
         ).fetchone()
         return int((row or {})["count"] or 0)
 
+    def has_action(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        action: str,
+        head_sha: Optional[str] = None,
+        statuses: Optional[Iterable[str]] = None,
+    ) -> bool:
+        clauses = ["repo = ?", "pr_number = ?", "action = ?"]
+        params: list[Any] = [repo, int(pr_number), action]
+        if head_sha:
+            clauses.append("head_sha = ?")
+            params.append(head_sha)
+        if statuses:
+            status_values = [str(item) for item in statuses if str(item)]
+            if status_values:
+                clauses.append("status IN (" + ", ".join("?" for _ in status_values) + ")")
+                params.extend(status_values)
+        row = self._conn.execute(
+            "SELECT 1 FROM dev_pr_automation_runs WHERE " + " AND ".join(clauses) + " LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        return row is not None
+
 
 def verify_github_signature(*, body: bytes, signature_header: str, secret: str) -> bool:
     if not secret or not signature_header:
@@ -378,6 +403,195 @@ def process_github_webhook(
         warnings=warnings,
     )
     return {"ok": True, "object": "hermes.dev_github_webhook_result", "event": event, **result}
+
+
+def reconcile_github_pr_automation(
+    *,
+    store: DevGitHubPRAutomationStore,
+    scm_store: DevSCMLifecycleStore,
+    repos: Optional[Iterable[str]] = None,
+    limit: int = 50,
+    router: Any = None,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+    pr_state_fetcher: Callable[..., Dict[str, Any]] = fetch_pr_state,
+    release_dispatcher: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Poll managed GitHub PRs and apply trusted-label PR automation decisions."""
+
+    target_repos = [repo for repo in (repos or sorted(managed_repos())) if repo in managed_repos()]
+    reports: list[Dict[str, Any]] = []
+    for repo in target_repos:
+        open_prs, open_warnings = fetch_open_prs(repo=repo, limit=limit, command_runner=command_runner)
+        merged_prs, merged_warnings = fetch_recent_merged_prs(
+            repo=repo,
+            limit=max(5, min(limit, 50)),
+            command_runner=command_runner,
+        )
+        repo_actions: list[Dict[str, Any]] = []
+        pr_reports: list[Dict[str, Any]] = []
+        for pr in open_prs:
+            result = reconcile_open_pr(
+                store=store,
+                scm_store=scm_store,
+                repo=repo,
+                pr=pr,
+                router=router,
+                command_runner=command_runner,
+                pr_state_fetcher=pr_state_fetcher,
+            )
+            pr_reports.append(result)
+            repo_actions.extend(result.get("actions") or [])
+        for pr in merged_prs:
+            result = reconcile_merged_pr_release(
+                store=store,
+                repo=repo,
+                pr=pr,
+                release_dispatcher=release_dispatcher,
+                command_runner=command_runner,
+            )
+            pr_reports.append(result)
+            repo_actions.extend(result.get("actions") or [])
+        reports.append({
+            "repo": repo,
+            "open_pr_count": len(open_prs),
+            "merged_pr_count": len(merged_prs),
+            "actions": repo_actions,
+            "prs": pr_reports,
+            "warnings": [*open_warnings, *merged_warnings],
+        })
+    return {
+        "ok": True,
+        "object": "hermes.dev_pr_automation_reconcile_result",
+        "repos": reports,
+        "action_count": sum(len(report.get("actions") or []) for report in reports),
+    }
+
+
+def reconcile_open_pr(
+    *,
+    store: DevGitHubPRAutomationStore,
+    scm_store: DevSCMLifecycleStore,
+    repo: str,
+    pr: Dict[str, Any],
+    router: Any = None,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+    pr_state_fetcher: Callable[..., Dict[str, Any]] = fetch_pr_state,
+) -> Dict[str, Any]:
+    pr_number = int(pr.get("number") or 0)
+    labels = set(_label_names(pr.get("labels") or []))
+    normalized = {
+        "event_type": "poll",
+        "action": "poll",
+        "repo": repo,
+        "pr_number": pr_number,
+        "labels": sorted(labels),
+        "head_sha": str(pr.get("headRefOid") or "").strip(),
+        "branch": pr.get("headRefName"),
+        "state": "open",
+        "draft": bool(pr.get("isDraft")),
+    }
+    pr_state = pr_state_fetcher(repo=repo, pr_number=pr_number)
+    if pr_state.get("pr_number"):
+        pr_state = scm_store.upsert_pr_state({**pr_state, "repo": repo, "pr_number": pr_number})
+    review_gate = fetch_github_review_gate(repo=repo, pr_number=pr_number)
+    readiness = scm_store.record_readiness(compose_merge_readiness(
+        repo=repo,
+        pr_number=pr_number,
+        pr_state=pr_state,
+        draft_status="approved_for_launch",
+        verification={},
+        code_review=review_gate,
+    ))
+    actions: list[Dict[str, Any]] = []
+    if _poll_should_request_copilot(
+        store=store,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=pr_state.get("head_sha"),
+        labels=labels,
+        review_gate=review_gate,
+        draft=bool(pr.get("isDraft")),
+    ):
+        actions.append(request_copilot_review(
+            store=store,
+            repo=repo,
+            pr_number=pr_number,
+            head_sha=pr_state.get("head_sha"),
+            labels=labels,
+            command_runner=command_runner,
+        ))
+    if _poll_should_auto_fix(
+        store=store,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=pr_state.get("head_sha"),
+        labels=labels,
+        pr=pr,
+        draft=bool(pr.get("isDraft")),
+    ):
+        actions.append(delegate_pr_fix(
+            store=store,
+            repo=repo,
+            pr_number=pr_number,
+            pr_state=pr_state,
+            labels=labels,
+            reason=_poll_fix_reason(pr),
+            router=router,
+            command_runner=command_runner,
+        ))
+    if should_auto_merge(labels=labels, readiness=readiness, normalized=normalized):
+        actions.append(auto_merge_pr(
+            store=store,
+            scm_store=scm_store,
+            repo=repo,
+            pr_number=pr_number,
+            readiness=readiness,
+            labels=labels,
+        ))
+    return {
+        "repo": repo,
+        "pr_number": pr_number,
+        "labels": sorted(labels),
+        "pr_state": pr_state,
+        "readiness": readiness,
+        "actions": actions,
+    }
+
+
+def reconcile_merged_pr_release(
+    *,
+    store: DevGitHubPRAutomationStore,
+    repo: str,
+    pr: Dict[str, Any],
+    release_dispatcher: Optional[Callable[..., Dict[str, Any]]] = None,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    pr_number = int(pr.get("number") or 0)
+    labels = set(_label_names(pr.get("labels") or []))
+    normalized = {
+        "event_type": "pull_request",
+        "action": "closed",
+        "repo": repo,
+        "pr_number": pr_number,
+        "labels": sorted(labels),
+        "merged": True,
+    }
+    actions: list[Dict[str, Any]] = []
+    if should_auto_release(labels=labels, normalized=normalized) and not store.has_action(
+        repo=repo,
+        pr_number=pr_number,
+        action="release",
+        statuses={"completed", "needs_human"},
+    ):
+        actions.append(auto_release_oryn_workspace(
+            store=store,
+            repo=repo,
+            pr_number=pr_number,
+            labels=labels,
+            release_dispatcher=release_dispatcher,
+            command_runner=command_runner,
+        ))
+    return {"repo": repo, "pr_number": pr_number, "labels": sorted(labels), "actions": actions}
 
 
 def normalize_webhook_event(*, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -831,6 +1045,24 @@ def run_manual_pr_automation_action(
     return {"ok": True, "object": "hermes.dev_pr_automation_action", "run": run}
 
 
+def fetch_open_prs(
+    *,
+    repo: str,
+    limit: int = 50,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> tuple[list[Dict[str, Any]], list[str]]:
+    return _fetch_pr_list(repo=repo, state="open", limit=limit, command_runner=command_runner)
+
+
+def fetch_recent_merged_prs(
+    *,
+    repo: str,
+    limit: int = 20,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> tuple[list[Dict[str, Any]], list[str]]:
+    return _fetch_pr_list(repo=repo, state="merged", limit=limit, command_runner=command_runner)
+
+
 def project_id_for_repo(repo: str) -> str:
     mapping = dict(DEFAULT_PROJECT_IDS)
     raw = os.getenv("HERMES_DEV_PR_AUTOMATION_PROJECTS_JSON")
@@ -842,6 +1074,121 @@ def project_id_for_repo(repo: str) -> str:
         except Exception:
             pass
     return mapping.get(repo, "OrynPlatform")
+
+
+def _fetch_pr_list(
+    *,
+    repo: str,
+    state: str,
+    limit: int,
+    command_runner: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> tuple[list[Dict[str, Any]], list[str]]:
+    runner = command_runner or _run_command
+    fields = (
+        "number,isDraft,labels,headRefName,headRefOid,url,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
+        if state == "open"
+        else "number,labels,mergedAt"
+    )
+    result = runner([
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        state,
+        "--limit",
+        str(max(1, min(int(limit or 50), 200))),
+        "--json",
+        fields,
+    ], timeout=60)
+    if int(result.get("exit_code") or 0) != 0:
+        return [], [f"gh pr list failed for {repo}: {result.get('output') or 'unknown error'}"]
+    try:
+        payload = json.loads(str(result.get("output") or "[]"))
+    except Exception as exc:
+        return [], [f"gh pr list returned invalid JSON for {repo}: {exc}"]
+    if not isinstance(payload, list):
+        return [], [f"gh pr list returned non-list JSON for {repo}."]
+    return [dict(item) for item in payload if isinstance(item, dict)], []
+
+
+def _poll_should_request_copilot(
+    *,
+    store: DevGitHubPRAutomationStore,
+    repo: str,
+    pr_number: int,
+    head_sha: Optional[str],
+    labels: set[str],
+    review_gate: Dict[str, Any],
+    draft: bool,
+) -> bool:
+    if draft:
+        return False
+    if not labels.intersection({AUTO_FIX_LABEL, AUTO_MERGE_LABEL, AUTO_RELEASE_LABEL}):
+        return False
+    if str(review_gate.get("verdict") or "").lower() in {"approved", "changes_requested"}:
+        return False
+    return not store.has_action(
+        repo=repo,
+        pr_number=pr_number,
+        action="request_copilot_review",
+        head_sha=head_sha,
+        statuses={"completed", "launched", "needs_human"},
+    )
+
+
+def _poll_should_auto_fix(
+    *,
+    store: DevGitHubPRAutomationStore,
+    repo: str,
+    pr_number: int,
+    head_sha: Optional[str],
+    labels: set[str],
+    pr: Dict[str, Any],
+    draft: bool,
+) -> bool:
+    if AUTO_FIX_LABEL not in labels or draft:
+        return False
+    if store.has_action(
+        repo=repo,
+        pr_number=pr_number,
+        action="fix_ci",
+        head_sha=head_sha,
+        statuses={"launched"},
+    ) or store.has_action(
+        repo=repo,
+        pr_number=pr_number,
+        action="fix_review_comments",
+        head_sha=head_sha,
+        statuses={"launched"},
+    ):
+        return False
+    if _poll_ci_failed(pr):
+        return True
+    review_decision = str(pr.get("reviewDecision") or "").upper()
+    return review_decision in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+
+
+def _poll_fix_reason(pr: Dict[str, Any]) -> str:
+    if _poll_ci_failed(pr):
+        return "CI reported a failing check/status."
+    return "Review state needs follow-up."
+
+
+def _poll_ci_failed(pr: Dict[str, Any]) -> bool:
+    rollup = pr.get("statusCheckRollup")
+    contexts = rollup if isinstance(rollup, list) else []
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        conclusion = str(context.get("conclusion") or "").upper()
+        state = str(context.get("state") or context.get("status") or "").upper()
+        if conclusion in {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}:
+            return True
+        if state in {"FAILURE", "ERROR"}:
+            return True
+    return False
 
 
 def _record_needs_human(

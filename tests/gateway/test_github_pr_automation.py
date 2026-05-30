@@ -10,6 +10,7 @@ from gateway.dev_control.github_pr_automation import (
     build_pr_fix_prompt,
     next_patch_version,
     process_github_webhook,
+    reconcile_github_pr_automation,
     verify_github_signature,
 )
 from gateway.dev_control.scm_lifecycle import DevSCMLifecycleStore, compose_merge_readiness
@@ -253,3 +254,195 @@ def test_fix_prompt_contains_allowed_scope():
 
     assert "apps/oryn-workspace/Sources/App.swift" in prompt
     assert "If a correct fix requires any other file, stop" in prompt
+
+
+def test_polling_reconciler_observes_unlabeled_pr_without_mutation(tmp_path, monkeypatch):
+    store = DevGitHubPRAutomationStore(tmp_path / "state.db")
+    scm_store = DevSCMLifecycleStore(tmp_path / "state.db")
+    commands = []
+
+    def runner(command, timeout=60):
+        commands.append(command)
+        if command[:3] == ["gh", "pr", "list"] and "--state" in command:
+            state = command[command.index("--state") + 1]
+            if state == "open":
+                return {
+                    "exit_code": 0,
+                    "output": json.dumps([{
+                        "number": 72,
+                        "isDraft": False,
+                        "labels": [],
+                        "headRefName": "codex/example",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [],
+                    }]),
+                }
+            return {"exit_code": 0, "output": "[]"}
+        if command[:3] == ["gh", "pr", "edit"]:
+            return {"exit_code": 0, "output": "review requested"}
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        "gateway.dev_control.github_pr_automation.fetch_github_review_gate",
+        lambda repo, pr_number: {"verdict": "unknown"},
+    )
+
+    result = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        pr_state_fetcher=lambda **kwargs: _pr_state(),
+    )
+
+    assert result["action_count"] == 0
+    assert not any(command[:3] == ["gh", "pr", "edit"] for command in commands)
+
+
+def test_polling_reconciler_requests_copilot_once_for_trusted_label(tmp_path, monkeypatch):
+    store = DevGitHubPRAutomationStore(tmp_path / "state.db")
+    scm_store = DevSCMLifecycleStore(tmp_path / "state.db")
+    commands = []
+
+    def runner(command, timeout=60):
+        commands.append(command)
+        if command[:3] == ["gh", "pr", "list"] and "--state" in command:
+            state = command[command.index("--state") + 1]
+            if state == "open":
+                return {
+                    "exit_code": 0,
+                    "output": json.dumps([{
+                        "number": 72,
+                        "isDraft": False,
+                        "labels": [{"name": AUTO_MERGE_LABEL}],
+                        "headRefName": "codex/example",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [],
+                    }]),
+                }
+            return {"exit_code": 0, "output": "[]"}
+        if command[:3] == ["gh", "pr", "edit"]:
+            return {"exit_code": 0, "output": "review requested"}
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        "gateway.dev_control.github_pr_automation.fetch_github_review_gate",
+        lambda repo, pr_number: {"verdict": "unknown"},
+    )
+
+    first = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        pr_state_fetcher=lambda **kwargs: _pr_state(),
+    )
+    second = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        pr_state_fetcher=lambda **kwargs: _pr_state(),
+    )
+
+    assert first["action_count"] == 1
+    assert first["repos"][0]["actions"][0]["action"] == "request_copilot_review"
+    assert second["action_count"] == 0
+    assert sum(1 for command in commands if command[:3] == ["gh", "pr", "edit"]) == 1
+
+
+def test_polling_reconciler_auto_fix_uses_label_and_failed_checks(tmp_path, monkeypatch):
+    store = DevGitHubPRAutomationStore(tmp_path / "state.db")
+    scm_store = DevSCMLifecycleStore(tmp_path / "state.db")
+    spawned = []
+
+    class Router:
+        def spawn(self, runtime, **kwargs):
+            spawned.append({"runtime": runtime, "kwargs": kwargs})
+            return type("Session", (), {"id": "session-poll"})()
+
+    def runner(command, timeout=60):
+        if command[:3] == ["gh", "pr", "list"] and "--state" in command:
+            state = command[command.index("--state") + 1]
+            if state == "open":
+                return {
+                    "exit_code": 0,
+                    "output": json.dumps([{
+                        "number": 72,
+                        "isDraft": False,
+                        "labels": [{"name": AUTO_FIX_LABEL}],
+                        "headRefName": "codex/example",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [{"name": "test", "conclusion": "FAILURE"}],
+                    }]),
+                }
+            return {"exit_code": 0, "output": "[]"}
+        if command[:4] == ["gh", "pr", "diff", "72"]:
+            return {"exit_code": 0, "output": "apps/oryn-workspace/Sources/App.swift\n"}
+        if command[:3] == ["gh", "pr", "edit"]:
+            return {"exit_code": 0, "output": "review requested"}
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(
+        "gateway.dev_control.github_pr_automation.fetch_github_review_gate",
+        lambda repo, pr_number: {"verdict": "approved"},
+    )
+
+    result = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        pr_state_fetcher=lambda **kwargs: _pr_state(),
+        router=Router(),
+    )
+
+    actions = result["repos"][0]["actions"]
+    assert [action["action"] for action in actions] == ["fix_ci"]
+    assert spawned
+    assert spawned[0]["kwargs"]["branch"] == "codex/example"
+
+
+def test_polling_reconciler_releases_merged_oryn_pr_once(tmp_path):
+    store = DevGitHubPRAutomationStore(tmp_path / "state.db")
+    scm_store = DevSCMLifecycleStore(tmp_path / "state.db")
+    releases = []
+
+    def runner(command, timeout=60):
+        if command[:3] == ["gh", "pr", "list"] and "--state" in command:
+            state = command[command.index("--state") + 1]
+            if state == "merged":
+                return {
+                    "exit_code": 0,
+                    "output": json.dumps([{
+                        "number": 72,
+                        "labels": [{"name": AUTO_RELEASE_LABEL}],
+                        "mergedAt": "2026-05-30T12:00:00Z",
+                    }]),
+                }
+            return {"exit_code": 0, "output": "[]"}
+        raise AssertionError(f"unexpected command: {command}")
+
+    def release_dispatcher(**kwargs):
+        releases.append(kwargs)
+        return {"ok": True, "version": "0.5.35", "build": 74}
+
+    first = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        release_dispatcher=release_dispatcher,
+    )
+    second = reconcile_github_pr_automation(
+        store=store,
+        scm_store=scm_store,
+        repos=["Felippen/Oryn"],
+        command_runner=runner,
+        release_dispatcher=release_dispatcher,
+    )
+
+    assert first["action_count"] == 1
+    assert first["repos"][0]["actions"][0]["action"] == "release"
+    assert second["action_count"] == 0
+    assert len(releases) == 1
