@@ -2020,17 +2020,27 @@ def finalize_pending_lab_ci_outcomes(
         if source_refs.get("source") != "dogfood_lab_loop" or not source_refs.get("draft_pr_only"):
             continue
         current_state = str(outcome.get("ci_state") or "unknown").strip().lower()
-        if current_state != "pending":
+        ci_status_ref = source_refs.get("ci_status") if isinstance(source_refs.get("ci_status"), dict) else {}
+        draft_artifact = source_refs.get("draft_artifact") if isinstance(source_refs.get("draft_artifact"), dict) else {}
+        publish = draft_artifact.get("publish") if isinstance(draft_artifact.get("publish"), dict) else {}
+        pr_number = draft_artifact.get("pr_number") or publish.get("pr_number") or _pr_number_from_url(str(draft_artifact.get("pr_url") or ""))
+        ci_finalized_at = source_refs.get("ci_finalized_at")
+        should_refresh = current_state == "pending" or (bool(pr_number) and not ci_finalized_at)
+        if not should_refresh:
             skipped.append({
                 "outcome_id": outcome.get("outcome_id"),
                 "reason": f"ci_state_not_pending:{current_state}",
             })
             continue
-        ci_status_ref = source_refs.get("ci_status") if isinstance(source_refs.get("ci_status"), dict) else {}
-        draft_artifact = source_refs.get("draft_artifact") if isinstance(source_refs.get("draft_artifact"), dict) else {}
-        publish = draft_artifact.get("publish") if isinstance(draft_artifact.get("publish"), dict) else {}
         repo = str(ci_status_ref.get("repo") or publish.get("repo") or "").strip()
-        ref = str(ci_status_ref.get("ref") or source_refs.get("head_sha") or draft_artifact.get("head_sha") or "").strip()
+        pr_ref = _resolve_lab_draft_pr_ref(repo=repo, draft_artifact=draft_artifact) if repo and pr_number else {}
+        ref = str(
+            pr_ref.get("head_sha")
+            or ci_status_ref.get("ref")
+            or source_refs.get("head_sha")
+            or draft_artifact.get("head_sha")
+            or ""
+        ).strip()
         if not repo or not ref:
             skipped.append({
                 "outcome_id": outcome.get("outcome_id"),
@@ -2061,6 +2071,19 @@ def finalize_pending_lab_ci_outcomes(
             },
             "ci_finalized_at": refreshed_at if next_state in {"success", "failure"} else None,
         }
+        if pr_ref.get("head_sha") or pr_ref.get("pr_number"):
+            next_draft_artifact = dict(draft_artifact)
+            next_publish = dict(publish)
+            if pr_ref.get("head_sha"):
+                next_draft_artifact["head_sha"] = pr_ref["head_sha"]
+                next_publish["head_sha"] = pr_ref["head_sha"]
+            if pr_ref.get("pr_number"):
+                next_draft_artifact["pr_number"] = pr_ref["pr_number"]
+                next_publish["pr_number"] = pr_ref["pr_number"]
+            if next_publish:
+                next_draft_artifact["publish"] = next_publish
+            next_source_refs["draft_artifact"] = next_draft_artifact
+            next_source_refs["head_sha"] = next_draft_artifact.get("head_sha") or source_refs.get("head_sha")
         gates = dict(next_source_refs.get("gates") or {})
         gates["ci"] = next_status
         next_source_refs["gates"] = gates
@@ -2080,6 +2103,7 @@ def finalize_pending_lab_ci_outcomes(
             "success": updated.get("success"),
             "repo": repo,
             "ref": ref,
+            "pr_number": pr_ref.get("pr_number") or pr_number,
             "warnings": (raw_ci or {}).get("warnings") or [],
         })
     return {
@@ -2091,6 +2115,31 @@ def finalize_pending_lab_ci_outcomes(
             "refreshed": len(refreshed),
             "skipped": len(skipped),
         },
+    }
+
+
+def _resolve_lab_draft_pr_ref(*, repo: str, draft_artifact: dict[str, Any]) -> dict[str, Any]:
+    pr_number = draft_artifact.get("pr_number") or _pr_number_from_url(str(draft_artifact.get("pr_url") or ""))
+    if not repo or not pr_number:
+        return {}
+    result = _run_command(
+        ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "number,headRefOid,url"],
+        timeout=30,
+    )
+    if result.get("returncode") != 0:
+        return {
+            "pr_number": pr_number,
+            "warnings": [result.get("stderr") or result.get("stdout") or "gh pr view failed"],
+        }
+    try:
+        payload = json.loads(result.get("stdout") or "{}")
+    except json.JSONDecodeError:
+        return {"pr_number": pr_number, "warnings": ["gh pr view returned invalid JSON"]}
+    return {
+        "pr_number": payload.get("number") or pr_number,
+        "head_sha": payload.get("headRefOid"),
+        "pr_url": payload.get("url") or draft_artifact.get("pr_url"),
+        "warnings": [],
     }
 
 
@@ -2480,6 +2529,7 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
         }
     head_sha = _git_head_sha(workspace)
     pr_url = (pr.get("stdout") or "").strip().splitlines()[-1] if (pr.get("stdout") or "").strip() else None
+    pr_number = _pr_number_from_url(pr_url or "")
     return {
         "ready": True,
         "status": "created",
@@ -2490,6 +2540,7 @@ def _publish_lab_draft_pr(*, candidate: dict[str, Any], workspace_path: Any, bra
         "branch": branch,
         "head_sha": head_sha,
         "pr_url": pr_url,
+        "pr_number": pr_number,
         "warnings": [*(branch_base.get("warnings") or []), *(author.get("warnings") or [])],
         "branch_base": branch_base,
         "author": author,

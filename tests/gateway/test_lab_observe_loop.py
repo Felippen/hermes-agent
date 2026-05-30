@@ -971,6 +971,55 @@ def test_lab_ci_finalizer_updates_pending_outcome_to_failure(monkeypatch, tmp_pa
     assert outcome["success"] is False
 
 
+def test_lab_ci_finalizer_uses_current_pr_head_for_unfinalized_draft(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    store = DevReliabilityStore(db_path)
+    store.upsert_outcome({
+        "plan_id": "plan-ci-pr-head",
+        "task_id": "task-ci-pr-head",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "terminal_status": "completed",
+        "merged": False,
+        "verification_verdict": "verified",
+        "ci_state": "success",
+        "code_review_verdict": "approved",
+        "source_refs": {
+            "source": "dogfood_lab_loop",
+            "draft_pr_only": True,
+            "draft_pr_ready": True,
+            "ci_status": {"repo": "Felippen/Oryn", "ref": "stale-head", "state": "success"},
+            "draft_artifact": {
+                "head_sha": "stale-head",
+                "pr_number": 123,
+                "pr_url": "https://github.com/Felippen/Oryn/pull/123",
+                "publish": {"repo": "Felippen/Oryn", "head_sha": "stale-head", "pr_number": 123},
+            },
+            "gates": {"verification": "completed", "ci": "success", "review": "approved"},
+        },
+    })
+    calls = []
+    monkeypatch.setattr(
+        "gateway.dev_control.lab_loop._resolve_lab_draft_pr_ref",
+        lambda *, repo, draft_artifact: {"pr_number": 123, "head_sha": "current-head", "warnings": []},
+    )
+
+    result = finalize_pending_lab_ci_outcomes(
+        db_path=db_path,
+        fetcher=lambda *, repo, ref: calls.append({"repo": repo, "ref": ref}) or {"state": "success", "repo": repo, "ref": ref},
+        now=2468.0,
+    )
+
+    outcome = store.get_outcome(plan_id="plan-ci-pr-head", task_id="task-ci-pr-head")
+    assert result["counts"]["refreshed"] == 1
+    assert calls == [{"repo": "Felippen/Oryn", "ref": "current-head"}]
+    assert outcome["ci_state"] == "success"
+    assert outcome["source_refs"]["ci_status"]["ref"] == "current-head"
+    assert outcome["source_refs"]["draft_artifact"]["head_sha"] == "current-head"
+    assert outcome["source_refs"]["draft_artifact"]["publish"]["head_sha"] == "current-head"
+    assert outcome["source_refs"]["ci_finalized_at"] == 2468.0
+
+
 def test_lab_ci_finalizer_keeps_pending_when_checks_still_running(monkeypatch, tmp_path):
     db_path, _stable_db = _env(monkeypatch, tmp_path)
     store = DevReliabilityStore(db_path)
@@ -1241,7 +1290,9 @@ def test_lab_executor_publishes_configured_draft_pr_before_ci(monkeypatch, tmp_p
     assert report["status"] == "completed"
     assert artifact["type"] == "draft_pr"
     assert artifact["pr_url"] == "https://github.com/Felippen/Oryn/pull/123"
+    assert artifact["pr_number"] == 123
     assert artifact["publish"]["status"] == "created"
+    assert artifact["publish"]["pr_number"] == 123
     assert artifact["publish"]["branch_base"]["base_ref"] == "codex/fixed-lab-base"
     assert any(command[:4] == ["git", "-C", str(Path(report["execution"]["workspace_path"])), "push"] for command in commands)
     assert any(command[:4] == ["git", "-C", str(Path(report["execution"]["workspace_path"])), "rebase"] and command[-1] == "codex/fixed-lab-base" for command in commands)
