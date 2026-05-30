@@ -12,13 +12,16 @@ from gateway.dev_control.lab_loop import (
     DevLabLoopStore,
     _await_implementation_terminal,
     _await_review_terminal,
+    _recover_lab_verification_from_transcript,
     _touched_paths_from_worktree,
+    _verification_timeout_seconds,
     finalize_pending_lab_ci_outcomes,
     loop_health,
     observe_profile_preflight,
     run_lab_observe_profile,
     run_lab_loop_pass,
 )
+from gateway.dev_control.acceptance_verification import DevVerificationStore
 from gateway.dev_control.reliability import DevReliabilityStore, scorecard
 from gateway.subagent_events import SubagentEventStore
 from gateway.dev_execution import DevExecutionStore
@@ -1687,6 +1690,86 @@ def test_lab_executor_preserves_structured_acceptance_criteria(monkeypatch, tmp_
     assert task_criteria == [criterion]
     assert isinstance(task_criteria[0], dict)
     assert report["execution"]["pre_verification_cleanup"]["cleaned"] is True
+
+
+def test_lab_verification_recovers_from_direct_transcript(monkeypatch, tmp_path):
+    db_path, _stable_db = _env(monkeypatch, tmp_path)
+    verification_store = DevVerificationStore(db_path)
+    command = "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q"
+    run = verification_store.create_run(
+        plan_id="plan-direct-recovery",
+        task_id="task-direct-recovery",
+        target_type="task",
+        status="launched",
+        results=[{
+            "criterion_id": "crit-1",
+            "statement": "Gateway API tests pass.",
+            "verification_method": "test",
+            "verification_detail": command,
+            "machine_checkable": True,
+            "status": "pending",
+            "command_run": command,
+            "exit_code": None,
+            "passed": None,
+            "output_excerpt": "",
+            "notes": "",
+            "warnings": [],
+        }],
+        executable_commands=[{
+            "criterion_id": "crit-1",
+            "command": command,
+            "cwd": ".",
+            "relative_cwd": ".",
+        }],
+        verified_against={"workspace_path": str(tmp_path / "lab" / "worktrees" / "verify")},
+        verification_session_id="lab-session-verify",
+        verification_runtime="ao",
+    )
+    transcript = """
+Worker completed verification.
+```json DEV_VERIFICATION_RESULTS
+{
+  "object": "hermes.dev_verification_results",
+  "results": [
+    {
+      "criterion_id": "crit-1",
+      "command_run": "scripts/run_tests.sh tests/gateway/test_api_server_runs.py -- -q",
+      "cwd": ".",
+      "exit_code": 0,
+      "output_excerpt": "=== Summary: 1 files, 22 tests passed, 0 failed in 0.8s",
+      "notes": ""
+    }
+  ]
+}
+```
+"""
+    router = _FakeLabRouter(tmp_path / "lab", status="running", transcript=transcript)
+    router.sessions["lab-session-verify"] = AOSession(
+        id="lab-session-verify",
+        project_id="HermesAgentLab",
+        status="running",
+        workspace_path=str(tmp_path / "lab" / "worktrees" / "verify"),
+    )
+
+    recovered = _recover_lab_verification_from_transcript(
+        verification_store=verification_store,
+        run=run,
+        bridge=router,
+    )
+
+    assert recovered["status"] == "completed"
+    assert recovered["verdict"] == "verified"
+    assert recovered["counts"]["passed"] == 1
+    assert recovered["results"][0]["passed"] is True
+
+
+def test_lab_verification_timeout_uses_remaining_pass_budget(monkeypatch):
+    monkeypatch.setenv("HERMES_DEV_LAB_VERIFY_TIMEOUT_SECONDS", "900")
+    monkeypatch.setattr("gateway.dev_control.lab_loop.time.time", lambda: 250.0)
+
+    timeout = _verification_timeout_seconds({"started_at": 100.0, "max_seconds": 200.0})
+
+    assert timeout == 50.0
 
 
 def test_lab_executor_quarantines_out_of_scope_worker_diff(monkeypatch, tmp_path):

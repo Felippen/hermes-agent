@@ -17,6 +17,9 @@ from typing import Any, Callable, Optional
 from gateway.dev_control.acceptance_verification import (
     DevVerificationStore,
     launch_verification_run,
+    parse_transcript_verification_results,
+    parse_verification_results,
+    reconcile_results,
     refresh_verification_run,
 )
 from gateway.dev_control.ci_status import fetch_ci_status
@@ -698,6 +701,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         implementation=implementation,
         diff_scope=diff_scope,
         draft_artifact=draft_artifact,
+        timeout_seconds=_verification_timeout_seconds(context),
     )
     verification_verdict = verification.get("verdict") or "unknown"
     ci_status = _measure_ci_r3(
@@ -1353,6 +1357,7 @@ def _measure_verification_r1(
     implementation: dict[str, Any],
     diff_scope: dict[str, Any],
     draft_artifact: Optional[dict[str, Any]],
+    timeout_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
     fixture_results = payload.get("verification_results")
@@ -1448,7 +1453,8 @@ def _measure_verification_r1(
             "warnings": [f"Verification launch failed: {exc}"],
         }
     if run.get("status") == "launched":
-        deadline = time.monotonic() + _env_float("HERMES_DEV_LAB_VERIFY_TIMEOUT_SECONDS", 900.0)
+        verify_timeout = max(1.0, float(timeout_seconds or _env_float("HERMES_DEV_LAB_VERIFY_TIMEOUT_SECONDS", 900.0)))
+        deadline = time.monotonic() + verify_timeout
         while time.monotonic() < deadline:
             refreshed = refresh_verification_run(
                 verification_store=verification_store,
@@ -1459,11 +1465,21 @@ def _measure_verification_r1(
             run = refreshed
             if run.get("status") in {"completed", "skipped", "needs_attention"}:
                 break
+            run = _recover_lab_verification_from_transcript(
+                verification_store=verification_store,
+                run=run,
+                bridge=bridge,
+            )
+            if run.get("status") in {"completed", "skipped", "needs_attention"}:
+                break
             time.sleep(1.0)
         if run.get("status") == "launched":
             run = verification_store.update_run(run["verification_run_id"], {
                 "status": "needs_attention",
-                "warnings": [*(run.get("warnings") or []), "Lab verification worker did not complete before timeout."],
+                "warnings": _unique_strings([
+                    *(run.get("warnings") or []),
+                    f"Lab verification worker did not complete before timeout ({verify_timeout:.1f}s).",
+                ]),
             })
     return {
         "status": run.get("status"),
@@ -1474,6 +1490,68 @@ def _measure_verification_r1(
         "measured": run.get("status") in {"completed", "skipped", "needs_attention"},
         "warnings": run.get("warnings") or [],
     }
+
+
+def _recover_lab_verification_from_transcript(
+    *,
+    verification_store: DevVerificationStore,
+    run: dict[str, Any],
+    bridge: Any,
+) -> dict[str, Any]:
+    """Lab-only safety net for verification workers whose final block was missed by refresh."""
+
+    if run.get("status") in {"completed", "skipped", "needs_attention"}:
+        return run
+    transcript = _lab_verification_transcript(run, bridge=bridge)
+    if not transcript.strip():
+        return run
+    parsed, warnings = _parse_lab_verification_output(transcript, run.get("executable_commands") or [])
+    if not parsed.get("results"):
+        return run
+    results, reconcile_warnings = reconcile_results(run.get("results") or [], parsed.get("results") or [])
+    return verification_store.update_run(run["verification_run_id"], {
+        "status": "completed",
+        "results": results,
+        "warnings": _unique_strings([
+            *(run.get("warnings") or []),
+            *warnings,
+            *reconcile_warnings,
+        ]),
+    })
+
+
+def _lab_verification_transcript(run: dict[str, Any], *, bridge: Any) -> str:
+    session_id = str(run.get("verification_session_id") or "").strip()
+    if not session_id:
+        return ""
+    runtime = str(run.get("verification_runtime") or "ao").strip() or "ao"
+    session = _lab_runtime_session(bridge, runtime, session_id)
+    if session is None:
+        session = {"id": session_id}
+    return _capture_lab_output(bridge, runtime, session)
+
+
+def _parse_lab_verification_output(text: str, executable_commands: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    parsed = parse_verification_results(text)
+    if parsed.get("warning"):
+        warnings.append(parsed["warning"])
+    if parsed.get("results") and not _verification_results_are_prompt_template(parsed):
+        return parsed, warnings
+    recovered = parse_transcript_verification_results(text, executable_commands)
+    if recovered.get("results"):
+        if recovered.get("warning"):
+            warnings.append(recovered["warning"])
+        return recovered, warnings
+    return parsed, warnings
+
+
+def _verification_results_are_prompt_template(parsed: dict[str, Any]) -> bool:
+    for item in parsed.get("results") or []:
+        excerpt = str(item.get("output_excerpt") or "").lower()
+        if "include the real test/build summary line" in excerpt:
+            return True
+    return False
 
 
 def _measure_ci_r3(
@@ -1922,6 +2000,14 @@ def _worker_timeout_seconds(context: dict[str, Any]) -> float:
     return min(configured, remaining)
 
 
+def _verification_timeout_seconds(context: dict[str, Any]) -> float:
+    configured = _env_float("HERMES_DEV_LAB_VERIFY_TIMEOUT_SECONDS", 900.0)
+    pass_budget = float(context.get("max_seconds") or configured)
+    elapsed = max(0.0, time.time() - float(context.get("started_at") or time.time()))
+    remaining = max(1.0, pass_budget - elapsed)
+    return min(configured, remaining)
+
+
 def _apply_adversarial_diff_fixture(
     *,
     candidate: dict[str, Any],
@@ -2097,6 +2183,17 @@ def _unique_paths(paths: list[Any]) -> list[str]:
             seen.add(normalized)
             result.append(normalized)
     return _drop_parent_directory_entries(result)
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def _drop_parent_directory_entries(paths: list[str]) -> list[str]:
