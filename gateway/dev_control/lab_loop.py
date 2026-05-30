@@ -715,6 +715,7 @@ def local_observe_executor(candidate: dict[str, Any], context: dict[str, Any]) -
         draft_artifact=draft_artifact,
         implementation=implementation,
         verification=verification,
+        ci_status=ci_status,
     )
     code_review_verdict = str(code_review.get("verdict") or verification.get("code_review_verdict") or "unknown")
     output_contract_score = code_review.get("output_contract_score")
@@ -1551,6 +1552,7 @@ def _measure_code_review_r4(
     draft_artifact: Optional[dict[str, Any]],
     implementation: dict[str, Any],
     verification: dict[str, Any],
+    ci_status: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
     fixture = payload.get("code_review_result")
@@ -1585,6 +1587,18 @@ def _measure_code_review_r4(
     prompt = "\n".join([
         prompt,
         "",
+        "Measured gate evidence supplied by Hermes:",
+        f"- Verification verdict: {verification.get('verdict') or 'unknown'}; "
+        f"status: {verification.get('status') or 'unknown'}; "
+        f"score: {verification.get('score') if verification.get('score') is not None else 'unknown'}.",
+        f"- Verification counts: {verification.get('counts') or {}}.",
+        f"- CI state: {(ci_status or {}).get('state') or 'unknown'}; "
+        f"status: {(ci_status or {}).get('status') or 'unknown'}.",
+        "- Treat this measured gate evidence as already collected. Do not rerun tests, builds, linters, or CI.",
+        "- Do not return verdict commented merely because you did not run tests/builds; review the PR diff against intent.",
+        "- If the diff satisfies the task intent and has no blocking code-review findings, return verdict approved.",
+        "- Return verdict commented only when the PR diff cannot be inspected, and include at least one finding explaining why.",
+        "",
         "Lab R4 constraints:",
         "- Review only. Do not edit files, commit, push, merge, approve, or publish.",
         "- Use the draft PR diff as the evidence source; do not inspect unrelated local changes.",
@@ -1613,11 +1627,21 @@ def _measure_code_review_r4(
         )
         transcript = terminal.get("transcript") or ""
         parsed = parse_code_review_result(transcript)
-        status = "completed" if parsed.get("verdict") != "unknown" else "needs_attention"
+        actionable = _code_review_result_is_actionable(parsed)
+        status = "completed" if actionable else "needs_attention"
+        if not actionable and parsed.get("verdict") != "unknown":
+            parsed = {
+                **parsed,
+                "verdict": "unknown",
+                "warnings": [
+                    *(parsed.get("warnings") or []),
+                    "Code-review result was not actionable: commented/empty review requires concrete findings or summary.",
+                ],
+            }
         return {
             **parsed,
             "status": status,
-            "measured": parsed.get("verdict") != "unknown",
+            "measured": actionable,
             "source": "ao",
             "review_session_id": _session_value(session, "id"),
             "review_status": terminal.get("status"),
@@ -1700,7 +1724,7 @@ def _await_review_terminal(*, bridge: Any, runtime: str, session: Any, timeout_s
     while True:
         transcript = _capture_lab_output(bridge, runtime, latest)
         parsed = parse_code_review_result(transcript)
-        if parsed.get("verdict") != "unknown":
+        if _code_review_result_is_actionable(parsed):
             return {
                 "status": "completed_from_transcript",
                 "session": latest,
@@ -1737,6 +1761,15 @@ def _await_review_terminal(*, bridge: Any, runtime: str, session: Any, timeout_s
         except Exception:
             refreshed = None
         latest = refreshed or latest
+
+
+def _code_review_result_is_actionable(review: dict[str, Any]) -> bool:
+    verdict = str((review or {}).get("verdict") or "unknown").strip().lower()
+    if verdict == "unknown":
+        return False
+    if verdict == "commented":
+        return bool((review or {}).get("findings") or (review or {}).get("summary") or (review or {}).get("evidence_refs"))
+    return True
 
 
 def _capture_lab_output(bridge: Any, runtime: str, session: Any) -> str:

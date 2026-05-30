@@ -501,8 +501,43 @@ def test_lab_executor_launches_review_worker_without_issue_binding(monkeypatch, 
     assert "gh pr diff 456 --repo Felippen/Oryn --patch" in review_spawn["kwargs"]["prompt"]
     assert "run only the exact gh pr view/diff commands listed above" in review_spawn["kwargs"]["prompt"]
     assert "Do not start background terminals or long-running tools" in review_spawn["kwargs"]["prompt"]
+    assert "Measured gate evidence supplied by Hermes:" in review_spawn["kwargs"]["prompt"]
+    assert "Verification verdict: verified" in review_spawn["kwargs"]["prompt"]
+    assert "CI state: success" in review_spawn["kwargs"]["prompt"]
+    assert "Do not return verdict commented merely because you did not run tests/builds" in review_spawn["kwargs"]["prompt"]
     assert report["gate_verdicts"]["review"] == "approved"
     assert report["execution"]["code_review"]["cleanup"]["cleaned"] is True
+
+
+def test_lab_review_await_ignores_empty_commented_result(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_DEV_LAB_MIN_TERMINAL_SECONDS", "0")
+    transcript = """
+{
+  "object": "hermes.dev_code_review_result",
+  "verdict": "commented",
+  "findings": [],
+  "summary": "",
+  "evidence_refs": []
+}
+"""
+    bridge = _FakeLabRouter(
+        tmp_path / "lab",
+        status="working",
+        status_sequence=["working", "working"],
+        transcript=transcript,
+    )
+    session = AOSession(id="review-session-empty-commented", status="working", workspace_path=str(tmp_path / "lab" / "review"))
+    bridge.sessions[session.id] = session
+
+    terminal = _await_review_terminal(
+        bridge=bridge,
+        runtime="ao",
+        session=session,
+        timeout_seconds=0.01,
+    )
+
+    assert terminal["status"] == "timed_out"
+    assert terminal["timed_out"] is True
 
 
 def test_lab_review_await_completes_when_plain_review_json_appears(tmp_path):
