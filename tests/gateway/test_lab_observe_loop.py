@@ -15,6 +15,7 @@ from gateway.dev_control.lab_loop import (
     _await_implementation_terminal,
     _candidate_acceptance_criteria,
     _await_review_terminal,
+    _normalize_lab_commit_author_for_ci,
     _recover_lab_verification_from_transcript,
     _touched_paths_from_worktree,
     _verification_timeout_seconds,
@@ -2011,6 +2012,42 @@ def test_lab_executor_preserves_structured_acceptance_criteria(monkeypatch, tmp_
     assert report["execution"]["pre_verification_cleanup"]["cleaned"] is True
 
 
+def test_lab_acceptance_criteria_rewrite_direct_pytest_to_repo_wrapper(monkeypatch, tmp_path):
+    db_path, stable_db = _env(monkeypatch, tmp_path)
+    DevLabLoopStore(db_path).upsert_candidate({
+        "prompt": "Worker adds a small test.",
+        "profile_id": "platform.implement",
+        "risk_level": "low",
+        "target_paths": ["tests/gateway/test_lab_dogfood_example.py"],
+        "source": "tests",
+        "payload": {
+            "acceptance_criteria": [{
+                "statement": "The generated lab dogfood test passes.",
+                "verification_method": "test",
+                "verification_detail": "pytest tests/gateway/test_lab_dogfood_example.py",
+                "machine_checkable": True,
+            }],
+            "verification_results": [{
+                "criterion_id": "crit-1",
+                "status": "passed",
+                "command_run": "scripts/run_tests.sh tests/gateway/test_lab_dogfood_example.py -- -q",
+                "exit_code": 0,
+                "output_excerpt": "1 passed in 0.1s",
+            }],
+        },
+    }, approved=True)
+
+    report = run_lab_loop_pass(
+        db_path=db_path,
+        stable_db_path=stable_db,
+        bridge=_FakeLabRouter(tmp_path / "lab", diff_paths=["tests/gateway/test_lab_dogfood_example.py"]),
+        sources=["reliability"],
+    )
+
+    task_criteria = report["execution"]["implement"]["plan"]["tasks"][0]["acceptance_criteria"]
+    assert task_criteria[0]["verification_detail"] == "scripts/run_tests.sh tests/gateway/test_lab_dogfood_example.py -- -q"
+
+
 def test_lab_default_acceptance_criterion_is_executable(monkeypatch):
     monkeypatch.delenv("HERMES_DEV_LAB_DEFAULT_VERIFICATION_COMMAND", raising=False)
 
@@ -2031,6 +2068,33 @@ def test_lab_default_acceptance_criterion_can_be_overridden(monkeypatch):
 
     assert criteria[0]["verification_detail"] == "make test"
     assert criteria[0]["machine_checkable"] is True
+
+
+def test_lab_commit_author_is_normalized_for_ci(monkeypatch, tmp_path):
+    workspace = tmp_path / "repo"
+    _init_git_repo(workspace)
+    (workspace / "tests" / "gateway").mkdir(parents=True)
+    (workspace / "tests" / "gateway" / "test_lab_dogfood_example.py").write_text(
+        "def test_marker():\n    assert True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "tests/gateway/test_lab_dogfood_example.py"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "test: add lab dogfood marker"],
+        cwd=workspace,
+        check=True,
+    )
+    previous_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip()
+
+    result = _normalize_lab_commit_author_for_ci(workspace)
+
+    author_email = subprocess.check_output(["git", "log", "-1", "--format=%ae"], cwd=workspace, text=True).strip()
+    assert result["status"] == "normalized"
+    assert result["previous_author_emails"] == ["lab@example.test"]
+    assert result["unsafe_author_emails"] == ["lab@example.test"]
+    assert result["previous_head_sha"] == previous_head
+    assert result["head_sha"] != previous_head
+    assert author_email == "41898282+github-actions[bot]@users.noreply.github.com"
 
 
 def test_lab_verification_recovers_from_direct_transcript(monkeypatch, tmp_path):
