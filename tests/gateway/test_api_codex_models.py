@@ -93,3 +93,42 @@ def test_set_session_model_accepts_reasoning_effort(api_server):
     assert payload["model"] == "gpt-5.3-codex"
     assert payload["reasoning_effort"] == "high"
     assert api_server._session_reasoning_overrides["session-1"]["effort"] == "high"
+
+
+def test_set_session_model_clears_reasoning_effort_with_empty_string(api_server):
+    switch_result = MagicMock(
+        success=True,
+        new_model="mistralai/mistral-large",
+        target_provider="openrouter",
+        api_key="key",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        warning_message="",
+    )
+
+    request = MagicMock()
+    request.match_info.get.return_value = "session-1"
+    request.json = MagicMock(
+        return_value={
+            "provider": "openrouter",
+            "model": "mistralai/mistral-large",
+            "reasoning_effort": "",
+        }
+    )
+
+    api_server._session_reasoning_overrides["session-1"] = {"enabled": True, "effort": "high"}
+
+    with patch("hermes_cli.model_switch.switch_model", return_value=switch_result):
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "openrouter", "api_key": "key", "base_url": ""},
+        ):
+            with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.4"):
+                with patch("hermes_cli.config.load_config", return_value={}):
+                    with patch("hermes_cli.config.get_compatible_custom_providers", return_value=[]):
+                        response = asyncio.run(api_server._handle_set_session_model(request))
+
+    payload = json.loads(response.body)
+
+    assert payload["reasoning_effort"] is None
+    assert "session-1" not in api_server._session_reasoning_overrides
