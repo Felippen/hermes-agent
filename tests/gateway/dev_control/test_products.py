@@ -795,7 +795,7 @@ def test_product_progression_loop_bounded_autonomy_launches_one_planned_task(tmp
         item = tick["data"][0]
         launched_plan = execution_store.get_plan(plan["plan_id"])
 
-        assert item["status"] == "advanced"
+        assert item["status"] == "advanced", item
         assert item["reason"] == "Bounded autonomy launched planned Product execution work."
         assert item["autonomy_policy"]["decision"] == "bounded_launch_applied"
         assert item["transition"]["action"] == "launch_execution_task"
