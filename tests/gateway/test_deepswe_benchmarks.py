@@ -1,10 +1,12 @@
 from gateway.dev_control.deepswe_benchmarks import (
     DevDeepSWEBenchmarkStore,
+    build_pier_command,
     compact_deepswe_evidence,
     diagnose_deepswe_run,
     evaluate_deepswe_comparability,
     generate_deepswe_actions,
     normalize_deepswe_context,
+    parse_deepswe_result_artifact,
     parse_deepswe_task_results,
     start_deepswe_benchmark,
 )
@@ -125,6 +127,26 @@ def test_compact_evidence_omits_benchmark_data():
     assert compact["summary"]["pass_rate"] == 0.5
 
 
+def test_pier_command_matches_current_cli_for_task_selection():
+    single = build_pier_command(normalize_deepswe_context(_context(
+        deepswe_checkout_path="/lab/deep-swe",
+        task_ids=["abs-module-cache-flags"],
+    )))
+    assert single["argv"][:4] == ["pier", "run", "-p", "/lab/deep-swe/tasks/abs-module-cache-flags"]
+    assert "--task-id" not in single["argv"]
+    assert "--jobs-dir" in single["argv"]
+
+    multiple = build_pier_command(normalize_deepswe_context(_context(
+        deepswe_checkout_path="/lab/deep-swe",
+        task_ids=["a", "b"],
+        resource_limits={"timeout_seconds": 600, "max_cost_usd": 5.0, "max_tasks": 2, "n_concurrent": 1},
+    )))
+    assert multiple["argv"][multiple["argv"].index("-p") + 1] == "/lab/deep-swe/tasks"
+    assert multiple["argv"].count("--include-task-name") == 2
+    assert multiple["argv"][multiple["argv"].index("--n-concurrent") + 1] == "1"
+    assert "--task-id" not in multiple["argv"]
+
+
 def test_parser_and_summary_classify_infrastructure_without_model_failure(tmp_path):
     store = DevDeepSWEBenchmarkStore(tmp_path / "state.db")
     run = start_deepswe_benchmark(
@@ -136,6 +158,33 @@ def test_parser_and_summary_classify_infrastructure_without_model_failure(tmp_pa
     )
     assert run["summary"]["infrastructure_failure_rate"] == 1.0
     assert run["task_results"][0]["failure_category"] == "dependency_environment_failure"
+
+
+def test_parser_ingests_pier_trial_result_without_raw_trajectory(tmp_path):
+    result_path = tmp_path / "jobs" / "job" / "task__abc" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        """
+        {
+          "task_name": "abs-module-cache-flags",
+          "verifier_result": {"rewards": {"reward": 0.0}},
+          "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "401 Unauthorized: Incorrect API key provided"
+          },
+          "agent_result": {"cost_usd": null, "n_input_tokens": null, "n_output_tokens": null},
+          "trajectory": "do not persist"
+        }
+        """,
+        encoding="utf-8",
+    )
+    parsed = parse_deepswe_result_artifact(tmp_path / "jobs")
+    assert parsed["task_results"][0]["task_id"] == "abs-module-cache-flags"
+    assert parsed["task_results"][0]["status"] == "error"
+    assert parsed["task_results"][0]["failure_category"] == "missing_credentials"
+    assert "trajectory" not in parsed["task_results"][0]
+    assert "Expected outcomes" not in parsed["task_results"][0]["message"]
+    assert parsed["task_results"][0]["message"] == "NonZeroAgentExitCodeError: missing or invalid agent credentials."
 
 
 def test_deepswe_comparability_detects_good_and_bad_runs(tmp_path):

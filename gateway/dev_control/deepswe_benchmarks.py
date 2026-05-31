@@ -472,6 +472,9 @@ def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
     checkout = context.get("deepswe_checkout_path")
     if checkout:
         task_path = str(Path(str(checkout)) / "tasks")
+    task_ids = [str(task_id) for task_id in (context.get("task_ids") or []) if str(task_id or "").strip()]
+    if checkout and len(task_ids) == 1:
+        task_path = str(Path(str(checkout)) / "tasks" / task_ids[0])
     command = [
         str(context.get("pier_executable") or "pier"),
         "run",
@@ -482,9 +485,14 @@ def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
     ]
     if context.get("model_profile"):
         command.extend(["--model", str(context["model_profile"])])
-    if context.get("task_ids"):
-        for task_id in context["task_ids"]:
-            command.extend(["--task-id", str(task_id)])
+    if context.get("artifact_dir"):
+        command.extend(["--jobs-dir", str(context["artifact_dir"])])
+    resource_limits = context.get("resource_limits") or {}
+    if resource_limits.get("n_concurrent"):
+        command.extend(["--n-concurrent", str(resource_limits["n_concurrent"])])
+    if len(task_ids) > 1:
+        for task_id in task_ids:
+            command.extend(["--include-task-name", task_id])
     elif context.get("n_tasks"):
         command.extend(["--n-tasks", str(context["n_tasks"])])
         if context.get("subset_seed") is not None:
@@ -510,7 +518,7 @@ def parse_deepswe_result_artifact(artifact: Any) -> Dict[str, Any]:
     if path.is_dir():
         results: list[Dict[str, Any]] = []
         refs = []
-        for candidate in sorted(path.glob("*.json")):
+        for candidate in sorted(path.rglob("result.json")):
             parsed = parse_deepswe_result_artifact(candidate)
             results.extend(parsed.get("task_results") or [])
             refs.append({"path": str(candidate), "sha256": _file_sha256(candidate)})
@@ -520,10 +528,63 @@ def parse_deepswe_result_artifact(artifact: Any) -> Dict[str, Any]:
     refs = [{"path": str(path), "sha256": _file_sha256(path)}]
     if isinstance(payload, list):
         return {"task_results": parse_deepswe_task_results(payload), "artifact_refs": refs}
+    pier_trial = _pier_trial_task_result(payload, path)
+    if pier_trial:
+        return {"task_results": parse_deepswe_task_results([pier_trial]), "artifact_refs": refs}
     return {
         "task_results": parse_deepswe_task_results(payload.get("task_results") or payload.get("results") or payload.get("trials") or []),
         "artifact_refs": compact_deepswe_evidence(payload.get("artifact_refs") or refs),
     }
+
+
+def _pier_trial_task_result(payload: Dict[str, Any], path: Path) -> Optional[Dict[str, Any]]:
+    if not payload.get("task_name") and not payload.get("verifier_result") and not payload.get("exception_info"):
+        return None
+    rewards = ((payload.get("verifier_result") or {}).get("rewards") or {}) if isinstance(payload.get("verifier_result"), dict) else {}
+    reward = _first_number(rewards.get("reward"))
+    exception_info = payload.get("exception_info") if isinstance(payload.get("exception_info"), dict) else {}
+    exception_text = " ".join(
+        str(part)
+        for part in (exception_info.get("exception_type"), exception_info.get("exception_message"))
+        if str(part or "").strip()
+    )
+    status = "passed" if reward is not None and reward >= 1.0 and not exception_info else ("error" if exception_info else "failed")
+    failure_category = _pier_failure_category(exception_text) if status != "passed" else None
+    return {
+        "task_id": payload.get("task_name") or (payload.get("task_id") or {}).get("path") or path.parent.name,
+        "status": status,
+        "verifier_status": "passed" if reward is not None and reward >= 1.0 else ("error" if exception_info else "failed"),
+        "failure_category": failure_category,
+        "message": _compact_pier_failure_message(failure_category, exception_info),
+        "cost_usd": (payload.get("agent_result") or {}).get("cost_usd") if isinstance(payload.get("agent_result"), dict) else None,
+        "input_tokens": (payload.get("agent_result") or {}).get("n_input_tokens") if isinstance(payload.get("agent_result"), dict) else None,
+        "output_tokens": (payload.get("agent_result") or {}).get("n_output_tokens") if isinstance(payload.get("agent_result"), dict) else None,
+        "artifact_ref": {"path": str(path), "sha256": _file_sha256(path)},
+    }
+
+
+def _pier_failure_category(text: Optional[str]) -> str:
+    lowered = str(text or "").lower()
+    if "api key" in lowered or "401 unauthorized" in lowered or "credential" in lowered:
+        return "missing_credentials"
+    if "timeout" in lowered:
+        return "timeout"
+    if "docker" in lowered or "image" in lowered or "environment" in lowered:
+        return "dependency_environment_failure"
+    return "verifier_failure"
+
+
+def _compact_pier_failure_message(category: Optional[str], exception_info: Dict[str, Any]) -> str:
+    exception_type = str(exception_info.get("exception_type") or "").strip()
+    if category == "missing_credentials":
+        return f"{exception_type or 'agent_error'}: missing or invalid agent credentials."
+    if category == "timeout":
+        return f"{exception_type or 'agent_error'}: agent or verifier timed out."
+    if category == "dependency_environment_failure":
+        return f"{exception_type or 'agent_error'}: benchmark environment failed."
+    if exception_type:
+        return f"{exception_type}: benchmark task failed; raw Pier message retained only in local artifact."
+    return "Benchmark task failed; raw Pier message retained only in local artifact."
 
 
 def parse_deepswe_task_results(results: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -771,7 +832,9 @@ def classify_deepswe_failure(task_result: Dict[str, Any]) -> str:
     text = " ".join(str(task_result.get(key) or "").lower() for key in ("message", "error", "error_type", "verifier_status", "status"))
     if "timeout" in text or task_result.get("status") == "timeout":
         return "timeout"
-    if "dependency" in text or "image" in text or "environment" in text or "credential" in text:
+    if "api key" in text or "401 unauthorized" in text or "credential" in text:
+        return "missing_credentials"
+    if "dependency" in text or "image" in text or "environment" in text:
         return "dependency_environment_failure"
     if "wrong file" in text or "unrelated file" in text:
         return "wrong_file_edit"
@@ -1099,7 +1162,7 @@ def _require_run(store: DevDeepSWEBenchmarkStore, run_id: str) -> Dict[str, Any]
 
 def _normalize_mode(value: Any) -> str:
     mode = str(value or "fixture").strip().lower().replace("-", "_")
-    return mode if mode in {"fixture", "dry_run", "live"} else "fixture"
+    return mode if mode in {"fixture", "dry_run", "live", "pilot", "pilot_preflight"} else "fixture"
 
 
 def _normalize_task_status(item: Dict[str, Any]) -> str:
