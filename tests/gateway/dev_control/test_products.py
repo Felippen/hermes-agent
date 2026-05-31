@@ -782,6 +782,7 @@ def test_product_progression_loop_bounded_autonomy_launches_one_planned_task(tmp
                 "goal": "Launch bounded worker",
                 "prompt": "Launch bounded worker",
                 "project_id": "BoundedLaunch",
+                "payload": {"runtime": "ao"},
             }],
         )
 
