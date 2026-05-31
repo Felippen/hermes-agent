@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -121,6 +122,31 @@ FAILURE_CATEGORIES = {
     "dependency_environment_failure",
     "regression",
     "cost_blowout",
+}
+
+DEEPSWE_SUITE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "quick_diagnostic": {
+        "description": "One-task exploratory smoke for auth, egress, parser, and basic harness signal.",
+        "task_ids": ["abs-module-cache-flags"],
+        "resource_limits": {
+            "timeout_seconds": 1200,
+            "max_cost_usd": 5.0,
+            "max_tasks": 1,
+            "n_concurrent": 1,
+        },
+        "budget_policy": {"mode": "post_run_classification", "promotion_blocking": True},
+    },
+    "promotion_probe": {
+        "description": "Small pinned suite for comparable before/after Lab promotion evidence.",
+        "task_ids": ["abs-stepped-slices", "actionlint-action-pinning-lint", "adaptix-name-mapping-aliases"],
+        "resource_limits": {
+            "timeout_seconds": 3600,
+            "max_cost_usd": 20.0,
+            "max_tasks": 3,
+            "n_concurrent": 1,
+        },
+        "budget_policy": {"mode": "post_run_classification", "promotion_blocking": True},
+    },
 }
 
 
@@ -393,6 +419,14 @@ def start_deepswe_benchmark(
             "DeepSWE Pier run produced infrastructure-class task failures.",
         )
     summary = summarize_deepswe_results(parsed_results, pinned_context, infrastructure_failure=infrastructure_failure)
+    budget_blockers = evaluate_deepswe_budget(summary, pinned_context)
+    if budget_blockers:
+        blockers = [*blockers, *budget_blockers]
+        status = "budget_blocked"
+        summary["budget_blockers"] = budget_blockers
+        summary["budget_status"] = "blocked"
+    else:
+        summary["budget_status"] = "ok"
     if infrastructure_failure:
         status = "infrastructure_failed"
     payload = {
@@ -441,16 +475,24 @@ def normalize_deepswe_run(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_deepswe_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    suite_profile_name, suite_profile, suite_profile_blocker = _resolve_suite_profile(context)
     task_ids = _normalize_list(context.get("task_ids") or context.get("tasks"))
+    if not task_ids and suite_profile:
+        task_ids = _normalize_list(suite_profile.get("task_ids"))
     subset_seed = context.get("subset_seed") if context.get("subset_seed") is not None else context.get("sample_seed")
     n_tasks = context.get("n_tasks")
-    resource_limits = compact_deepswe_evidence(context.get("resource_limits") or {})
+    profile_limits = dict(suite_profile.get("resource_limits") or {}) if suite_profile else {}
+    resource_limits = compact_deepswe_evidence({**profile_limits, **(context.get("resource_limits") or {})})
     if not resource_limits:
         resource_limits = {
             "timeout_seconds": _int_or_none(context.get("timeout_seconds")) or 3600,
             "max_cost_usd": _float_or_none(context.get("max_cost_usd")),
             "max_tasks": _int_or_none(n_tasks) or len(task_ids) or None,
         }
+    elif context.get("timeout_seconds") is not None and "timeout_seconds" not in resource_limits:
+        resource_limits["timeout_seconds"] = _int_or_none(context.get("timeout_seconds"))
+    if context.get("max_cost_usd") is not None:
+        resource_limits["max_cost_usd"] = _float_or_none(context.get("max_cost_usd"))
     network_policy = compact_deepswe_evidence(context.get("network_policy") or {"mode": "agent_allowlist"})
     artifact_refs = compact_deepswe_evidence(context.get("artifact_refs") or [])
     normalized = {
@@ -464,6 +506,9 @@ def normalize_deepswe_context(context: Dict[str, Any]) -> Dict[str, Any]:
         "task_ids": task_ids,
         "subset_seed": subset_seed,
         "n_tasks": _int_or_none(n_tasks),
+        "suite_profile": suite_profile_name,
+        "suite_profile_details": compact_deepswe_evidence(suite_profile) if suite_profile else {},
+        "budget_policy": compact_deepswe_evidence(context.get("budget_policy") or (suite_profile or {}).get("budget_policy") or {"mode": "post_run_classification"}),
         "resource_limits": resource_limits,
         "network_policy": network_policy,
         "lab_environment_id": _first_str(context.get("lab_environment_id"), os.getenv("HERMES_LAB_ENVIRONMENT_ID"), "lab"),
@@ -475,9 +520,27 @@ def normalize_deepswe_context(context: Dict[str, Any]) -> Dict[str, Any]:
     }
     normalized["task_subset_hash"] = task_subset_hash(normalized)
     blockers = _context_blockers(normalized)
+    if suite_profile_blocker:
+        blockers.append(suite_profile_blocker)
     if blockers:
         normalized["blockers"] = blockers
     return compact_deepswe_evidence(normalized)
+
+
+def _resolve_suite_profile(context: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    name = _first_str(context.get("suite_profile"), context.get("suite"))
+    if not name:
+        return None, {}, None
+    normalized = name.strip().lower().replace("-", "_")
+    profile = DEEPSWE_SUITE_PROFILES.get(normalized)
+    if profile is None:
+        return normalized, {}, _blocker(
+            "unknown_suite_profile",
+            f"Unknown DeepSWE suite profile: {name}.",
+            field="suite_profile",
+            severity="blocked",
+        )
+    return normalized, dict(profile), None
 
 
 def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -619,9 +682,13 @@ def parse_deepswe_result_artifact(artifact: Any) -> Dict[str, Any]:
     pier_trial = _pier_trial_task_result(payload, path)
     if pier_trial:
         return {"task_results": parse_deepswe_task_results([pier_trial]), "artifact_refs": refs}
+    run_duration = _duration_seconds(payload.get("started_at"), payload.get("finished_at") or payload.get("updated_at"))
     return {
         "task_results": parse_deepswe_task_results(payload.get("task_results") or payload.get("results") or payload.get("trials") or []),
-        "artifact_refs": compact_deepswe_evidence(payload.get("artifact_refs") or refs),
+        "artifact_refs": compact_deepswe_evidence([
+            *(payload.get("artifact_refs") or refs),
+            *([{"path": str(path), "run_duration_seconds": run_duration}] if run_duration is not None else []),
+        ]),
     }
 
 
@@ -645,6 +712,7 @@ def _pier_trial_task_result(payload: Dict[str, Any], path: Path) -> Optional[Dic
         "failure_category": failure_category,
         "message": _compact_pier_failure_message(failure_category, exception_info) if status != "passed" else None,
         "cost_usd": (payload.get("agent_result") or {}).get("cost_usd") if isinstance(payload.get("agent_result"), dict) else None,
+        "duration_seconds": _duration_seconds(payload.get("started_at"), payload.get("finished_at")),
         "input_tokens": (payload.get("agent_result") or {}).get("n_input_tokens") if isinstance(payload.get("agent_result"), dict) else None,
         "output_tokens": (payload.get("agent_result") or {}).get("n_output_tokens") if isinstance(payload.get("agent_result"), dict) else None,
         "artifact_ref": {"path": str(path), "sha256": _file_sha256(path)},
@@ -742,6 +810,32 @@ def summarize_deepswe_results(
         "environment_fingerprint": context.get("environment_fingerprint") or environment_fingerprint(context),
         "infrastructure_failure": infrastructure_failure or {},
     })
+
+
+def evaluate_deepswe_budget(summary: Dict[str, Any], context: Dict[str, Any]) -> list[Dict[str, Any]]:
+    resource_limits = context.get("resource_limits") if isinstance(context.get("resource_limits"), dict) else {}
+    blockers: list[Dict[str, Any]] = []
+    max_cost = _float_or_none(resource_limits.get("max_cost_usd"))
+    cost = _float_or_none(summary.get("cost_usd"))
+    if max_cost is not None and cost is not None and cost > max_cost:
+        blockers.append(_blocker(
+            "deepswe_cost_budget_exceeded",
+            f"DeepSWE cost ${cost:.4f} exceeded configured max ${max_cost:.4f}.",
+            field="resource_limits.max_cost_usd",
+            severity="blocked",
+        ))
+    max_duration = _float_or_none(resource_limits.get("max_duration_seconds"))
+    if max_duration is None:
+        max_duration = _float_or_none(resource_limits.get("timeout_seconds"))
+    duration = _float_or_none(summary.get("duration_seconds"))
+    if max_duration is not None and duration is not None and duration > max_duration:
+        blockers.append(_blocker(
+            "deepswe_duration_budget_exceeded",
+            f"DeepSWE duration {duration:.1f}s exceeded configured max {max_duration:.1f}s.",
+            field="resource_limits.timeout_seconds",
+            severity="blocked",
+        ))
+    return blockers
 
 
 def evaluate_deepswe_comparability(
@@ -1334,6 +1428,29 @@ def _first_number(*values: Any) -> Optional[float]:
         if number is not None:
             return number
     return None
+
+
+def _duration_seconds(started_at: Any, finished_at: Any) -> Optional[float]:
+    start = _parse_timestamp(started_at)
+    finish = _parse_timestamp(finished_at)
+    if start is None or finish is None:
+        return None
+    return max(0.0, round(finish - start, 6))
+
+
+def _parse_timestamp(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _float_or_none(value: Any) -> Optional[float]:

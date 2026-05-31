@@ -3,6 +3,7 @@ from gateway.dev_control.deepswe_benchmarks import (
     build_pier_command,
     compact_deepswe_evidence,
     diagnose_deepswe_run,
+    evaluate_deepswe_budget,
     evaluate_deepswe_comparability,
     generate_deepswe_actions,
     normalize_deepswe_context,
@@ -172,6 +173,30 @@ def test_pier_command_matches_current_cli_for_task_selection():
     assert "--task-id" not in multiple["argv"]
 
 
+def test_suite_profile_resolves_tasks_and_resource_limits():
+    context = normalize_deepswe_context(_context(
+        suite_profile="quick-diagnostic",
+        task_ids=[],
+        resource_limits={},
+    ))
+    assert context["suite_profile"] == "quick_diagnostic"
+    assert context["task_ids"] == ["abs-module-cache-flags"]
+    assert context["resource_limits"]["max_cost_usd"] == 5.0
+    assert context["resource_limits"]["n_concurrent"] == 1
+    assert context["budget_policy"]["promotion_blocking"] is True
+
+    overridden = normalize_deepswe_context(_context(
+        suite_profile="quick_diagnostic",
+        task_ids=["explicit-task"],
+        resource_limits={"max_cost_usd": 2.0},
+    ))
+    assert overridden["task_ids"] == ["explicit-task"]
+    assert overridden["resource_limits"]["max_cost_usd"] == 2.0
+
+    unknown = normalize_deepswe_context(_context(suite_profile="does-not-exist"))
+    assert any(blocker["code"] == "unknown_suite_profile" for blocker in unknown["blockers"])
+
+
 def test_parser_and_summary_classify_infrastructure_without_model_failure(tmp_path):
     store = DevDeepSWEBenchmarkStore(tmp_path / "state.db")
     run = start_deepswe_benchmark(
@@ -219,6 +244,8 @@ def test_parser_does_not_attach_failure_message_to_passed_pier_trial(tmp_path):
         """
         {
           "task_name": "abs-module-cache-flags",
+          "started_at": "2026-05-31T10:15:56.847346Z",
+          "finished_at": "2026-05-31T10:16:56.847346Z",
           "verifier_result": {"rewards": {"reward": 1.0}},
           "agent_result": {"cost_usd": 2.5, "n_input_tokens": 100, "n_output_tokens": 20}
         }
@@ -228,6 +255,47 @@ def test_parser_does_not_attach_failure_message_to_passed_pier_trial(tmp_path):
     parsed = parse_deepswe_result_artifact(tmp_path / "jobs")
     assert parsed["task_results"][0]["status"] == "passed"
     assert parsed["task_results"][0]["message"] is None
+    assert parsed["task_results"][0]["duration_seconds"] == 60.0
+
+
+def test_parser_records_top_level_pier_duration_artifact_ref(tmp_path):
+    result_path = tmp_path / "jobs" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        """
+        {
+          "started_at": "2026-05-31T12:15:56.833642",
+          "finished_at": "2026-05-31T13:00:27.190041",
+          "stats": {"n_completed_trials": 3}
+        }
+        """,
+        encoding="utf-8",
+    )
+    parsed = parse_deepswe_result_artifact(result_path)
+    assert parsed["task_results"] == []
+    assert any(ref.get("run_duration_seconds") == 2670.356399 for ref in parsed["artifact_refs"])
+
+
+def test_budget_overruns_block_run_without_erasing_pass_results(tmp_path):
+    store = DevDeepSWEBenchmarkStore(tmp_path / "state.db")
+    run = start_deepswe_benchmark(
+        store=store,
+        context=_context(resource_limits={"timeout_seconds": 60, "max_cost_usd": 1.0, "max_tasks": 1}),
+        task_results=[{"task_id": "a", "status": "passed", "cost_usd": 2.0, "duration_seconds": 120}],
+    )
+    assert run["status"] == "budget_blocked"
+    assert run["task_results"][0]["status"] == "passed"
+    codes = {blocker["code"] for blocker in run["blockers"]}
+    assert {"deepswe_cost_budget_exceeded", "deepswe_duration_budget_exceeded"} <= codes
+    assert run["summary"]["budget_status"] == "blocked"
+
+
+def test_budget_evaluation_allows_clean_in_budget_summary():
+    blockers = evaluate_deepswe_budget(
+        {"cost_usd": 1.0, "duration_seconds": 30.0},
+        {"resource_limits": {"max_cost_usd": 2.0, "timeout_seconds": 60}},
+    )
+    assert blockers == []
 
 
 def test_parser_classifies_subscription_proxy_block_as_environment(tmp_path):
