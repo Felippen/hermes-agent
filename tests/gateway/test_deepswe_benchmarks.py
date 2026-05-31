@@ -131,10 +131,17 @@ def test_pier_command_matches_current_cli_for_task_selection():
     single = build_pier_command(normalize_deepswe_context(_context(
         deepswe_checkout_path="/lab/deep-swe",
         task_ids=["abs-module-cache-flags"],
+        network_policy={
+            "mode": "agent_allowlist",
+            "auth_mode": "codex_subscription",
+            "codex_auth_json_path": "/lab/.codex/auth.json",
+        },
     )))
     assert single["argv"][:4] == ["pier", "run", "-p", "/lab/deep-swe/tasks/abs-module-cache-flags"]
     assert "--task-id" not in single["argv"]
     assert "--jobs-dir" in single["argv"]
+    assert "--agent-env" in single["argv"]
+    assert "CODEX_AUTH_JSON_PATH=/lab/.codex/auth.json" in single["argv"]
 
     multiple = build_pier_command(normalize_deepswe_context(_context(
         deepswe_checkout_path="/lab/deep-swe",
@@ -185,6 +192,27 @@ def test_parser_ingests_pier_trial_result_without_raw_trajectory(tmp_path):
     assert "trajectory" not in parsed["task_results"][0]
     assert "Expected outcomes" not in parsed["task_results"][0]["message"]
     assert parsed["task_results"][0]["message"] == "NonZeroAgentExitCodeError: missing or invalid agent credentials."
+
+
+def test_parser_classifies_subscription_proxy_block_as_environment(tmp_path):
+    result_path = tmp_path / "jobs" / "job" / "task__abc" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        """
+        {
+          "task_name": "abs-module-cache-flags",
+          "verifier_result": {"rewards": {"reward": 0.0}},
+          "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "Proxy connection failed: HTTP CONNECT failed with status 403"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    parsed = parse_deepswe_result_artifact(tmp_path / "jobs")
+    assert parsed["task_results"][0]["failure_category"] == "dependency_environment_failure"
+    assert "HTTP CONNECT" not in parsed["task_results"][0]["message"]
 
 
 def test_deepswe_comparability_detects_good_and_bad_runs(tmp_path):

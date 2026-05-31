@@ -367,7 +367,9 @@ def start_deepswe_benchmark(
                 timeout_seconds=float((pinned_context.get("resource_limits") or {}).get("timeout_seconds") or 3600),
                 runner=runner,
             )
-            raw_results = raw_results or parse_deepswe_result_artifact(completed.get("result_artifact") or {}).get("task_results") or []
+            parsed_artifact = parse_deepswe_result_artifact(completed.get("result_artifact") or pinned_context.get("artifact_dir") or {})
+            raw_results = raw_results or parsed_artifact.get("task_results") or []
+            artifact_refs.extend(parsed_artifact.get("artifact_refs") or [])
             status = "completed" if int(completed.get("returncode") or 0) == 0 else "infrastructure_failed"
             infrastructure_failure = completed.get("infrastructure_failure") or {}
             artifact_refs.extend(completed.get("artifact_refs") or [])
@@ -379,6 +381,17 @@ def start_deepswe_benchmark(
             infrastructure_failure = _infra_failure("pier_failure", str(exc))
 
     parsed_results = parse_deepswe_task_results(raw_results or [])
+    infra_categories = {
+        str(item.get("failure_category") or "")
+        for item in parsed_results
+        if str(item.get("failure_category") or "") in INFRASTRUCTURE_FAILURE_CATEGORIES
+    }
+    if infra_categories:
+        status = "infrastructure_failed"
+        infrastructure_failure = infrastructure_failure or _infra_failure(
+            sorted(infra_categories)[0],
+            "DeepSWE Pier run produced infrastructure-class task failures.",
+        )
     summary = summarize_deepswe_results(parsed_results, pinned_context, infrastructure_failure=infrastructure_failure)
     if infrastructure_failure:
         status = "infrastructure_failed"
@@ -490,6 +503,8 @@ def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
     resource_limits = context.get("resource_limits") or {}
     if resource_limits.get("n_concurrent"):
         command.extend(["--n-concurrent", str(resource_limits["n_concurrent"])])
+    for agent_env in _pier_agent_env(context):
+        command.extend(["--agent-env", agent_env])
     if len(task_ids) > 1:
         for task_id in task_ids:
             command.extend(["--include-task-name", task_id])
@@ -502,6 +517,28 @@ def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
         "advisory_only": True,
         "side_effects": _no_side_effects(),
     }
+
+
+def _pier_agent_env(context: Dict[str, Any]) -> list[str]:
+    network_policy = context.get("network_policy") if isinstance(context.get("network_policy"), dict) else {}
+    agent_env = network_policy.get("agent_env") if isinstance(network_policy.get("agent_env"), dict) else {}
+    values = [f"{key}={value}" for key, value in agent_env.items() if str(key or "").strip() and str(value or "").strip()]
+    auth_mode = str(network_policy.get("auth_mode") or network_policy.get("credentials") or "").strip().lower()
+    if auth_mode in {"codex_subscription", "codex_auth_json", "subscription"}:
+        auth_path = _lab_codex_auth_path(network_policy)
+        values.append(f"CODEX_AUTH_JSON_PATH={auth_path}")
+    return values
+
+
+def _lab_codex_auth_path(network_policy: Dict[str, Any]) -> str:
+    explicit = str(network_policy.get("codex_auth_json_path") or "").strip()
+    if explicit:
+        return explicit
+    lab_home = Path(lab_paths_from_env()["lab_home"])
+    lab_auth = lab_home / ".codex" / "auth.json"
+    if lab_auth.exists():
+        return str(lab_auth)
+    return str(Path.home() / ".codex" / "auth.json")
 
 
 def parse_deepswe_result_artifact(artifact: Any) -> Dict[str, Any]:
@@ -569,6 +606,8 @@ def _pier_failure_category(text: Optional[str]) -> str:
         return "missing_credentials"
     if "timeout" in lowered:
         return "timeout"
+    if any(token in lowered for token in ("proxy", "network", "connect", "connection", "disconnected", "egress")):
+        return "dependency_environment_failure"
     if "docker" in lowered or "image" in lowered or "environment" in lowered:
         return "dependency_environment_failure"
     return "verifier_failure"
@@ -834,6 +873,8 @@ def classify_deepswe_failure(task_result: Dict[str, Any]) -> str:
         return "timeout"
     if "api key" in text or "401 unauthorized" in text or "credential" in text:
         return "missing_credentials"
+    if any(token in text for token in ("proxy", "network", "connect", "connection", "disconnected", "egress")):
+        return "dependency_environment_failure"
     if "dependency" in text or "image" in text or "environment" in text:
         return "dependency_environment_failure"
     if "wrong file" in text or "unrelated file" in text:
