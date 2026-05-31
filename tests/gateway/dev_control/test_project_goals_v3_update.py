@@ -32,7 +32,29 @@ def test_update_project_goal_title_and_status(store):
     assert updated["status"] == "blocked"
 
 
-def test_update_project_goal_rejects_invalid_parent_kind(store):
+def test_update_vision_goal_records_revision_history(store):
+    vision = create_project_goal(
+        store=store,
+        kind="vision",
+        title="Vision",
+        project_id="OrynWorkspace",
+        markdown="First draft",
+        status="active",
+    )
+    updated = update_project_goal(
+        store=store,
+        goal_id=vision["goal_id"],
+        markdown="Second draft",
+        payload={"app_vision_version": 2},
+    )
+    assert updated["markdown"] == "Second draft"
+    revisions = updated["payload"]["vision_revisions"]
+    assert len(revisions) == 1
+    assert revisions[0]["markdown"] == "First draft"
+    assert revisions[0]["version"] == 1
+    assert updated["payload"]["app_vision_version"] == 2
+
+
     vision = create_project_goal(
         store=store,
         kind="vision",

@@ -385,7 +385,24 @@ def update_project_goal(
         if not updates["title"]:
             raise ValueError("title cannot be empty")
     if markdown is not None:
+        previous_markdown = str(current.get("markdown") or "")
         updates["markdown"] = str(markdown)
+        if (
+            current.get("kind") == "vision"
+            and str(markdown) != previous_markdown
+        ):
+            merged_payload = dict(current.get("payload") or {})
+            if payload is not None:
+                merged_payload.update(payload)
+            revisions = list(merged_payload.get("vision_revisions") or [])
+            revisions.append({
+                "version": len(revisions) + 1,
+                "markdown": previous_markdown,
+                "recorded_at": time.time(),
+            })
+            merged_payload["vision_revisions"] = revisions[-20:]
+            updates["payload"] = merged_payload
+            payload = None
     if status is not None:
         normalized = str(status).strip().lower()
         if normalized not in GOAL_STATUSES:

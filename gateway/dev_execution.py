@@ -1235,6 +1235,37 @@ class DevExecutionStore:
                 ("launched", now, plan_id),
             )
 
+    def patch_task_payload(self, *, plan_id: str, task_id: str, payload_updates: Dict[str, Any]) -> None:
+        if not payload_updates:
+            return
+        row = self._conn.execute(
+            """
+            SELECT payload
+            FROM dev_execution_plan_tasks
+            WHERE plan_id = ? AND task_id = ?
+            """,
+            (plan_id, task_id),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"Dev execution task not found: {plan_id}/{task_id}")
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(payload_updates)
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE dev_execution_plan_tasks
+                SET payload = ?, updated_at = ?
+                WHERE plan_id = ? AND task_id = ?
+                """,
+                (json.dumps(payload, ensure_ascii=False), now, plan_id, task_id),
+            )
+
     def append_launch_record(
         self,
         *,
@@ -2097,6 +2128,25 @@ def launch_execution_plan(
                 metadata=metadata,
             )
         store.update_task_launch(plan_id=plan_id, task_id=task["task_id"], ao_session_id=session.id)
+        work_case_id = None
+        try:
+            from gateway.dev_control.work_case_hooks import create_work_case_for_dispatch
+
+            work_case_id = create_work_case_for_dispatch(
+                plan_id=plan_id,
+                task=task,
+                ao_session_id=session.id,
+                runtime=str(metadata.get("runtime") or runtime),
+                project_id=profile.get("project_id"),
+            )
+            if work_case_id:
+                store.patch_task_payload(
+                    plan_id=plan_id,
+                    task_id=task["task_id"],
+                    payload_updates={"work_case_id": work_case_id},
+                )
+        except Exception:
+            pass
         launched.append({
             "task_id": task["task_id"],
             "goal": task.get("goal"),
@@ -2113,6 +2163,7 @@ def launch_execution_plan(
             "runtime_policy_reason": runtime_selection.get("runtime_policy_reason"),
             "session": session.event_fields(),
             "launch_profile_id": metadata["launch_profile_id"],
+            "work_case_id": work_case_id,
         })
 
     launch_record = None
@@ -2148,10 +2199,16 @@ def derive_execution_plan_status(
         raise KeyError(f"Dev execution plan not found: {plan_id}")
 
     bridge = _ensure_runtime_router(bridge)
-    tasks = [
-        _derive_task_status(task, bridge=bridge, event_store=event_store)
-        for task in (plan.get("tasks") or [])
-    ]
+    tasks = []
+    for task in (plan.get("tasks") or []):
+        derived = _derive_task_status(task, bridge=bridge, event_store=event_store)
+        try:
+            from gateway.dev_control.work_case_hooks import maybe_close_work_case_for_task
+
+            maybe_close_work_case_for_task(task=task, derived=derived, store=store)
+        except Exception:
+            pass
+        tasks.append(derived)
     status = _rollup_plan_status(tasks)
     review = _review_decision_from_status(status=status, tasks=tasks)
     runbook = store.resolve_runbook_for_plan({**plan, "tasks": tasks})
