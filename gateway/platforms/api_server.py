@@ -678,6 +678,7 @@ API_SERVER_SLASH_COMMANDS = frozenset({
     "help", "commands", "status", "profile", "yolo", "restart",
     "new", "reset", "clear", "stop", "steer", "queue", "background",
     "codex-runtime",
+    "project", "vision", "milestone", "pgoal", "psubgoal",
 })
 
 # Commands the Oryn Workspace app may handle natively (still listed in catalog).
@@ -837,6 +838,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_execution_store: Optional[Any] = None
         self._dev_clarification_store: Optional[Any] = None
         self._dev_plan_artifact_store: Optional[Any] = None
+        self._dev_project_goal_store: Optional[Any] = None
         self._dev_verification_store: Optional[Any] = None
         self._dev_signal_store: Optional[Any] = None
         self._dev_product_event_store: Optional[Any] = None
@@ -1227,6 +1229,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             (self._dev_scm_store, "dev_merge_approvals", "created_at"),
             (self._dev_reliability_store, "dev_reliability_outcomes", "updated_at"),
             (self._dev_reliability_store, "dev_reliability_improvements", "measured_at"),
+            (self._dev_project_goal_store, "dev_project_goals", "updated_at"),
             (self._subagent_event_store, "subagent_events", "event_id"),
         ):
             if store is None:
@@ -2006,6 +2009,21 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             return {"type": "error", "message": f"/subgoal: {exc}"}
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return {"type": "text", "content": f"✓ Added subgoal {idx}: {text}"}
+
+    def _dispatch_project_goal_slash(self, canonical: str, cmd_arg: str) -> dict:
+        from gateway.dev_control.project_goal_slash import dispatch_project_goal_slash
+
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return {"type": "error", "message": "Dev project goal store unavailable."}
+        return dispatch_project_goal_slash(
+            canonical,
+            cmd_arg,
+            goal_store=store,
+            verification_store=self._ensure_dev_verification_store(),
+            execution_store=self._ensure_dev_execution_store(),
+            plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+        )
 
     @staticmethod
     def _serialize_message_content(content) -> str:
@@ -3357,6 +3375,9 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
         if canonical == "subgoal":
             return self._dispatch_subgoal_slash(session_id, cmd_arg)
+
+        if canonical in {"project", "vision", "milestone", "pgoal", "psubgoal"}:
+            return self._dispatch_project_goal_slash(canonical, cmd_arg)
 
         if canonical == "restart":
             try:
