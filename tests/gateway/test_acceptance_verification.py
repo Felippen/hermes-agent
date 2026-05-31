@@ -11,6 +11,7 @@ from gateway.dev_control.acceptance_verification import (
     parse_verification_results,
     reconcile_results,
     refresh_verification_run,
+    trigger_terminal_task_verifications,
 )
 from gateway.dev_execution import DevExecutionStore, set_execution_plan_test_state
 from gateway.subagent_events import SubagentEventStore
@@ -243,6 +244,121 @@ def test_verification_reconciles_when_runtime_terminal_even_with_nonterminal_eve
     )
     assert refreshed["status"] == "completed"
     assert refreshed["verdict"] == "verified"
+
+
+def test_verification_trigger_creates_manual_run_once_for_terminal_task(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    criteria = acceptance_criteria_to_strings([{
+        "statement": "Manual acceptance remains manual.",
+        "verification_method": "manual",
+        "verification_detail": "Review the behavior manually.",
+        "machine_checkable": False,
+    }])
+    plan = execution_store.create_plan(
+        title="Trigger verification",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Implemented task",
+            "prompt": "Do the implementation.",
+            "profile_id": "workspace.implement",
+            "project_id": "OrynWorkspace",
+            "permissions": "edit",
+            "acceptance_criteria": criteria,
+        }],
+    )
+    task_id = plan["tasks"][0]["task_id"]
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        state="completed_ok",
+        event_store=event_store,
+        ao_session_id="implemented-session",
+    )
+
+    first = trigger_terminal_task_verifications(
+        execution_store=execution_store,
+        verification_store=verification_store,
+        event_store=event_store,
+    )
+    second = trigger_terminal_task_verifications(
+        execution_store=execution_store,
+        verification_store=verification_store,
+        event_store=event_store,
+    )
+
+    assert first["created_count"] == 1
+    assert first["created"][0]["status"] == "skipped"
+    assert first["created"][0]["verdict"] == "manual_required"
+    assert second["created_count"] == 0
+    assert second["skipped"][0]["reason"] == "current_verification_exists"
+
+
+def test_verification_trigger_skips_nonterminal_and_missing_criteria(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    plan = execution_store.create_plan(
+        title="No criteria",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Still planned",
+            "prompt": "Do the implementation.",
+            "profile_id": "workspace.implement",
+            "project_id": "OrynWorkspace",
+            "permissions": "edit",
+            "acceptance_criteria": [],
+        }],
+    )
+
+    result = trigger_terminal_task_verifications(
+        execution_store=execution_store,
+        verification_store=verification_store,
+    )
+
+    assert result["created_count"] == 0
+    assert result["skipped"][0]["plan_id"] == plan["plan_id"]
+    assert result["skipped"][0]["reason"] == "non_terminal_or_unlaunchable"
+
+
+def test_verification_trigger_records_absent_criteria_as_unverifiable(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    plan = execution_store.create_plan(
+        title="Absent criteria",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Completed without criteria",
+            "prompt": "Do the implementation.",
+            "profile_id": "workspace.implement",
+            "project_id": "OrynWorkspace",
+            "permissions": "edit",
+            "acceptance_criteria": [],
+        }],
+    )
+    task_id = plan["tasks"][0]["task_id"]
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=task_id,
+        state="completed_ok",
+        event_store=event_store,
+    )
+
+    result = trigger_terminal_task_verifications(
+        execution_store=execution_store,
+        verification_store=verification_store,
+        event_store=event_store,
+    )
+
+    assert result["created_count"] == 1
+    assert result["created"][0]["status"] == "skipped"
+    assert result["created"][0]["verdict"] == "unverifiable"
 
 
 def test_verification_refresh_recovers_transcript_before_runtime_terminal(tmp_path):

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Block accidental pushes to NousResearch from the Oryn Hermes fork.
+set -euo pipefail
+
+remote="${1:-}"
+if [[ "${remote}" == "upstream" || "${remote}" == "nous-upstream" ]]; then
+  echo "blocked: refusing to push to NousResearch (nous-upstream)." >&2
+  echo "push to origin (Felippen/hermes-agent) and open PRs from the Oryn repo root." >&2
+  exit 1
+fi
+
+exit 0

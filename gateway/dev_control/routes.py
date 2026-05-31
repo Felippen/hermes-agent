@@ -48,6 +48,7 @@ from gateway.dev_control.acceptance_verification import (
     launch_verification_run,
     list_verification_runs,
     refresh_verification_run,
+    trigger_terminal_task_verifications,
 )
 from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.clarifications import (
@@ -58,6 +59,12 @@ from gateway.dev_control.clarifications import (
     get_clarification,
     list_clarifications,
     start_clarification,
+)
+from gateway.dev_control.deepswe_benchmarks import (
+    DevDeepSWEBenchmarkStore,
+    diagnose_deepswe_run,
+    generate_deepswe_actions,
+    start_deepswe_benchmark,
 )
 from gateway.dev_control.harness_benchmarks import (
     get_harness_benchmark_run,
@@ -73,6 +80,15 @@ from gateway.dev_control.harness_recommendations import (
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
 )
+from gateway.dev_control.harness_promotions import (
+    DevHarnessPromotionStore,
+    confirm_stable_promotion,
+    create_promotion_candidate,
+    generate_promotion_package,
+    qualify_promotion,
+    record_promotion_merge,
+    record_promotion_pr,
+)
 from gateway.dev_control.github_pr_automation import (
     DevGitHubPRAutomationStore,
     automation_summary,
@@ -86,7 +102,7 @@ from gateway.dev_control.incidents import (
     detect_incidents,
     resolve_incident,
 )
-from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health
+from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health, promotion_evidence_from_lab_pass
 from gateway.dev_control.plan_artifacts import (
     DevPlanArtifactStore,
     approve_execution_plan_draft,
@@ -102,6 +118,17 @@ from gateway.dev_control.plan_artifacts import (
     revise_execution_plan_draft,
     revise_plan_artifact,
 )
+from gateway.dev_control.project_goals import (
+    DevProjectGoalStore,
+    abandon_project_goal,
+    create_project_goal,
+    get_project_goal_tree,
+    list_project_goals,
+    maybe_create_subgoal_for_approved_artifact,
+    sync_subgoal_plan_id,
+    update_project_goal,
+)
+from gateway.dev_control.project_goal_eval import reevaluate_project_goal
 from gateway.dev_control.project_scope import project_id_from_payload, resolve_project_id
 from gateway.dev_control.product_events import DevProductEventStore
 from gateway.dev_control.production_signals import (
@@ -201,6 +228,19 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_harness_recommendation_runs": {"method": "GET", "path": "/v1/dev/harness/recommendations"},
         "dev_harness_benchmark": {"method": "POST", "path": "/v1/dev/harness/benchmarks"},
         "dev_harness_benchmark_runs": {"method": "GET", "path": "/v1/dev/harness/benchmarks"},
+        "dev_harness_promotions": {"method": "GET", "path": "/v1/dev/harness/promotions"},
+        "dev_create_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions"},
+        "dev_harness_promotion_detail": {"method": "GET", "path": "/v1/dev/harness/promotions/{promotion_id}"},
+        "dev_qualify_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/qualify"},
+        "dev_package_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/package"},
+        "dev_harness_promotion_pr": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/pr"},
+        "dev_harness_promotion_merge": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/merge"},
+        "dev_harness_promotion_confirm_stable": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/confirm-stable"},
+        "dev_deepswe_runs": {"method": "GET", "path": "/v1/dev/deepswe-runs"},
+        "dev_start_deepswe_run": {"method": "POST", "path": "/v1/dev/deepswe-runs"},
+        "dev_deepswe_run_detail": {"method": "GET", "path": "/v1/dev/deepswe-runs/{run_id}"},
+        "dev_deepswe_run_diagnose": {"method": "POST", "path": "/v1/dev/deepswe-runs/{run_id}/diagnose"},
+        "dev_deepswe_run_actions": {"method": "POST", "path": "/v1/dev/deepswe-runs/{run_id}/actions"},
         "dev_clarifications": {"method": "GET", "path": "/v1/dev/clarifications"},
         "dev_start_clarification": {"method": "POST", "path": "/v1/dev/clarifications"},
         "dev_answer_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/answer"},
@@ -213,11 +253,18 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_cancel_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/cancel"},
         "dev_create_execution_plan_from_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan"},
         "dev_plan_artifact_builds": {"method": "GET", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/builds"},
+        "dev_project_goals": {"method": "GET", "path": "/v1/dev/goals"},
+        "dev_create_project_goal": {"method": "POST", "path": "/v1/dev/goals"},
+        "dev_project_goal_tree": {"method": "GET", "path": "/v1/dev/goals/tree"},
+        "dev_project_goal_reevaluate": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/reevaluate"},
+        "dev_abandon_project_goal": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/abandon"},
+        "dev_update_project_goal": {"method": "PATCH", "path": "/v1/dev/goals/{goal_id}"},
         "dev_execution_plan_draft_review": {"method": "GET", "path": "/v1/dev/execution-plans/{plan_id}/draft-review"},
         "dev_revise_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/revise-draft"},
         "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
         "dev_cancel_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/cancel-draft"},
         "dev_verification_runs": {"method": "GET", "path": "/v1/dev/verification-runs"},
+        "dev_verification_trigger": {"method": "POST", "path": "/v1/dev/verification-runs/trigger"},
         "dev_start_verification_run": {"method": "POST", "path": "/v1/dev/verification-runs"},
         "dev_verification_run_detail": {"method": "GET", "path": "/v1/dev/verification-runs/{verification_run_id}"},
         "dev_signal_reports": {"method": "GET", "path": "/v1/dev/signal-reports"},
@@ -265,6 +312,19 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_get("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_post("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", adapter._handle_dev_harness_benchmark_detail)
+    app.router.add_get("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_post("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_get("/v1/dev/harness/promotions/{promotion_id}", adapter._handle_dev_harness_promotion_detail)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/qualify", adapter._handle_dev_harness_promotion_qualify)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/package", adapter._handle_dev_harness_promotion_package)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/pr", adapter._handle_dev_harness_promotion_pr)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/merge", adapter._handle_dev_harness_promotion_merge)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/confirm-stable", adapter._handle_dev_harness_promotion_confirm_stable)
+    app.router.add_get("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_post("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_get("/v1/dev/deepswe-runs/{run_id}", adapter._handle_dev_deepswe_run_detail)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/diagnose", adapter._handle_dev_deepswe_run_diagnose)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/actions", adapter._handle_dev_deepswe_run_actions)
     app.router.add_get("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_post("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_get("/v1/dev/clarifications/{clarification_id}", adapter._handle_dev_clarification_detail)
@@ -279,6 +339,12 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/cancel", adapter._handle_dev_plan_artifact_cancel)
     app.router.add_post("/v1/dev/plan-artifacts/{plan_artifact_id}/create-execution-plan", adapter._handle_dev_plan_artifact_create_execution_plan)
     app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}/builds", adapter._handle_dev_plan_artifact_builds)
+    app.router.add_get("/v1/dev/goals/tree", adapter._handle_dev_project_goal_tree)
+    app.router.add_get("/v1/dev/goals", adapter._handle_dev_project_goals)
+    app.router.add_post("/v1/dev/goals", adapter._handle_dev_project_goals)
+    app.router.add_post("/v1/dev/goals/{goal_id}/reevaluate", adapter._handle_dev_project_goal_reevaluate)
+    app.router.add_post("/v1/dev/goals/{goal_id}/abandon", adapter._handle_dev_project_goal_abandon)
+    app.router.add_patch("/v1/dev/goals/{goal_id}", adapter._handle_dev_project_goal_update)
     app.router.add_get("/v1/dev/runtimes/openhands/server", adapter._handle_dev_openhands_server_status)
     app.router.add_post("/v1/dev/runtimes/openhands/server/start", adapter._handle_dev_openhands_server_start)
     app.router.add_post("/v1/dev/runtimes/openhands/server/stop", adapter._handle_dev_openhands_server_stop)
@@ -286,6 +352,7 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/execution-plans", adapter._handle_dev_execution_plans)
     app.router.add_get("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
     app.router.add_post("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
+    app.router.add_post("/v1/dev/verification-runs/trigger", adapter._handle_dev_verification_trigger)
     app.router.add_get("/v1/dev/verification-runs/{verification_run_id}", adapter._handle_dev_verification_run_detail)
     app.router.add_get("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
     app.router.add_post("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
@@ -374,6 +441,7 @@ class DevControlRouteMixin:
         pr_automation_store = self._ensure_dev_github_pr_automation_store()
         reliability_store = self._ensure_dev_reliability_store()
         lab_loop_store = self._ensure_dev_lab_loop_store()
+        goal_store = self._ensure_dev_project_goal_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
@@ -463,6 +531,14 @@ class DevControlRouteMixin:
                 "project_id": project_id,
                 "clarifications": clarifications.get("data", []),
                 "plan_artifacts": artifacts.get("data", []),
+                "project_goals": (
+                    get_project_goal_tree(
+                        store=goal_store,
+                        project_id=resolve_project_id(project_id),
+                    )
+                    if goal_store is not None
+                    else None
+                ),
                 "subagent_board": build_agent_board_response(board_rows),
                 "dev_plans": plans,
                 "latest_plan_artifact_build": latest_build,
@@ -569,6 +645,43 @@ class DevControlRouteMixin:
             logger.warning("Dev plan artifact store unavailable: %s", exc)
             return None
         return self._dev_plan_artifact_store
+
+    def _ensure_dev_project_goal_store(self) -> Optional[DevProjectGoalStore]:
+        """Create the Dev project goal store on the same state.db as execution plans."""
+        if getattr(self, "_dev_project_goal_store", None) is not None:
+            return self._dev_project_goal_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_project_goal_store = DevProjectGoalStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev project goal store unavailable: %s", exc)
+            return None
+        return self._dev_project_goal_store
+
+    def _invalidate_dev_dashboard_read_models(self) -> None:
+        invalidate = getattr(self, "_invalidate_ao_read_models", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _sync_subgoal_plan_id_for_build(
+        self,
+        *,
+        plan_id: str,
+        plan_artifact_id: Optional[str] = None,
+    ) -> None:
+        goal_store = self._ensure_dev_project_goal_store()
+        if goal_store is None:
+            return
+        try:
+            sync_subgoal_plan_id(
+                goal_store,
+                plan_id,
+                plan_artifact_id=plan_artifact_id,
+            )
+        except Exception as exc:
+            logger.warning("Dev project goal plan_id sync failed: %s", exc)
 
     def _ensure_dev_verification_store(self) -> Optional[DevVerificationStore]:
         """Create the Dev verification store on the same state.db as execution plans."""
@@ -681,6 +794,34 @@ class DevControlRouteMixin:
             logger.warning("Dev Lab loop store unavailable: %s", exc)
             return None
         return self._dev_lab_loop_store
+
+    def _ensure_dev_harness_promotion_store(self) -> Optional[DevHarnessPromotionStore]:
+        """Create the Dev harness promotion store on the same state.db as execution plans."""
+        if getattr(self, "_dev_harness_promotion_store", None) is not None:
+            return self._dev_harness_promotion_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_harness_promotion_store = DevHarnessPromotionStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev harness promotion store unavailable: %s", exc)
+            return None
+        return self._dev_harness_promotion_store
+
+    def _ensure_dev_deepswe_benchmark_store(self) -> Optional[DevDeepSWEBenchmarkStore]:
+        """Create the DeepSWE benchmark store on the same state.db as execution plans."""
+        if getattr(self, "_dev_deepswe_benchmark_store", None) is not None:
+            return self._dev_deepswe_benchmark_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_deepswe_benchmark_store = DevDeepSWEBenchmarkStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev DeepSWE benchmark store unavailable: %s", exc)
+            return None
+        return self._dev_deepswe_benchmark_store
 
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
@@ -886,12 +1027,18 @@ class DevControlRouteMixin:
         store = self._ensure_dev_plan_artifact_store()
         if store is None:
             return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
+        goal_store = self._ensure_dev_project_goal_store()
         try:
             result = approve_plan_artifact(store=store, plan_artifact_id=request.match_info["plan_artifact_id"])
+            if goal_store is not None:
+                subgoal = maybe_create_subgoal_for_approved_artifact(store=goal_store, artifact=result)
+                if subgoal:
+                    result = {**result, "linked_project_subgoal": subgoal}
         except KeyError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_plan_artifact_cancel(self, request: "web.Request") -> "web.Response":
@@ -939,6 +1086,13 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev plan artifact build failed: {exc}"}}, status=500)
+        plan_id = str(result.get("plan_id") or "").strip()
+        if plan_id:
+            self._sync_subgoal_plan_id_for_build(
+                plan_id=plan_id,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+            )
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_plan_artifact_builds(self, request: "web.Request") -> "web.Response":
@@ -957,6 +1111,154 @@ class DevControlRouteMixin:
             )
         except KeyError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
+        return web.json_response(result)
+
+    async def _handle_dev_project_goals(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/goals — list or create durable project goals."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        if request.method == "GET":
+            include_abandoned = str(request.rel_url.query.get("include_abandoned") or "true").lower() not in {
+                "0", "false", "no",
+            }
+            result = list_project_goals(
+                store=store,
+                project_id=request.rel_url.query.get("project_id") or None,
+                kind=request.rel_url.query.get("kind") or None,
+                status=request.rel_url.query.get("status") or None,
+                parent_goal_id=request.rel_url.query.get("parent_goal_id"),
+                include_abandoned=include_abandoned,
+                limit=request.rel_url.query.get("limit") or 200,
+            )
+            return web.json_response(result)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = create_project_goal(
+                store=store,
+                kind=body.get("kind") or "",
+                title=body.get("title") or "",
+                project_id=project_id_from_payload(body),
+                parent_goal_id=body.get("parent_goal_id"),
+                markdown=body.get("markdown") or "",
+                status=body.get("status") or "proposed",
+                acceptance_criteria=body.get("acceptance_criteria") or [],
+                plan_artifact_id=body.get("plan_artifact_id"),
+                ordering=body.get("ordering") or 0,
+                payload=body.get("payload") or {},
+            )
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev project goal creation failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response(result)
+
+    async def _handle_dev_project_goal_tree(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/goals/tree — assembled project goal hierarchy."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        project_id = resolve_project_id(request.rel_url.query.get("project_id"))
+        include_abandoned = str(request.rel_url.query.get("include_abandoned") or "false").lower() in {
+            "1", "true", "yes",
+        }
+        result = get_project_goal_tree(
+            store=store,
+            project_id=project_id,
+            include_abandoned=include_abandoned,
+        )
+        return web.json_response(result)
+
+    async def _handle_dev_project_goal_reevaluate(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/goals/{goal_id}/reevaluate — manual re-evaluation trigger."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        verification_store = self._ensure_dev_verification_store()
+        execution_store = self._ensure_dev_execution_store()
+        plan_artifact_store = self._ensure_dev_plan_artifact_store()
+        signal_store = self._ensure_dev_signal_store()
+        reliability_store = self._ensure_dev_reliability_store()
+        try:
+            result = reevaluate_project_goal(
+                store=store,
+                goal_id=request.match_info["goal_id"],
+                verification_store=verification_store,
+                execution_store=execution_store,
+                plan_artifact_store=plan_artifact_store,
+                signal_store=signal_store,
+                reliability_store=reliability_store,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev project goal re-evaluation failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response(result)
+
+    async def _handle_dev_project_goal_update(self, request: "web.Request") -> "web.Response":
+        """PATCH /v1/dev/goals/{goal_id} — update durable project goal fields."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = update_project_goal(
+                store=store,
+                goal_id=request.match_info["goal_id"],
+                title=body.get("title"),
+                markdown=body.get("markdown"),
+                status=body.get("status"),
+                acceptance_criteria=body.get("acceptance_criteria"),
+                plan_artifact_id=body.get("plan_artifact_id"),
+                parent_goal_id=body.get("parent_goal_id"),
+                ordering=body.get("ordering"),
+                payload=body.get("payload"),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev project goal update failed: {exc}"}}, status=500)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response(result)
+
+    async def _handle_dev_project_goal_abandon(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/goals/{goal_id}/abandon — mark a goal abandoned."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_project_goal_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev project goal store unavailable"}}, status=503)
+        try:
+            result = abandon_project_goal(store=store, goal_id=request.match_info["goal_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_execution_plan_draft_review(self, request: "web.Request") -> "web.Response":
@@ -1021,6 +1323,7 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_execution_plan_cancel_draft(self, request: "web.Request") -> "web.Response":
@@ -1194,6 +1497,261 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev harness benchmark lookup failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotions(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/harness/promotions — list or create promotion records."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        if request.method == "GET":
+            rows = store.list_promotions(
+                status=request.rel_url.query.get("status") or None,
+                lab_pass_id=request.rel_url.query.get("lab_pass_id") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response({"ok": True, "object": "list", "data": rows, "total": len(rows)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            lab_evidence = body.get("lab_evidence") or {}
+            benchmark_run_ids = body.get("benchmark_run_ids") or []
+            lab_pass_id = body.get("lab_pass_id") or body.get("pass_id")
+            if not lab_evidence and lab_pass_id:
+                lab_store = self._ensure_dev_lab_loop_store()
+                if lab_store is None:
+                    return web.json_response({"error": {"message": "Dev Lab loop store unavailable"}}, status=503)
+                lab_pass = lab_store.get_pass(lab_pass_id)
+                if lab_pass is None:
+                    return web.json_response({"error": {"message": f"Dev Lab pass not found: {lab_pass_id}"}}, status=404)
+                lab_evidence = promotion_evidence_from_lab_pass(
+                    lab_pass,
+                    benchmark_run_ids=benchmark_run_ids,
+                    target_repo=body.get("target_repo"),
+                    target_capability=body.get("target_capability"),
+                    improvement_category=body.get("improvement_category") or body.get("category"),
+                )
+            result = create_promotion_candidate(
+                store=store,
+                lab_evidence=lab_evidence,
+                benchmark_evidence=body.get("benchmark_evidence") or {},
+                target_repo=body.get("target_repo"),
+                target_capability=body.get("target_capability"),
+                improvement_category=body.get("improvement_category") or body.get("category"),
+                benchmark_run_ids=benchmark_run_ids,
+                qualify=_coerce_request_bool(body.get("qualify"), default=False),
+            )
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion creation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/harness/promotions/{promotion_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        promotion = store.get_promotion(request.match_info["promotion_id"])
+        if promotion is None:
+            return web.json_response({"error": {"message": "Dev harness promotion not found"}}, status=404)
+        return web.json_response(promotion)
+
+    async def _handle_dev_harness_promotion_qualify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/qualify."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            result = qualify_promotion(store=store, promotion_id=request.match_info["promotion_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion qualification failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_package(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/package."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            result = generate_promotion_package(store=store, promotion_id=request.match_info["promotion_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion packaging failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_pr(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/pr — record PR metadata only."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = record_promotion_pr(store=store, promotion_id=request.match_info["promotion_id"], pr_refs=body)
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion PR metadata failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_merge(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/merge — record merge metadata only."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = record_promotion_merge(store=store, promotion_id=request.match_info["promotion_id"], merge_refs=body)
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion merge metadata failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_confirm_stable(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/confirm-stable."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = confirm_stable_promotion(
+                store=store,
+                promotion_id=request.match_info["promotion_id"],
+                stable_evidence=body.get("stable_evidence") or body,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion Stable confirmation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_runs(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/deepswe-runs — list or start Lab DeepSWE benchmark runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        if request.method == "GET":
+            rows = store.list_runs(
+                status=request.rel_url.query.get("status") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response({"ok": True, "object": "list", "data": rows, "total": len(rows)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = start_deepswe_benchmark(
+                store=store,
+                context=body.get("context") or body,
+                task_results=body.get("task_results"),
+                result_artifact=body.get("result_artifact"),
+                mode=body.get("mode") or "fixture",
+                execute=_coerce_request_bool(body.get("execute"), default=False),
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE benchmark run failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_run_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/deepswe-runs/{run_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        run = store.get_run(request.match_info["run_id"])
+        if run is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark run not found"}}, status=404)
+        return web.json_response(run)
+
+    async def _handle_dev_deepswe_run_diagnose(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/deepswe-runs/{run_id}/diagnose."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        try:
+            result = diagnose_deepswe_run(store=store, run_id=request.match_info["run_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE diagnosis failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_run_actions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/deepswe-runs/{run_id}/actions — generate advisory improvement actions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            diagnosis_id = body.get("diagnosis_id")
+            if not diagnosis_id:
+                existing = store.latest_diagnosis(request.match_info["run_id"])
+                diagnosis = existing or diagnose_deepswe_run(store=store, run_id=request.match_info["run_id"])
+                diagnosis_id = diagnosis["diagnosis_id"]
+            result = generate_deepswe_actions(
+                store=store,
+                diagnosis_id=diagnosis_id,
+                signal_store=self._ensure_dev_signal_store() if _coerce_request_bool(body.get("create_backlog_proposals"), default=False) else None,
+                lab_store=self._ensure_dev_lab_loop_store() if _coerce_request_bool(body.get("create_lab_candidates"), default=False) else None,
+                create_backlog_proposals=_coerce_request_bool(body.get("create_backlog_proposals"), default=False),
+                create_lab_candidates=_coerce_request_bool(body.get("create_lab_candidates"), default=False),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE action generation failed: {exc}"}}, status=500)
         return web.json_response(result)
 
     async def _handle_dev_openhands_server_status(self, request: "web.Request") -> "web.Response":
@@ -1784,6 +2342,8 @@ class DevControlRouteMixin:
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
+        self._sync_subgoal_plan_id_for_build(plan_id=plan_id)
+        self._invalidate_dev_dashboard_read_models()
         return web.json_response(result)
 
     async def _handle_dev_verification_runs(self, request: "web.Request") -> "web.Response":
@@ -1829,6 +2389,32 @@ class DevControlRouteMixin:
             return web.json_response(_openai_error(str(exc)), status=404)
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_verification_trigger(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/verification-runs/trigger — launch missing advisory checks."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        execution_store = self._ensure_dev_execution_store()
+        verification_store = self._ensure_dev_verification_store()
+        if execution_store is None or verification_store is None:
+            return web.json_response(_openai_error("Dev verification store unavailable"), status=503)
+        try:
+            result = trigger_terminal_task_verifications(
+                execution_store=execution_store,
+                verification_store=verification_store,
+                event_store=self._ensure_subagent_event_store(),
+                project_id=body.get("project_id") or None,
+                limit=int(body.get("limit") or 50),
+            )
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -2473,6 +3059,7 @@ class DevControlRouteMixin:
             scm_store=self._ensure_dev_scm_store(),
             incident_store=self._ensure_dev_incident_store(),
             product_event_store=self._ensure_dev_product_event_store(),
+            event_store=self._ensure_subagent_event_store(),
             project_id=body.get("project_id"),
             limit=int(body.get("limit") or 200),
         )

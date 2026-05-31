@@ -108,6 +108,17 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[text | pause | resume | clear | status]"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
+    CommandDef("project", "Manage durable Dev project goals (vision → subgoal)", "Dev",
+               args_hint="tree|list|create|abandon|reevaluate|status",
+               subcommands=("tree", "list", "create", "abandon", "reevaluate", "status", "help")),
+    CommandDef("vision", "Create a project vision node (Dev project goals)", "Dev",
+               args_hint="<title> [--parent id]"),
+    CommandDef("milestone", "Create a project milestone node", "Dev",
+               args_hint="<title> [--parent id]"),
+    CommandDef("pgoal", "Create a project goal node (not session /goal)", "Dev",
+               args_hint="<title> [--parent id]"),
+    CommandDef("psubgoal", "Create a project subgoal linked to execution", "Dev",
+               args_hint="<title> [--parent id] [--plan-artifact-id id]"),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
@@ -1072,6 +1083,20 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Preserve the short forms operators rely on before canonical Dev commands
+    # and plugin-provided commands consume Slack's 50-command manifest cap.
+    priority_aliases = {
+        "background": ("btw", "bg"),
+        "new": ("reset",),
+        "queue": ("q",),
+    }
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        for alias in priority_aliases.get(cmd.name, ()):
+            if alias in cmd.aliases:
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:

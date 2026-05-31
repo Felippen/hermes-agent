@@ -32,6 +32,8 @@ from gateway.dev_control.acceptance_verification import DevVerificationStore
 from gateway.dev_control.production_signals import DevProductionSignalStore
 from gateway.dev_control.reliability import DevReliabilityStore
 from gateway.dev_control.lab_loop import DevLabLoopStore
+from gateway.dev_control.harness_promotions import DevHarnessPromotionStore
+from gateway.dev_control.deepswe_benchmarks import DevDeepSWEBenchmarkStore
 from gateway.dev_control.repo_grounding import collect_repo_grounding
 from gateway.dev_control.read_models import build_agent_board_rows
 from gateway.subagent_events import SubagentEventStore
@@ -225,6 +227,19 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_post("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", adapter._handle_dev_harness_benchmark_detail)
+    app.router.add_get("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_post("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_get("/v1/dev/harness/promotions/{promotion_id}", adapter._handle_dev_harness_promotion_detail)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/qualify", adapter._handle_dev_harness_promotion_qualify)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/package", adapter._handle_dev_harness_promotion_package)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/pr", adapter._handle_dev_harness_promotion_pr)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/merge", adapter._handle_dev_harness_promotion_merge)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/confirm-stable", adapter._handle_dev_harness_promotion_confirm_stable)
+    app.router.add_get("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_post("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_get("/v1/dev/deepswe-runs/{run_id}", adapter._handle_dev_deepswe_run_detail)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/diagnose", adapter._handle_dev_deepswe_run_diagnose)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/actions", adapter._handle_dev_deepswe_run_actions)
     app.router.add_get("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_post("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_get("/v1/dev/clarifications/{clarification_id}", adapter._handle_dev_clarification_detail)
@@ -246,6 +261,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/dev/execution-plans", adapter._handle_dev_execution_plans)
     app.router.add_get("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
     app.router.add_post("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
+    app.router.add_post("/v1/dev/verification-runs/trigger", adapter._handle_dev_verification_trigger)
     app.router.add_get("/v1/dev/verification-runs/{verification_run_id}", adapter._handle_dev_verification_run_detail)
     app.router.add_get("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
     app.router.add_post("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
@@ -1544,6 +1560,56 @@ class TestRunEvents:
         task = plan_payload["plan"]["tasks"][0]
         assert task["acceptance_verification"]["verdict"] == "verified"
         assert plan_payload["plan"]["acceptance_verification"]["counts"]["passed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_dev_verification_trigger_api_creates_and_deduplicates_manual_runs(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._subagent_event_store = SubagentEventStore(db_path)
+        adapter._dev_verification_store = DevVerificationStore(db_path)
+        criteria = acceptance_criteria_to_strings([{
+            "statement": "Manual verification remains manual.",
+            "verification_method": "manual",
+            "verification_detail": "Review the result manually.",
+            "machine_checkable": False,
+        }])
+        plan = adapter._dev_execution_store.create_plan(
+            title="Verify trigger API",
+            vision_brief=None,
+            tasks=[{
+                "goal": "Implemented feature",
+                "prompt": "Implement the feature.",
+                "profile_id": "workspace.implement",
+                "project_id": "OrynWorkspace",
+                "permissions": "edit",
+                "acceptance_criteria": criteria,
+            }],
+        )
+        task_id = plan["tasks"][0]["task_id"]
+        from gateway.dev_execution import set_execution_plan_test_state
+
+        set_execution_plan_test_state(
+            store=adapter._dev_execution_store,
+            plan_id=plan["plan_id"],
+            task_id=task_id,
+            state="completed_ok",
+            event_store=adapter._subagent_event_store,
+            ao_session_id="implemented-trigger-session",
+        )
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            first_resp = await cli.post("/v1/dev/verification-runs/trigger", json={})
+            second_resp = await cli.post("/v1/dev/verification-runs/trigger", json={})
+            first = await first_resp.json()
+            second = await second_resp.json()
+
+        assert first_resp.status == 200
+        assert second_resp.status == 200
+        assert first["created_count"] == 1
+        assert first["created"][0]["verdict"] == "manual_required"
+        assert second["created_count"] == 0
+        assert second["skipped"][0]["reason"] == "current_verification_exists"
 
     @pytest.mark.asyncio
     async def test_dev_execution_plan_draft_can_revise_and_approve_without_launch(self, adapter, tmp_path):
@@ -6057,3 +6123,184 @@ class TestDevReliabilityAPI:
             assert data["object"] == "hermes.dev_lab_loop_health"
             assert data["state"]["status"] == "idle"
             assert data["real_outcome_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dev_harness_promotion_api_lifecycle_is_advisory(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._dev_lab_loop_store = DevLabLoopStore(db_path)
+        adapter._dev_harness_promotion_store = DevHarnessPromotionStore(db_path)
+        adapter._dev_lab_loop_store.record_pass({
+            "pass_id": "devlab-pass-api",
+            "candidate_id": "dogfood:api",
+            "status": "completed",
+            "candidate": {"candidate_id": "dogfood:api", "target_paths": ["gateway/dev_control/routes.py"]},
+            "execution": {
+                "draft_artifact": {"artifact_id": "draft-api", "branch": "lab/api", "head_sha": "abc123", "ready": True},
+                "diff_scope": {"ok": True},
+                "touched_paths": ["gateway/dev_control/routes.py"],
+                "quarantined": False,
+                "empty_diff": False,
+                "verification": {"verification_run_id": "verify-api"},
+                "verification_verdict": "passed",
+                "ci_state": "success",
+                "code_review_verdict": "approved",
+            },
+        })
+        benchmark_evidence = {
+            "benchmark_run_ids": ["bench-before-api", "bench-after-api"],
+            "comparable": True,
+            "live": True,
+            "sample_count": 8,
+            "baseline": {
+                "task_set_hash": "tasks-v1",
+                "scoring_rubric": "rubric-v1",
+                "runtime_profile": "platform.implement",
+                "metrics": {
+                    "score": 0.70,
+                    "failure_rate": 0.10,
+                    "verification_success_rate": 0.90,
+                    "ci_success_rate": 0.95,
+                    "review_success_rate": 0.90,
+                    "cost_usd": 1.0,
+                    "duration_seconds": 100.0,
+                },
+            },
+            "candidate": {
+                "task_set_hash": "tasks-v1",
+                "scoring_rubric": "rubric-v1",
+                "runtime_profile": "platform.implement",
+                "metrics": {
+                    "score": 0.80,
+                    "failure_rate": 0.10,
+                    "verification_success_rate": 0.90,
+                    "ci_success_rate": 0.95,
+                    "review_success_rate": 0.90,
+                    "cost_usd": 1.05,
+                    "duration_seconds": 104.0,
+                },
+            },
+        }
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post("/v1/dev/harness/promotions", json={
+                "lab_pass_id": "devlab-pass-api",
+                "benchmark_run_ids": ["bench-before-api", "bench-after-api"],
+                "benchmark_evidence": benchmark_evidence,
+                "target_repo": "hermes-agent",
+                "target_capability": "dev-harness",
+                "improvement_category": "output_contract",
+                "qualify": True,
+            })
+            assert create_resp.status == 200
+            created = await create_resp.json()
+            assert created["status"] == "qualified"
+            promotion_id = created["promotion_id"]
+
+            package_resp = await cli.post(f"/v1/dev/harness/promotions/{promotion_id}/package", json={})
+            assert package_resp.status == 200
+            packaged = await package_resp.json()
+            assert packaged["status"] == "packaged"
+            assert packaged["package"]["side_effects"]["merged"] is False
+            assert "Stable confirmation has not run" in packaged["package"]["body"]
+
+            pr_resp = await cli.post(f"/v1/dev/harness/promotions/{promotion_id}/pr", json={
+                "child_pr": "https://github.test/hermes-agent/pull/1",
+            })
+            assert pr_resp.status == 200
+            pr_record = await pr_resp.json()
+            assert pr_record["status"] == "pr_open"
+
+            merge_resp = await cli.post(f"/v1/dev/harness/promotions/{promotion_id}/merge", json={
+                "child_sha": "abc123",
+            })
+            assert merge_resp.status == 200
+            merged = await merge_resp.json()
+            assert merged["status"] == "merged"
+            assert "confirmation" not in merged["stable_evidence"]
+
+            confirm_resp = await cli.post(f"/v1/dev/harness/promotions/{promotion_id}/confirm-stable", json={
+                "stable_evidence": {
+                    "benchmark_run_ids": ["stable-bench-api"],
+                    "benchmark_evidence": benchmark_evidence,
+                }
+            })
+            assert confirm_resp.status == 200
+            confirmed = await confirm_resp.json()
+            assert confirmed["status"] == "stable_confirmed"
+            assert confirmed["stable_evidence"]["environment"] == "stable"
+
+            list_resp = await cli.get("/v1/dev/harness/promotions")
+            assert list_resp.status == 200
+            listed = await list_resp.json()
+            assert listed["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_dev_deepswe_api_creates_diagnoses_and_actions(self, adapter, tmp_path):
+        db_path = tmp_path / "state.db"
+        adapter._dev_execution_store = DevExecutionStore(db_path)
+        adapter._dev_deepswe_benchmark_store = DevDeepSWEBenchmarkStore(db_path)
+        adapter._dev_signal_store = DevProductionSignalStore(db_path)
+        adapter._dev_lab_loop_store = DevLabLoopStore(db_path)
+
+        context = {
+            "deepswe_repo_url": "https://github.com/datacurve-ai/deep-swe",
+            "deepswe_commit": "abc123",
+            "pier_version": "0.1.0",
+            "agent_adapter": "mini-swe-agent",
+            "model_profile": "openai/gpt-5.5",
+            "task_ids": ["task-a", "task-b", "task-c"],
+            "resource_limits": {"timeout_seconds": 600, "max_cost_usd": 5.0, "max_tasks": 3},
+            "network_policy": {"mode": "agent_allowlist"},
+        }
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            missing_resp = await cli.post("/v1/dev/deepswe-runs", json={
+                "context": {"deepswe_commit": "abc123"},
+                "task_results": [],
+            })
+            assert missing_resp.status == 400
+
+            create_resp = await cli.post("/v1/dev/deepswe-runs", json={
+                "context": context,
+                "mode": "fixture",
+                "task_results": [
+                    {"task_id": "task-a", "status": "passed", "prompt": "do not persist"},
+                    {"task_id": "task-b", "status": "failed", "failure_category": "navigation_failure"},
+                    {"task_id": "task-c", "status": "failed", "failure_category": "navigation_failure"},
+                ],
+            })
+            assert create_resp.status == 200
+            run = await create_resp.json()
+            assert run["object"] == "hermes.dev_deepswe_benchmark_run"
+            assert run["summary"]["task_count"] == 3
+            assert "prompt" not in run["task_results"][0]
+            run_id = run["run_id"]
+
+            detail_resp = await cli.get(f"/v1/dev/deepswe-runs/{run_id}")
+            assert detail_resp.status == 200
+            detail = await detail_resp.json()
+            assert detail["run_id"] == run_id
+
+            diagnose_resp = await cli.post(f"/v1/dev/deepswe-runs/{run_id}/diagnose", json={})
+            assert diagnose_resp.status == 200
+            diagnosis = await diagnose_resp.json()
+            assert diagnosis["patterns"][0]["failure_category"] == "navigation_failure"
+
+            actions_resp = await cli.post(f"/v1/dev/deepswe-runs/{run_id}/actions", json={
+                "diagnosis_id": diagnosis["diagnosis_id"],
+                "create_backlog_proposals": True,
+                "create_lab_candidates": True,
+            })
+            assert actions_resp.status == 200
+            actions = await actions_resp.json()
+            assert actions["created_count"] == 1
+            assert actions["created"][0]["proposal_id"]
+            assert actions["created"][0]["lab_candidate_id"]
+
+            listed_resp = await cli.get("/v1/dev/deepswe-runs")
+            assert listed_resp.status == 200
+            listed = await listed_resp.json()
+            assert listed["total"] == 1

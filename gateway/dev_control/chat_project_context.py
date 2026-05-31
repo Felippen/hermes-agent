@@ -84,6 +84,11 @@ def build_chat_project_context_overlay(body: Optional[dict[str, Any]]) -> Option
         sections.append("")
         sections.append(snapshot)
 
+    goal_digest = str(body.get("project_goal_tree_digest") or "").strip()
+    if goal_digest:
+        sections.append("")
+        sections.append(goal_digest)
+
     if len(sections) <= 2:
         return None
     return "\n".join(sections)

@@ -39,7 +39,14 @@ def main() -> int:
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        print(json.dumps({"ok": False, "status": "already_running", "lock_path": str(lock_path)}))
+        print(json.dumps({
+            "ok": True,
+            "object": "hermes.dev_signal_digest_summary",
+            "status": "skipped_lock",
+            "skipped_reason": "already_running",
+            "lock_path": str(lock_path),
+            "advisory_only": True,
+        }, sort_keys=True))
         return 0
 
     try:
