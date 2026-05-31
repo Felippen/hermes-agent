@@ -270,6 +270,17 @@ class DevLabLoopStore:
         ).fetchall()
         return [_pass_from_row(row) for row in rows]
 
+    def get_pass(self, pass_id: str) -> Optional[dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT *
+            FROM dev_lab_loop_passes
+            WHERE pass_id = ?
+            """,
+            (str(pass_id or "").strip(),),
+        ).fetchone()
+        return _pass_from_row(row) if row else None
+
     def get_state(self) -> dict[str, Any]:
         row = self._conn.execute("SELECT * FROM dev_lab_loop_state WHERE id = 1").fetchone()
         if not row:
@@ -3075,6 +3086,64 @@ def enqueue_approved_proposals(*, db_path: Path, store: Optional[DevLabLoopStore
     return queued
 
 
+def promotion_evidence_from_lab_pass(
+    report: dict[str, Any],
+    *,
+    benchmark_run_ids: Optional[list[str]] = None,
+    target_repo: Optional[str] = None,
+    target_capability: Optional[str] = None,
+    improvement_category: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return compact Lab evidence suitable for promotion records."""
+
+    execution = report.get("execution") or {}
+    draft_artifact = execution.get("draft_artifact") or report.get("draft_artifact") or {}
+    diff_scope = execution.get("diff_scope") or report.get("diff_scope") or {}
+    candidate = report.get("candidate") or {}
+    touched_paths = (
+        execution.get("touched_paths")
+        or report.get("touched_paths")
+        or candidate.get("target_paths")
+        or []
+    )
+    gates = report.get("gate_verdicts") or {
+        "verification": execution.get("verification_verdict"),
+        "ci": execution.get("ci_state"),
+        "review": execution.get("code_review_verdict"),
+        "contract_score": execution.get("output_contract_score"),
+    }
+    evidence = {
+        "object": "hermes.dev_lab_promotion_evidence",
+        "environment": "lab",
+        "source": "dev_lab_loop_pass",
+        "pass_id": report.get("pass_id"),
+        "candidate_id": report.get("candidate_id") or candidate.get("candidate_id"),
+        "status": report.get("status"),
+        "outcome_id": report.get("outcome_id") or execution.get("outcome_id"),
+        "benchmark_run_ids": benchmark_run_ids or [],
+        "verification_run_ids": _compact_ids([
+            (execution.get("verification") or {}).get("verification_run_id"),
+            execution.get("verification_run_id"),
+        ]),
+        "gate_verdicts": gates,
+        "draft_artifact": _compact_draft_artifact(draft_artifact),
+        "branch": execution.get("branch") or report.get("branch"),
+        "head_sha": execution.get("head_sha") or (draft_artifact or {}).get("head_sha"),
+        "diff_scope": diff_scope,
+        "quarantined": bool(execution.get("quarantined") or report.get("quarantined")),
+        "quarantine_reason": (diff_scope or {}).get("reason") or execution.get("implementation_reason"),
+        "empty_diff": bool(execution.get("empty_diff") or report.get("empty_diff")),
+        "out_of_scope": report.get("skip_reason") == "out_of_scope" or (diff_scope or {}).get("status") == "out_of_scope",
+        "cost": execution.get("cost") or {"cost_usd": execution.get("cost_usd"), "status": execution.get("cost_status")},
+        "duration_seconds": execution.get("duration_seconds"),
+        "touched_paths": touched_paths,
+        "target_repo": target_repo,
+        "target_capability": target_capability,
+        "improvement_category": improvement_category,
+    }
+    return _compact_promotion_evidence(evidence)
+
+
 def _run_digest(db_path: Path, *, sources: Optional[list[str]]) -> dict[str, Any]:
     selected = sources or [source.strip() for source in os.getenv("HERMES_DEV_SIGNAL_DIGEST_SOURCES", "deterministic,product,reliability").split(",") if source.strip()]
     return run_signal_digest_sources(
@@ -3426,6 +3495,47 @@ def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
         value = str(row.get(key) or "unknown")
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _compact_draft_artifact(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in ("artifact_id", "branch", "head_sha", "base_ref", "ready", "remote")
+        if value.get(key) is not None
+    }
+
+
+def _compact_ids(values: list[Any]) -> list[str]:
+    seen = set()
+    ids: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ids.append(text)
+    return ids
+
+
+def _compact_promotion_evidence(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return "<truncated>"
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in {"messages", "raw_messages", "raw_transcript", "transcript", "stdout", "stderr", "events", "worker_messages"}:
+                compact[key_text] = "<omitted>"
+                continue
+            compact[key_text] = _compact_promotion_evidence(item, depth=depth + 1)
+        return compact
+    if isinstance(value, list):
+        return [_compact_promotion_evidence(item, depth=depth + 1) for item in value[:50]]
+    if isinstance(value, str) and len(value) > 800:
+        return value[:800] + "...<truncated>"
+    return value
 
 
 def _json(value: Any) -> str:

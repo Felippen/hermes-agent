@@ -845,6 +845,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_incident_store: Optional[Any] = None
         self._dev_scm_store: Optional[Any] = None
         self._dev_reliability_store: Optional[Any] = None
+        self._dev_harness_promotion_store: Optional[Any] = None
+        self._dev_deepswe_benchmark_store: Optional[Any] = None
         self._dev_supervisor_loop_task: Optional["asyncio.Task"] = None
         self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}

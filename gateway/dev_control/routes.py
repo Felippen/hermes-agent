@@ -48,6 +48,7 @@ from gateway.dev_control.acceptance_verification import (
     launch_verification_run,
     list_verification_runs,
     refresh_verification_run,
+    trigger_terminal_task_verifications,
 )
 from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.clarifications import (
@@ -58,6 +59,12 @@ from gateway.dev_control.clarifications import (
     get_clarification,
     list_clarifications,
     start_clarification,
+)
+from gateway.dev_control.deepswe_benchmarks import (
+    DevDeepSWEBenchmarkStore,
+    diagnose_deepswe_run,
+    generate_deepswe_actions,
+    start_deepswe_benchmark,
 )
 from gateway.dev_control.harness_benchmarks import (
     get_harness_benchmark_run,
@@ -73,6 +80,15 @@ from gateway.dev_control.harness_recommendations import (
     get_harness_recommendation_run,
     list_harness_recommendation_runs,
 )
+from gateway.dev_control.harness_promotions import (
+    DevHarnessPromotionStore,
+    confirm_stable_promotion,
+    create_promotion_candidate,
+    generate_promotion_package,
+    qualify_promotion,
+    record_promotion_merge,
+    record_promotion_pr,
+)
 from gateway.dev_control.github_pr_automation import (
     DevGitHubPRAutomationStore,
     automation_summary,
@@ -86,7 +102,7 @@ from gateway.dev_control.incidents import (
     detect_incidents,
     resolve_incident,
 )
-from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health
+from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health, promotion_evidence_from_lab_pass
 from gateway.dev_control.plan_artifacts import (
     DevPlanArtifactStore,
     approve_execution_plan_draft,
@@ -212,6 +228,19 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_harness_recommendation_runs": {"method": "GET", "path": "/v1/dev/harness/recommendations"},
         "dev_harness_benchmark": {"method": "POST", "path": "/v1/dev/harness/benchmarks"},
         "dev_harness_benchmark_runs": {"method": "GET", "path": "/v1/dev/harness/benchmarks"},
+        "dev_harness_promotions": {"method": "GET", "path": "/v1/dev/harness/promotions"},
+        "dev_create_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions"},
+        "dev_harness_promotion_detail": {"method": "GET", "path": "/v1/dev/harness/promotions/{promotion_id}"},
+        "dev_qualify_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/qualify"},
+        "dev_package_harness_promotion": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/package"},
+        "dev_harness_promotion_pr": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/pr"},
+        "dev_harness_promotion_merge": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/merge"},
+        "dev_harness_promotion_confirm_stable": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/confirm-stable"},
+        "dev_deepswe_runs": {"method": "GET", "path": "/v1/dev/deepswe-runs"},
+        "dev_start_deepswe_run": {"method": "POST", "path": "/v1/dev/deepswe-runs"},
+        "dev_deepswe_run_detail": {"method": "GET", "path": "/v1/dev/deepswe-runs/{run_id}"},
+        "dev_deepswe_run_diagnose": {"method": "POST", "path": "/v1/dev/deepswe-runs/{run_id}/diagnose"},
+        "dev_deepswe_run_actions": {"method": "POST", "path": "/v1/dev/deepswe-runs/{run_id}/actions"},
         "dev_clarifications": {"method": "GET", "path": "/v1/dev/clarifications"},
         "dev_start_clarification": {"method": "POST", "path": "/v1/dev/clarifications"},
         "dev_answer_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/answer"},
@@ -235,6 +264,7 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
         "dev_cancel_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/cancel-draft"},
         "dev_verification_runs": {"method": "GET", "path": "/v1/dev/verification-runs"},
+        "dev_verification_trigger": {"method": "POST", "path": "/v1/dev/verification-runs/trigger"},
         "dev_start_verification_run": {"method": "POST", "path": "/v1/dev/verification-runs"},
         "dev_verification_run_detail": {"method": "GET", "path": "/v1/dev/verification-runs/{verification_run_id}"},
         "dev_signal_reports": {"method": "GET", "path": "/v1/dev/signal-reports"},
@@ -282,6 +312,19 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_get("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_post("/v1/dev/harness/benchmarks", adapter._handle_dev_harness_benchmarks)
     app.router.add_get("/v1/dev/harness/benchmarks/{benchmark_run_id}", adapter._handle_dev_harness_benchmark_detail)
+    app.router.add_get("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_post("/v1/dev/harness/promotions", adapter._handle_dev_harness_promotions)
+    app.router.add_get("/v1/dev/harness/promotions/{promotion_id}", adapter._handle_dev_harness_promotion_detail)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/qualify", adapter._handle_dev_harness_promotion_qualify)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/package", adapter._handle_dev_harness_promotion_package)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/pr", adapter._handle_dev_harness_promotion_pr)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/merge", adapter._handle_dev_harness_promotion_merge)
+    app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/confirm-stable", adapter._handle_dev_harness_promotion_confirm_stable)
+    app.router.add_get("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_post("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
+    app.router.add_get("/v1/dev/deepswe-runs/{run_id}", adapter._handle_dev_deepswe_run_detail)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/diagnose", adapter._handle_dev_deepswe_run_diagnose)
+    app.router.add_post("/v1/dev/deepswe-runs/{run_id}/actions", adapter._handle_dev_deepswe_run_actions)
     app.router.add_get("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_post("/v1/dev/clarifications", adapter._handle_dev_clarifications)
     app.router.add_get("/v1/dev/clarifications/{clarification_id}", adapter._handle_dev_clarification_detail)
@@ -309,6 +352,7 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/execution-plans", adapter._handle_dev_execution_plans)
     app.router.add_get("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
     app.router.add_post("/v1/dev/verification-runs", adapter._handle_dev_verification_runs)
+    app.router.add_post("/v1/dev/verification-runs/trigger", adapter._handle_dev_verification_trigger)
     app.router.add_get("/v1/dev/verification-runs/{verification_run_id}", adapter._handle_dev_verification_run_detail)
     app.router.add_get("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
     app.router.add_post("/v1/dev/signal-reports", adapter._handle_dev_signal_reports)
@@ -750,6 +794,34 @@ class DevControlRouteMixin:
             logger.warning("Dev Lab loop store unavailable: %s", exc)
             return None
         return self._dev_lab_loop_store
+
+    def _ensure_dev_harness_promotion_store(self) -> Optional[DevHarnessPromotionStore]:
+        """Create the Dev harness promotion store on the same state.db as execution plans."""
+        if getattr(self, "_dev_harness_promotion_store", None) is not None:
+            return self._dev_harness_promotion_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_harness_promotion_store = DevHarnessPromotionStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev harness promotion store unavailable: %s", exc)
+            return None
+        return self._dev_harness_promotion_store
+
+    def _ensure_dev_deepswe_benchmark_store(self) -> Optional[DevDeepSWEBenchmarkStore]:
+        """Create the DeepSWE benchmark store on the same state.db as execution plans."""
+        if getattr(self, "_dev_deepswe_benchmark_store", None) is not None:
+            return self._dev_deepswe_benchmark_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_deepswe_benchmark_store = DevDeepSWEBenchmarkStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev DeepSWE benchmark store unavailable: %s", exc)
+            return None
+        return self._dev_deepswe_benchmark_store
 
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
@@ -1427,6 +1499,261 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": f"Dev harness benchmark lookup failed: {exc}"}}, status=500)
         return web.json_response(result)
 
+    async def _handle_dev_harness_promotions(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/harness/promotions — list or create promotion records."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        if request.method == "GET":
+            rows = store.list_promotions(
+                status=request.rel_url.query.get("status") or None,
+                lab_pass_id=request.rel_url.query.get("lab_pass_id") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response({"ok": True, "object": "list", "data": rows, "total": len(rows)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            lab_evidence = body.get("lab_evidence") or {}
+            benchmark_run_ids = body.get("benchmark_run_ids") or []
+            lab_pass_id = body.get("lab_pass_id") or body.get("pass_id")
+            if not lab_evidence and lab_pass_id:
+                lab_store = self._ensure_dev_lab_loop_store()
+                if lab_store is None:
+                    return web.json_response({"error": {"message": "Dev Lab loop store unavailable"}}, status=503)
+                lab_pass = lab_store.get_pass(lab_pass_id)
+                if lab_pass is None:
+                    return web.json_response({"error": {"message": f"Dev Lab pass not found: {lab_pass_id}"}}, status=404)
+                lab_evidence = promotion_evidence_from_lab_pass(
+                    lab_pass,
+                    benchmark_run_ids=benchmark_run_ids,
+                    target_repo=body.get("target_repo"),
+                    target_capability=body.get("target_capability"),
+                    improvement_category=body.get("improvement_category") or body.get("category"),
+                )
+            result = create_promotion_candidate(
+                store=store,
+                lab_evidence=lab_evidence,
+                benchmark_evidence=body.get("benchmark_evidence") or {},
+                target_repo=body.get("target_repo"),
+                target_capability=body.get("target_capability"),
+                improvement_category=body.get("improvement_category") or body.get("category"),
+                benchmark_run_ids=benchmark_run_ids,
+                qualify=_coerce_request_bool(body.get("qualify"), default=False),
+            )
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion creation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/harness/promotions/{promotion_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        promotion = store.get_promotion(request.match_info["promotion_id"])
+        if promotion is None:
+            return web.json_response({"error": {"message": "Dev harness promotion not found"}}, status=404)
+        return web.json_response(promotion)
+
+    async def _handle_dev_harness_promotion_qualify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/qualify."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            result = qualify_promotion(store=store, promotion_id=request.match_info["promotion_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion qualification failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_package(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/package."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            result = generate_promotion_package(store=store, promotion_id=request.match_info["promotion_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion packaging failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_pr(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/pr — record PR metadata only."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = record_promotion_pr(store=store, promotion_id=request.match_info["promotion_id"], pr_refs=body)
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion PR metadata failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_merge(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/merge — record merge metadata only."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = record_promotion_merge(store=store, promotion_id=request.match_info["promotion_id"], merge_refs=body)
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion merge metadata failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_harness_promotion_confirm_stable(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/harness/promotions/{promotion_id}/confirm-stable."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_harness_promotion_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev harness promotion store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = confirm_stable_promotion(
+                store=store,
+                promotion_id=request.match_info["promotion_id"],
+                stable_evidence=body.get("stable_evidence") or body,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev harness promotion Stable confirmation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_runs(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/deepswe-runs — list or start Lab DeepSWE benchmark runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        if request.method == "GET":
+            rows = store.list_runs(
+                status=request.rel_url.query.get("status") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response({"ok": True, "object": "list", "data": rows, "total": len(rows)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = start_deepswe_benchmark(
+                store=store,
+                context=body.get("context") or body,
+                task_results=body.get("task_results"),
+                result_artifact=body.get("result_artifact"),
+                mode=body.get("mode") or "fixture",
+                execute=_coerce_request_bool(body.get("execute"), default=False),
+                persist=_coerce_request_bool(body.get("persist"), default=True),
+            )
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE benchmark run failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_run_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/deepswe-runs/{run_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        run = store.get_run(request.match_info["run_id"])
+        if run is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark run not found"}}, status=404)
+        return web.json_response(run)
+
+    async def _handle_dev_deepswe_run_diagnose(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/deepswe-runs/{run_id}/diagnose."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        try:
+            result = diagnose_deepswe_run(store=store, run_id=request.match_info["run_id"])
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE diagnosis failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_deepswe_run_actions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/deepswe-runs/{run_id}/actions — generate advisory improvement actions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_deepswe_benchmark_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev DeepSWE benchmark store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            diagnosis_id = body.get("diagnosis_id")
+            if not diagnosis_id:
+                existing = store.latest_diagnosis(request.match_info["run_id"])
+                diagnosis = existing or diagnose_deepswe_run(store=store, run_id=request.match_info["run_id"])
+                diagnosis_id = diagnosis["diagnosis_id"]
+            result = generate_deepswe_actions(
+                store=store,
+                diagnosis_id=diagnosis_id,
+                signal_store=self._ensure_dev_signal_store() if _coerce_request_bool(body.get("create_backlog_proposals"), default=False) else None,
+                lab_store=self._ensure_dev_lab_loop_store() if _coerce_request_bool(body.get("create_lab_candidates"), default=False) else None,
+                create_backlog_proposals=_coerce_request_bool(body.get("create_backlog_proposals"), default=False),
+                create_lab_candidates=_coerce_request_bool(body.get("create_lab_candidates"), default=False),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev DeepSWE action generation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
     async def _handle_dev_openhands_server_status(self, request: "web.Request") -> "web.Response":
         """GET /v1/dev/runtimes/openhands/server — inspect local OpenHands server."""
         auth_err = self._check_auth(request)
@@ -2062,6 +2389,32 @@ class DevControlRouteMixin:
             return web.json_response(_openai_error(str(exc)), status=404)
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=409)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_verification_trigger(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/verification-runs/trigger — launch missing advisory checks."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        execution_store = self._ensure_dev_execution_store()
+        verification_store = self._ensure_dev_verification_store()
+        if execution_store is None or verification_store is None:
+            return web.json_response(_openai_error("Dev verification store unavailable"), status=503)
+        try:
+            result = trigger_terminal_task_verifications(
+                execution_store=execution_store,
+                verification_store=verification_store,
+                event_store=self._ensure_subagent_event_store(),
+                project_id=body.get("project_id") or None,
+                limit=int(body.get("limit") or 50),
+            )
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
@@ -2706,6 +3059,7 @@ class DevControlRouteMixin:
             scm_store=self._ensure_dev_scm_store(),
             incident_store=self._ensure_dev_incident_store(),
             product_event_store=self._ensure_dev_product_event_store(),
+            event_store=self._ensure_subagent_event_store(),
             project_id=body.get("project_id"),
             limit=int(body.get("limit") or 200),
         )

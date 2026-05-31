@@ -29,6 +29,7 @@ SUMMARY_RE = re.compile(
 )
 TERMINAL_RUN_STATUSES = {"completed", "failed", "skipped", "needs_attention"}
 TERMINAL_SESSION_STATUSES = {"completed", "complete", "done", "success", "succeeded", "failed", "errored", "error", "terminated", "killed", "exited"}
+VERIFICATION_TRIGGER_TASK_STATUSES = {"completed", "needs_review"}
 UNRUNNABLE_OUTPUT_RES = [
     re.compile(pattern, re.IGNORECASE | re.MULTILINE)
     for pattern in (
@@ -470,6 +471,84 @@ def launch_verification_run(
     }
 
 
+def trigger_terminal_task_verifications(
+    *,
+    execution_store: Any,
+    verification_store: DevVerificationStore,
+    event_store: Any = None,
+    bridge: Any = None,
+    project_id: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Create advisory verification runs for terminal Dev tasks that lack current evidence."""
+
+    created: list[Dict[str, Any]] = []
+    skipped: list[Dict[str, Any]] = []
+    plans = execution_store.list_plans(limit=limit, project_id=project_id)
+    for raw_plan in plans:
+        plan = _derived_plan_for_verification(
+            execution_store,
+            raw_plan,
+            bridge=bridge,
+            event_store=event_store,
+        )
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if not plan_id:
+            continue
+        for task in plan.get("tasks") or []:
+            task_id = str(task.get("task_id") or "").strip()
+            status = str(task.get("status") or plan.get("status") or "").strip().lower()
+            if status not in VERIFICATION_TRIGGER_TASK_STATUSES:
+                skipped.append({
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "reason": "non_terminal_or_unlaunchable",
+                    "status": status or "unknown",
+                })
+                continue
+            evidence_version = _verification_evidence_version(plan, task)
+            latest = verification_store.latest_for_task(plan_id=plan_id, task_id=task_id)
+            latest_refs = latest.get("verified_against") if isinstance(latest, dict) else {}
+            latest_version = str((latest_refs or {}).get("evidence_version") or "").strip()
+            if latest and (not evidence_version or latest_version == evidence_version):
+                skipped.append({
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "reason": "current_verification_exists",
+                    "verification_run_id": latest.get("verification_run_id"),
+                    "evidence_version": latest_version or None,
+                })
+                continue
+            try:
+                run = launch_verification_run(
+                    execution_store=execution_store,
+                    verification_store=verification_store,
+                    plan_id=plan_id,
+                    task_id=task_id,
+                    bridge=bridge,
+                    event_store=event_store,
+                )
+                if evidence_version:
+                    run = verification_store.update_run(run["verification_run_id"], {
+                        "verified_against": {
+                            **(run.get("verified_against") or {}),
+                            "evidence_version": evidence_version,
+                        }
+                    })
+                created.append(run)
+            except ValueError as exc:
+                skipped.append({"plan_id": plan_id, "task_id": task_id, "reason": str(exc), "status": status})
+    return {
+        "ok": True,
+        "object": "hermes.dev_verification_trigger_run",
+        "created": created,
+        "created_count": len(created),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "advisory_only": True,
+    }
+
+
 def refresh_verification_run(
     *,
     verification_store: DevVerificationStore,
@@ -680,6 +759,29 @@ def _derived_plan_for_verification(execution_store: Any, plan: Dict[str, Any], *
         return status_payload.get("plan") or {**plan, "tasks": status_payload.get("tasks") or plan.get("tasks") or []}
     except Exception:
         return plan
+
+
+def _verification_evidence_version(plan: Dict[str, Any], task: Dict[str, Any]) -> Optional[str]:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    for key in (
+        "head_sha",
+        "commit_sha",
+        "branch",
+        "ao_session_id",
+        "runtime_session_id",
+        "verification_evidence_version",
+    ):
+        value = task.get(key) or payload.get(key)
+        if str(value or "").strip():
+            return str(value).strip()
+    raw = {
+        "plan_updated_at": plan.get("updated_at"),
+        "task_updated_at": task.get("updated_at"),
+        "status": task.get("status") or plan.get("status"),
+    }
+    if any(value is not None for value in raw.values()):
+        return json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    return None
 
 
 def _busy_worktree_reason(target_task: Dict[str, Any], tasks: list[Dict[str, Any]]) -> Optional[str]:
