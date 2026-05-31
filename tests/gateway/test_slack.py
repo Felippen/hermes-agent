@@ -190,16 +190,19 @@ class TestAppMentionHandler:
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
         # Slack slash commands are registered via a single regex matcher
-        # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
-        # /model, ...) so users get native-slash parity with Discord and
-        # Telegram. Verify the regex matches the key expected slashes.
+        # covering the Slack manifest's generated native slash set. The
+        # manifest is capped by Slack, so aliases may fall back to
+        # /hermes <alias> when there are more entries than Slack permits.
         assert len(registered_commands) == 1, (
             f"expected 1 combined slash matcher, got {registered_commands!r}"
         )
         slash_matcher = registered_commands[0]
         import re as _re
+        from hermes_cli.commands import slack_native_slashes
         assert isinstance(slash_matcher, _re.Pattern)
-        for expected in ("/hermes", "/btw", "/stop", "/model", "/help"):
+        expected_slashes = {f"/{name}" for name, _desc, _hint in slack_native_slashes()}
+        assert {"/hermes", "/stop", "/model", "/help"}.issubset(expected_slashes)
+        for expected in expected_slashes:
             assert slash_matcher.match(expected), (
                 f"Slack slash regex does not match {expected}"
             )
