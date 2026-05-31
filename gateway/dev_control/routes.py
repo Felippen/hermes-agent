@@ -52,12 +52,15 @@ from gateway.dev_control.acceptance_verification import (
 )
 from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.clarifications import (
+    DEFAULT_CLARIFICATION_KIND,
     DevClarificationStore,
     answer_clarification,
+    approve_clarification_brief,
     cancel_clarification,
     complete_clarification,
     get_clarification,
     list_clarifications,
+    revise_clarification_brief,
     start_clarification,
 )
 from gateway.dev_control.deepswe_benchmarks import (
@@ -130,6 +133,22 @@ from gateway.dev_control.project_goals import (
 )
 from gateway.dev_control.project_goal_eval import reevaluate_project_goal
 from gateway.dev_control.project_scope import project_id_from_payload, resolve_project_id
+from gateway.dev_control.products import (
+    DevProductStore,
+    build_product_live_portfolio_snapshot,
+    build_product_live_snapshot,
+    build_product_action_surface,
+    build_product_backlog,
+    build_product_portfolio,
+    list_product_progression_loop,
+    normalize_flow_control_state,
+    product_flow_control,
+    seed_products_from_project_ids,
+    tick_product_progression_loop,
+    update_portfolio_flow_control,
+    update_product_flow_control,
+    upsert_product,
+)
 from gateway.dev_control.product_events import DevProductEventStore
 from gateway.dev_control.production_signals import (
     DevProductionSignalStore,
@@ -171,6 +190,7 @@ logger = logging.getLogger(__name__)
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+_PRODUCT_FLOW_CONTROL_BLOCKING_STATES = frozenset({"paused", "hold_new_work", "needs_direction", "unknown"})
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -189,6 +209,34 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _dedupe_project_ids(project_ids: Any) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in project_ids or []:
+        project_id = resolve_project_id(value)
+        if project_id in seen:
+            continue
+        seen.add(project_id)
+        deduped.append(project_id)
+    return deduped
 
 
 def _fetch_ci_status(*args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -246,6 +294,8 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_answer_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/answer"},
         "dev_complete_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/complete"},
         "dev_cancel_clarification": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/cancel"},
+        "dev_approve_clarification_brief": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/approve-brief"},
+        "dev_revise_clarification_brief": {"method": "POST", "path": "/v1/dev/clarifications/{clarification_id}/revise-brief"},
         "dev_plan_artifacts": {"method": "GET", "path": "/v1/dev/plan-artifacts"},
         "dev_create_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts"},
         "dev_revise_plan_artifact": {"method": "POST", "path": "/v1/dev/plan-artifacts/{plan_artifact_id}/revise"},
@@ -259,6 +309,18 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_project_goal_reevaluate": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/reevaluate"},
         "dev_abandon_project_goal": {"method": "POST", "path": "/v1/dev/goals/{goal_id}/abandon"},
         "dev_update_project_goal": {"method": "PATCH", "path": "/v1/dev/goals/{goal_id}"},
+        "dev_products": {"method": "GET", "path": "/v1/dev/products"},
+        "dev_create_product": {"method": "POST", "path": "/v1/dev/products"},
+        "dev_product_portfolio": {"method": "GET", "path": "/v1/dev/products/portfolio"},
+        "dev_product_portfolio_stream": {"method": "GET", "path": "/v1/dev/products/portfolio/stream"},
+        "dev_portfolio_flow_control": {"method": "POST", "path": "/v1/dev/products/portfolio/flow-control"},
+        "dev_product_actions": {"method": "GET", "path": "/v1/dev/products/actions"},
+        "dev_product_progression_loop": {"method": "GET", "path": "/v1/dev/products/progression-loop"},
+        "dev_product_progression_loop_tick": {"method": "POST", "path": "/v1/dev/products/progression-loop/tick"},
+        "dev_product_detail": {"method": "GET", "path": "/v1/dev/products/{product_id}"},
+        "dev_product_detail_stream": {"method": "GET", "path": "/v1/dev/products/{product_id}/stream"},
+        "dev_product_backlog": {"method": "GET", "path": "/v1/dev/products/{product_id}/backlog"},
+        "dev_product_flow_control": {"method": "POST", "path": "/v1/dev/products/{product_id}/flow-control"},
         "dev_execution_plan_draft_review": {"method": "GET", "path": "/v1/dev/execution-plans/{plan_id}/draft-review"},
         "dev_revise_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/revise-draft"},
         "dev_approve_execution_plan_draft": {"method": "POST", "path": "/v1/dev/execution-plans/{plan_id}/approve-draft"},
@@ -331,6 +393,8 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/answer", adapter._handle_dev_clarification_answer)
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/complete", adapter._handle_dev_clarification_complete)
     app.router.add_post("/v1/dev/clarifications/{clarification_id}/cancel", adapter._handle_dev_clarification_cancel)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/approve-brief", adapter._handle_dev_clarification_approve_brief)
+    app.router.add_post("/v1/dev/clarifications/{clarification_id}/revise-brief", adapter._handle_dev_clarification_revise_brief)
     app.router.add_get("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
     app.router.add_post("/v1/dev/plan-artifacts", adapter._handle_dev_plan_artifacts)
     app.router.add_get("/v1/dev/plan-artifacts/{plan_artifact_id}", adapter._handle_dev_plan_artifact_detail)
@@ -345,6 +409,18 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/goals/{goal_id}/reevaluate", adapter._handle_dev_project_goal_reevaluate)
     app.router.add_post("/v1/dev/goals/{goal_id}/abandon", adapter._handle_dev_project_goal_abandon)
     app.router.add_patch("/v1/dev/goals/{goal_id}", adapter._handle_dev_project_goal_update)
+    app.router.add_get("/v1/dev/products", adapter._handle_dev_products)
+    app.router.add_post("/v1/dev/products", adapter._handle_dev_products)
+    app.router.add_get("/v1/dev/products/portfolio", adapter._handle_dev_product_portfolio)
+    app.router.add_get("/v1/dev/products/portfolio/stream", adapter._handle_dev_product_portfolio_stream)
+    app.router.add_post("/v1/dev/products/portfolio/flow-control", adapter._handle_dev_portfolio_flow_control)
+    app.router.add_get("/v1/dev/products/actions", adapter._handle_dev_product_actions)
+    app.router.add_get("/v1/dev/products/progression-loop", adapter._handle_dev_product_progression_loop)
+    app.router.add_post("/v1/dev/products/progression-loop/tick", adapter._handle_dev_product_progression_loop_tick)
+    app.router.add_post("/v1/dev/products/{product_id}/flow-control", adapter._handle_dev_product_flow_control)
+    app.router.add_get("/v1/dev/products/{product_id}/stream", adapter._handle_dev_product_stream)
+    app.router.add_get("/v1/dev/products/{product_id}", adapter._handle_dev_product_detail)
+    app.router.add_get("/v1/dev/products/{product_id}/backlog", adapter._handle_dev_product_backlog)
     app.router.add_get("/v1/dev/runtimes/openhands/server", adapter._handle_dev_openhands_server_status)
     app.router.add_post("/v1/dev/runtimes/openhands/server/start", adapter._handle_dev_openhands_server_start)
     app.router.add_post("/v1/dev/runtimes/openhands/server/stop", adapter._handle_dev_openhands_server_stop)
@@ -442,9 +518,20 @@ class DevControlRouteMixin:
         reliability_store = self._ensure_dev_reliability_store()
         lab_loop_store = self._ensure_dev_lab_loop_store()
         goal_store = self._ensure_dev_project_goal_store()
+        product_store = self._ensure_dev_product_store()
         event_store = self._ensure_subagent_event_store()
         if clarification_store is None or artifact_store is None or execution_store is None or event_store is None:
             return web.json_response(_openai_error("Oryn project dashboard stores unavailable"), status=503)
+        if product_store is not None:
+            product_project_id = resolve_project_id(project_id)
+            try:
+                if product_store.get_by_project_id(product_project_id) is None:
+                    seed_products_from_project_ids(
+                        store=product_store,
+                        project_ids=[product_project_id],
+                    )
+            except Exception as exc:
+                logger.debug("Product spine pre-seed unavailable for project dashboard: %s", exc)
 
         fingerprint = self._project_dashboard_fingerprint(
             project_id,
@@ -525,10 +612,35 @@ class DevControlRouteMixin:
                         )
                     except Exception:
                         latest_draft_review = None
+            product = None
+            product_backlog = None
+            if product_store is not None:
+                product_project_id = resolve_project_id(project_id)
+                try:
+                    product = product_store.get_by_project_id(product_project_id)
+                    if product is None:
+                        seeded = seed_products_from_project_ids(
+                            store=product_store,
+                            project_ids=[product_project_id],
+                        )
+                        product = seeded[0] if seeded else None
+                    if product is not None:
+                        product_backlog = build_product_backlog(
+                            product=product,
+                            execution_store=execution_store,
+                            goal_store=goal_store,
+                            verification_store=verification_store,
+                            incident_store=incident_store,
+                            event_store=event_store,
+                        )
+                except Exception as exc:
+                    logger.debug("Product spine unavailable for project dashboard: %s", exc)
 
             return {
                 "object": "hermes.oryn.project_dashboard",
                 "project_id": project_id,
+                "product": product,
+                "product_backlog": product_backlog,
                 "clarifications": clarifications.get("data", []),
                 "plan_artifacts": artifacts.get("data", []),
                 "project_goals": (
@@ -659,6 +771,20 @@ class DevControlRouteMixin:
             logger.warning("Dev project goal store unavailable: %s", exc)
             return None
         return self._dev_project_goal_store
+
+    def _ensure_dev_product_store(self) -> Optional[DevProductStore]:
+        """Create the Dev Product store on the same state.db as execution plans."""
+        if getattr(self, "_dev_product_store", None) is not None:
+            return self._dev_product_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_product_store = DevProductStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev Product store unavailable: %s", exc)
+            return None
+        return self._dev_product_store
 
     def _invalidate_dev_dashboard_read_models(self) -> None:
         invalidate = getattr(self, "_invalidate_ao_read_models", None)
@@ -837,6 +963,7 @@ class DevControlRouteMixin:
                 project_id=request.rel_url.query.get("project_id") or None,
                 session_id=request.rel_url.query.get("session_id") or None,
                 status=request.rel_url.query.get("status") or None,
+                clarification_kind=request.rel_url.query.get("clarification_kind") or None,
                 limit=request.rel_url.query.get("limit") or 50,
             )
             return web.json_response(result)
@@ -852,6 +979,7 @@ class DevControlRouteMixin:
                 session_id=body.get("session_id"),
                 project_context=body.get("project_context"),
                 max_questions=body.get("max_questions") or 5,
+                clarification_kind=body.get("clarification_kind") or DEFAULT_CLARIFICATION_KIND,
             )
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
@@ -939,6 +1067,51 @@ class DevControlRouteMixin:
             return web.json_response({"error": {"message": str(exc)}}, status=404)
         except ValueError as exc:
             return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_approve_brief(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/approve-brief."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            result = approve_clarification_brief(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        return web.json_response(result)
+
+    async def _handle_dev_clarification_revise_brief(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/clarifications/{clarification_id}/revise-brief."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_clarification_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev clarification store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = revise_clarification_brief(
+                store=store,
+                clarification_id=request.match_info["clarification_id"],
+                feedback=body.get("feedback") or "",
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Discovery brief revision failed: {exc}"}}, status=500)
         return web.json_response(result)
 
     async def _handle_dev_plan_artifacts(self, request: "web.Request") -> "web.Response":
@@ -1075,6 +1248,16 @@ class DevControlRouteMixin:
         if artifact_store is None or execution_store is None:
             return web.json_response({"error": {"message": "Dev plan artifact store unavailable"}}, status=503)
         try:
+            artifact = get_plan_artifact(
+                store=artifact_store,
+                plan_artifact_id=request.match_info["plan_artifact_id"],
+            )
+            gate = self._blocked_product_flow_gate_for_project_ids(
+                [artifact.get("project_id")],
+                action="create_execution_plan_from_artifact",
+            )
+            if gate:
+                return self._product_flow_gate_response(gate)
             result = create_execution_plan_from_artifact(
                 artifact_store=artifact_store,
                 execution_store=execution_store,
@@ -1177,6 +1360,473 @@ class DevControlRouteMixin:
             project_id=project_id,
             include_abandoned=include_abandoned,
         )
+        return web.json_response(result)
+
+    async def _handle_dev_products(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/products — list or upsert durable Dev Products."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        if request.method == "GET":
+            project_id = request.rel_url.query.get("project_id") or None
+            if project_id:
+                product = product_store.get_by_project_id(project_id)
+                data = [product] if product else []
+            else:
+                include_archived = str(request.rel_url.query.get("include_archived") or "").lower() in {"1", "true", "yes"}
+                data = product_store.list(
+                    include_archived=include_archived,
+                    lifecycle_state=request.rel_url.query.get("lifecycle_state") or None,
+                    limit=self._bounded_query_limit(request, default=100),
+                )
+            return web.json_response({"object": "list", "data": data, "total": len(data)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            product = upsert_product(
+                store=product_store,
+                product_id=body.get("product_id"),
+                project_id=project_id_from_payload(body),
+                name=body.get("name"),
+                lifecycle_state=body.get("lifecycle_state"),
+                primary_repo=body.get("primary_repo"),
+                repository_bindings=body.get("repository_bindings") or body.get("repos") or [],
+                payload=body.get("payload") or {},
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response(product)
+
+    async def _handle_dev_product_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/products/{product_id} — fetch one durable Dev Product."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product = self._product_from_request(request)
+        if product is None:
+            return web.json_response(_openai_error("Dev Product not found"), status=404)
+        if str(request.rel_url.query.get("include_backlog") or "").lower() in {"1", "true", "yes"}:
+            return web.json_response({**product, "backlog": self._product_backlog_payload(product)})
+        return web.json_response(product)
+
+    async def _handle_dev_product_backlog(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/products/{product_id}/backlog — derived Product backlog."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product = self._product_from_request(request)
+        if product is None:
+            return web.json_response(_openai_error("Dev Product not found"), status=404)
+        return web.json_response(self._product_backlog_payload(product))
+
+    async def _handle_dev_product_stream(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/dev/products/{product_id}/stream — SSE selected Product snapshots."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        if self._product_from_request(request) is None:
+            return web.json_response(_openai_error("Dev Product not found"), status=404)
+
+        once = _coerce_request_bool(request.rel_url.query.get("once"), default=False)
+        max_events = 1 if once else _bounded_int(request.rel_url.query.get("max_events"), default=0, minimum=0, maximum=100)
+        snapshot_interval = _bounded_float(
+            request.rel_url.query.get("snapshot_interval"),
+            default=5.0,
+            minimum=0.01,
+            maximum=60.0,
+        )
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+        sequence = 0
+        try:
+            while True:
+                sequence += 1
+                product = self._product_from_request(request)
+                if product is None:
+                    raise KeyError("Dev Product not found")
+                snapshot = build_product_live_snapshot(
+                    store=product_store,
+                    product=product,
+                    execution_store=self._ensure_dev_execution_store(),
+                    clarification_store=self._ensure_dev_clarification_store(),
+                    plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+                    goal_store=self._ensure_dev_project_goal_store(),
+                    verification_store=self._ensure_dev_verification_store(),
+                    incident_store=self._ensure_dev_incident_store(),
+                    event_store=self._ensure_subagent_event_store(),
+                )
+                snapshot["sequence"] = sequence
+                payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+                await response.write(
+                    f"event: dev.product.snapshot\ndata: {payload}\n\n".encode("utf-8")
+                )
+                if max_events and sequence >= max_events:
+                    break
+                await response.write(b": keepalive\n\n")
+                await asyncio.sleep(snapshot_interval)
+        except (asyncio.CancelledError, ConnectionResetError):
+            raise
+        except Exception as exc:
+            logger.exception("Product detail stream failed")
+            error_payload = json.dumps({"error": {"message": str(exc)}}, ensure_ascii=False, separators=(",", ":"))
+            try:
+                await response.write(f"event: error\ndata: {error_payload}\n\n".encode("utf-8"))
+            except Exception:
+                pass
+        finally:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+    async def _handle_dev_portfolio_flow_control(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/products/portfolio/flow-control — record bounded portfolio flow intent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            flow_control = update_portfolio_flow_control(
+                store=product_store,
+                state=body.get("state") or body.get("flow_control_state") or body.get("flow_state"),
+                autonomy_level=body.get("autonomy_level") or body.get("autonomyLevel"),
+                reason=body.get("reason"),
+                requested_by=body.get("requested_by") or body.get("requestedBy"),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            param = "autonomy_level" if "autonomy" in message else "state"
+            return web.json_response(_openai_error(message, param=param), status=400)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response({
+            "object": "hermes.dev_portfolio_flow_control_update",
+            "flow_control": flow_control,
+        })
+
+    async def _handle_dev_product_flow_control(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/products/{product_id}/flow-control — record bounded Product flow intent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        product = self._product_from_request(request)
+        if product is None:
+            return web.json_response(_openai_error("Dev Product not found"), status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            updated = update_product_flow_control(
+                store=product_store,
+                product_id=product["product_id"],
+                state=body.get("state") or body.get("flow_control_state") or body.get("flow_state"),
+                autonomy_level=body.get("autonomy_level") or body.get("autonomyLevel"),
+                reason=body.get("reason"),
+                requested_by=body.get("requested_by") or body.get("requestedBy"),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            param = "autonomy_level" if "autonomy" in message else "state"
+            return web.json_response(_openai_error(message, param=param), status=400)
+        except KeyError:
+            return web.json_response(_openai_error("Dev Product not found"), status=404)
+        self._invalidate_dev_dashboard_read_models()
+        return web.json_response({
+            "object": "hermes.dev_product_flow_control_update",
+            "product": updated,
+            "flow_control": updated.get("flow_control"),
+        })
+
+    def _product_from_request(self, request: "web.Request") -> Optional[Dict[str, Any]]:
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return None
+        product_id = str(request.match_info.get("product_id") or "").strip()
+        if product_id.startswith("project:"):
+            return product_store.get_by_project_id(product_id.removeprefix("project:"))
+        return product_store.get(product_id)
+
+    def _product_backlog_payload(self, product: Dict[str, Any]) -> Dict[str, Any]:
+        return build_product_backlog(
+            product=product,
+            execution_store=self._ensure_dev_execution_store(),
+            goal_store=self._ensure_dev_project_goal_store(),
+            verification_store=self._ensure_dev_verification_store(),
+            incident_store=self._ensure_dev_incident_store(),
+            event_store=self._ensure_subagent_event_store(),
+        )
+
+    def _project_ids_from_execution_plan_payload(self, payload: Dict[str, Any]) -> list[str]:
+        project_ids: list[str] = []
+        context = payload.get("project_context") if isinstance(payload.get("project_context"), dict) else {}
+        explicit_project_id = payload.get("project_id") or context.get("project_id")
+        if explicit_project_id:
+            project_ids.append(resolve_project_id(explicit_project_id))
+        project_ids.extend(self._project_ids_from_execution_plan_tasks(payload.get("tasks") or []))
+        return _dedupe_project_ids(project_ids)
+
+    def _project_ids_from_execution_plan_tasks(
+        self,
+        tasks: Any,
+        *,
+        task_ids: Any = None,
+    ) -> list[str]:
+        if not isinstance(tasks, list):
+            return []
+        wanted = {str(task_id) for task_id in (task_ids or []) if str(task_id).strip()}
+        project_ids: list[str] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            task_id = str(task.get("task_id") or "").strip()
+            if wanted and task_id not in wanted:
+                continue
+            project_ids.append(resolve_project_id(task.get("project_id")))
+        return _dedupe_project_ids(project_ids)
+
+    def _blocked_product_flow_gate_for_project_ids(
+        self,
+        project_ids: list[str],
+        *,
+        action: str,
+    ) -> Optional[Dict[str, Any]]:
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return None
+        portfolio_flow_control = product_store.get_portfolio_flow_control()
+        portfolio_flow_state = normalize_flow_control_state(portfolio_flow_control.get("state"), default="normal")
+        if portfolio_flow_state in _PRODUCT_FLOW_CONTROL_BLOCKING_STATES:
+            reason = portfolio_flow_control.get("reason") or f"Portfolio flow-control state is {portfolio_flow_state}."
+            return {
+                "object": "hermes.dev_portfolio_flow_control_gate",
+                "blocked": True,
+                "action": action,
+                "scope": "portfolio",
+                "state": portfolio_flow_state,
+                "reason": reason,
+                "flow_control": portfolio_flow_control,
+                "message": (
+                    f"Portfolio flow-control is {portfolio_flow_state}; "
+                    f"new Dev work is gated until flow control returns to normal."
+                ),
+            }
+        for project_id in _dedupe_project_ids(project_ids):
+            product = product_store.get_by_project_id(project_id)
+            if not product:
+                continue
+            flow_control = product_flow_control(product)
+            flow_state = normalize_flow_control_state(flow_control.get("state"), default="normal")
+            if flow_state not in _PRODUCT_FLOW_CONTROL_BLOCKING_STATES:
+                continue
+            reason = flow_control.get("reason") or f"Product flow-control state is {flow_state}."
+            return {
+                "object": "hermes.dev_product_flow_control_gate",
+                "blocked": True,
+                "action": action,
+                "product_id": product.get("product_id"),
+                "project_id": product.get("project_id"),
+                "state": flow_state,
+                "reason": reason,
+                "flow_control": flow_control,
+                "message": (
+                    f"Product {product.get('name') or product.get('product_id')} is {flow_state}; "
+                    f"new Dev work is gated until flow control returns to normal."
+                ),
+            }
+        return None
+
+    def _product_flow_gate_response(self, gate: Dict[str, Any]) -> "web.Response":
+        payload = _openai_error(
+            str(gate.get("message") or "Flow-control blocks new Dev work."),
+            code="product_flow_control_blocked",
+        )
+        payload["flow_control_gate"] = gate
+        return web.json_response(payload, status=409)
+
+    async def _handle_dev_product_portfolio(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/products/portfolio — read-only multi-Product overview."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        portfolio = build_product_portfolio(
+            store=product_store,
+            execution_store=self._ensure_dev_execution_store(),
+            goal_store=self._ensure_dev_project_goal_store(),
+            verification_store=self._ensure_dev_verification_store(),
+            incident_store=self._ensure_dev_incident_store(),
+            event_store=self._ensure_subagent_event_store(),
+            clarification_store=self._ensure_dev_clarification_store(),
+            plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+            product_limit=self._bounded_query_limit(request, default=100),
+        )
+        return web.json_response(portfolio)
+
+    async def _handle_dev_product_portfolio_stream(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/dev/products/portfolio/stream — SSE Product portfolio snapshots."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+
+        once = _coerce_request_bool(request.rel_url.query.get("once"), default=False)
+        max_events = 1 if once else _bounded_int(request.rel_url.query.get("max_events"), default=0, minimum=0, maximum=100)
+        snapshot_interval = _bounded_float(
+            request.rel_url.query.get("snapshot_interval"),
+            default=5.0,
+            minimum=0.01,
+            maximum=60.0,
+        )
+        product_limit = self._bounded_query_limit(request, default=100)
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+        sequence = 0
+        try:
+            while True:
+                sequence += 1
+                snapshot = build_product_live_portfolio_snapshot(
+                    store=product_store,
+                    execution_store=self._ensure_dev_execution_store(),
+                    clarification_store=self._ensure_dev_clarification_store(),
+                    plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+                    goal_store=self._ensure_dev_project_goal_store(),
+                    verification_store=self._ensure_dev_verification_store(),
+                    incident_store=self._ensure_dev_incident_store(),
+                    event_store=self._ensure_subagent_event_store(),
+                    product_limit=product_limit,
+                )
+                snapshot["sequence"] = sequence
+                payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+                await response.write(
+                    f"event: dev.product.portfolio.snapshot\ndata: {payload}\n\n".encode("utf-8")
+                )
+                if max_events and sequence >= max_events:
+                    break
+                await response.write(b": keepalive\n\n")
+                await asyncio.sleep(snapshot_interval)
+        except (asyncio.CancelledError, ConnectionResetError):
+            raise
+        except Exception as exc:
+            logger.exception("Product portfolio stream failed")
+            error_payload = json.dumps({"error": {"message": str(exc)}}, ensure_ascii=False, separators=(",", ":"))
+            try:
+                await response.write(f"event: error\ndata: {error_payload}\n\n".encode("utf-8"))
+            except Exception:
+                pass
+        finally:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+    async def _handle_dev_product_actions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/products/actions — read-only Product action surface."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        actions = build_product_action_surface(
+            store=product_store,
+            execution_store=self._ensure_dev_execution_store(),
+            clarification_store=self._ensure_dev_clarification_store(),
+            plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+            goal_store=self._ensure_dev_project_goal_store(),
+            verification_store=self._ensure_dev_verification_store(),
+            incident_store=self._ensure_dev_incident_store(),
+            event_store=self._ensure_subagent_event_store(),
+            product_id=request.rel_url.query.get("product_id") or None,
+            product_limit=self._bounded_query_limit(request, default=100),
+        )
+        return web.json_response(actions)
+
+    async def _handle_dev_product_progression_loop(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/products/progression-loop — latest advisory Product loop state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        return web.json_response(list_product_progression_loop(
+            store=product_store,
+            product_id=request.rel_url.query.get("product_id") or None,
+            limit=self._bounded_query_limit(request, default=100),
+            latest_only=str(request.rel_url.query.get("history") or "").lower() not in {"1", "true", "yes"},
+        ))
+
+    async def _handle_dev_product_progression_loop_tick(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/products/progression-loop/tick — record bounded advisory Product loop iterations."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        product_store = self._ensure_dev_product_store()
+        if product_store is None:
+            return web.json_response(_openai_error("Dev Product store unavailable"), status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            from tools.ao_bridge import AOBridge
+
+            bridge = AOBridge()
+        except Exception:
+            bridge = None
+        try:
+            result = tick_product_progression_loop(
+                store=product_store,
+                execution_store=self._ensure_dev_execution_store(),
+                clarification_store=self._ensure_dev_clarification_store(),
+                plan_artifact_store=self._ensure_dev_plan_artifact_store(),
+                goal_store=self._ensure_dev_project_goal_store(),
+                verification_store=self._ensure_dev_verification_store(),
+                incident_store=self._ensure_dev_incident_store(),
+                event_store=self._ensure_subagent_event_store(),
+                bridge=bridge,
+                product_id=body.get("product_id") or request.rel_url.query.get("product_id") or None,
+                product_limit=body.get("limit") or request.rel_url.query.get("limit") or 25,
+            )
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
         return web.json_response(result)
 
     async def _handle_dev_project_goal_reevaluate(self, request: "web.Request") -> "web.Response":
@@ -1823,6 +2473,12 @@ class DevControlRouteMixin:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        gate = self._blocked_product_flow_gate_for_project_ids(
+            self._project_ids_from_execution_plan_payload(body),
+            action="create_execution_plan",
+        )
+        if gate:
+            return self._product_flow_gate_response(gate)
         try:
             plan = store.create_plan(
                 title=body.get("title") or "Dev execution plan",
@@ -2329,6 +2985,14 @@ class DevControlRouteMixin:
         except Exception:
             body = {}
         task_ids = body.get("task_ids") if isinstance(body, dict) else None
+        plan = store.get_plan(plan_id)
+        if plan:
+            gate = self._blocked_product_flow_gate_for_project_ids(
+                self._project_ids_from_execution_plan_tasks(plan.get("tasks") or [], task_ids=task_ids),
+                action="launch_execution_plan",
+            )
+            if gate:
+                return self._product_flow_gate_response(gate)
         try:
             result = launch_execution_plan(
                 store=store,
@@ -3059,6 +3723,7 @@ class DevControlRouteMixin:
             scm_store=self._ensure_dev_scm_store(),
             incident_store=self._ensure_dev_incident_store(),
             product_event_store=self._ensure_dev_product_event_store(),
+            product_store=self._ensure_dev_product_store(),
             event_store=self._ensure_subagent_event_store(),
             project_id=body.get("project_id"),
             limit=int(body.get("limit") or 200),

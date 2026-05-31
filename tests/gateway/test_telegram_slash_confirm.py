@@ -46,6 +46,10 @@ def _make_adapter():
     return adapter
 
 
+def _assert_markdown_v2(parse_mode):
+    assert str(parse_mode) == "MarkdownV2" or "MARKDOWN_V2" in repr(parse_mode)
+
+
 class TestSendSlashConfirm:
 
     @pytest.mark.asyncio
@@ -71,7 +75,7 @@ class TestSendSlashConfirm:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        _assert_markdown_v2(sent["parse_mode"])
         # Underscores and dots must be escaped by format_message
         assert "script\\_name" in sent["text"]
         assert "\\." in sent["text"]

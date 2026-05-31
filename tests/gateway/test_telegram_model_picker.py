@@ -42,6 +42,10 @@ def _make_adapter():
     return adapter
 
 
+def _assert_markdown_v2(parse_mode):
+    assert str(parse_mode) == "MarkdownV2" or "MARKDOWN_V2" in repr(parse_mode)
+
+
 class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
@@ -67,7 +71,7 @@ class TestTelegramModelPicker:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        _assert_markdown_v2(sent["parse_mode"])
         assert "provider\\_one" in sent["text"]
         assert "`model_1`" in sent["text"]
 
@@ -98,7 +102,7 @@ class TestTelegramModelPicker:
         await adapter._handle_model_picker_callback(query, "mb", "12345")
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        _assert_markdown_v2(edit_kwargs["parse_mode"])
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
 
@@ -139,7 +143,7 @@ class TestTelegramModelPicker:
         # regression we're guarding).
         query.edit_message_text.assert_awaited()
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        _assert_markdown_v2(edit_kwargs["parse_mode"])
         # The dynamic result text was routed through format_message
         # (backtick code blocks survive escaping).
         assert "`gpt-5`" in edit_kwargs["text"]

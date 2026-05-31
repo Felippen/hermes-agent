@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from gateway.dev_control.project_scope import resolve_project_id
 from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
 
 
@@ -264,11 +265,15 @@ def normalize_outcome(outcome: Dict[str, Any]) -> Dict[str, Any]:
     category = str(outcome.get("category") or f"{profile_id}/{risk_level}").strip()
     completed_at = _optional_float(outcome.get("completed_at")) or _optional_float(outcome.get("updated_at")) or now
     merged_at = _optional_float(outcome.get("merged_at"))
+    source_refs = outcome.get("source_refs") if isinstance(outcome.get("source_refs"), dict) else {}
     normalized = {
         "object": "hermes.dev_reliability_outcome",
         "outcome_id": str(outcome.get("outcome_id") or f"devrel-out-{uuid.uuid4().hex[:10]}"),
         "plan_id": str(outcome.get("plan_id") or "").strip(),
         "task_id": str(outcome.get("task_id") or "").strip(),
+        "project_id": _optional_text(outcome.get("project_id") or source_refs.get("project_id")),
+        "product_id": _optional_text(outcome.get("product_id") or source_refs.get("product_id")),
+        "product_name": _optional_text(outcome.get("product_name") or source_refs.get("product_name")),
         "category": category,
         "profile_id": profile_id,
         "risk_level": risk_level,
@@ -281,7 +286,7 @@ def normalize_outcome(outcome: Dict[str, Any]) -> Dict[str, Any]:
         "rework_count": max(0, int(outcome.get("rework_count") or 0)),
         "escaped": bool(outcome.get("escaped")),
         "escape_refs": outcome.get("escape_refs") or [],
-        "source_refs": outcome.get("source_refs") or {},
+        "source_refs": source_refs,
         "created_at": float(outcome.get("created_at") or now),
         "updated_at": float(outcome.get("updated_at") or now),
         "completed_at": completed_at,
@@ -303,16 +308,27 @@ def compose_task_outcome(
     readiness: Optional[Dict[str, Any]] = None,
     incidents: Optional[Iterable[Dict[str, Any]]] = None,
     product_events: Optional[Iterable[Dict[str, Any]]] = None,
+    product: Optional[Dict[str, Any]] = None,
     config: Optional[ReliabilityConfig] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     config = config or reliability_config_from_env()
     now_value = float(now or time.time())
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    project_id = resolve_project_id(
+        task.get("project_id"),
+        payload.get("project_id"),
+        (payload.get("project_context") or {}).get("project_id") if isinstance(payload.get("project_context"), dict) else None,
+        plan.get("project_id"),
+    )
     source_refs = {
         "plan_id": plan.get("plan_id"),
         "task_id": task.get("task_id"),
+        "project_id": project_id,
     }
+    if product:
+        source_refs["product_id"] = product.get("product_id")
+        source_refs["product_name"] = product.get("name")
     profile_id = str(task.get("profile_id") or payload.get("profile_id") or "unknown").strip() or "unknown"
     risk_level = normalize_risk_level(task.get("risk_level") or payload.get("risk_level") or payload.get("risk"))
     terminal_status = str(task.get("status") or plan.get("status") or "").strip().lower()
@@ -341,6 +357,9 @@ def compose_task_outcome(
     outcome = {
         "plan_id": plan.get("plan_id"),
         "task_id": task.get("task_id"),
+        "project_id": project_id,
+        "product_id": (product or {}).get("product_id"),
+        "product_name": (product or {}).get("name"),
         "category": f"{profile_id}/{risk_level}",
         "profile_id": profile_id,
         "risk_level": risk_level,
@@ -439,6 +458,14 @@ def scorecard(
         )
         category_rows.append(row)
     category_rows.sort(key=lambda item: (TIER_RANK.get(item["tier"], 0), item["success_rate"] or 0.0, -item["escape_rate"]))
+    product_rows = product_scorecards(
+        normalized,
+        config=config,
+        now=now_value,
+        current_start=current_start,
+        previous_start=previous_start,
+        window={"start": current_start, "end": now_value, "days": config.window_days},
+    )
     return {
         "ok": True,
         "object": "hermes.dev_reliability_scorecard",
@@ -452,16 +479,93 @@ def scorecard(
             "trusted_min_window_days": config.trusted_min_window_days,
         },
         "categories": category_rows,
+        "products": product_rows,
         "weakest": weakest_categories(category_rows, limit=5),
         "summary": {
             "category_count": len(category_rows),
+            "product_count": len(product_rows),
             "sample_count": sum(item["sample_count"] for item in category_rows),
+            "escape_count": sum(item["escape_count"] for item in category_rows),
             "trusted_count": sum(1 for item in category_rows if item["tier"] == "trusted"),
             "observed_count": sum(1 for item in category_rows if item["tier"] == "observed"),
             "unproven_count": sum(1 for item in category_rows if item["tier"] == "unproven"),
         },
         "advisory_only": True,
     }
+
+
+def product_scorecards(
+    outcomes: list[Dict[str, Any]],
+    *,
+    config: ReliabilityConfig,
+    now: float,
+    current_start: float,
+    previous_start: float,
+    window: Dict[str, Any],
+) -> list[Dict[str, Any]]:
+    current = [item for item in outcomes if current_start <= _outcome_time(item) <= now]
+    previous = [item for item in outcomes if previous_start <= _outcome_time(item) < current_start]
+    grouped: dict[str, list[Dict[str, Any]]] = {}
+    previous_grouped: dict[str, list[Dict[str, Any]]] = {}
+    for item in current:
+        grouped.setdefault(_product_group_key(item), []).append(item)
+    for item in previous:
+        previous_grouped.setdefault(_product_group_key(item), []).append(item)
+
+    rows: list[Dict[str, Any]] = []
+    for key, items in grouped.items():
+        prev_items = previous_grouped.get(key, [])
+        sample_count = len(items)
+        success_count = sum(1 for item in items if outcome_success(item))
+        escape_count = sum(1 for item in items if item.get("escaped"))
+        rework_count = sum(1 for item in items if int(item.get("rework_count") or 0) > 0)
+        success_rate = _rate(success_count, sample_count)
+        previous_success_rate = _rate(sum(1 for item in prev_items if outcome_success(item)), len(prev_items))
+        product_categories: list[Dict[str, Any]] = []
+        for category in sorted({item["category"] for item in items}):
+            category_items = [item for item in items if item["category"] == category]
+            previous_category_items = [item for item in prev_items if item["category"] == category]
+            product_categories.append(category_scorecard(
+                category=category,
+                outcomes=category_items,
+                previous_outcomes=previous_category_items,
+                config=config,
+                window=window,
+            ))
+        weakest = weakest_categories(product_categories, limit=1)
+        exemplar = items[0] if items else {}
+        row = {
+            "object": "hermes.dev_product_reliability",
+            "product_id": exemplar.get("product_id") or key,
+            "project_id": exemplar.get("project_id"),
+            "name": exemplar.get("product_name") or exemplar.get("project_id") or key,
+            "sample_count": sample_count,
+            "success_count": success_count,
+            "failure_count": max(sample_count - success_count, 0),
+            "success_rate": success_rate,
+            "rework_rate": _rate(rework_count, sample_count),
+            "escape_rate": _rate(escape_count, sample_count),
+            "escape_count": escape_count,
+            "trend": _trend(success_rate, previous_success_rate),
+            "previous_success_rate": previous_success_rate,
+            "tier": "unproven",
+            "tier_reasons": [],
+            "weakest_category": weakest[0] if weakest else None,
+            "categories": product_categories,
+            "window": window,
+            "advisory_only": True,
+        }
+        tier, reasons = classify_trust_tier(row, config=config)
+        row["tier"] = tier
+        row["tier_reasons"] = reasons
+        rows.append(row)
+    rows.sort(key=lambda item: (
+        TIER_RANK.get(str(item.get("tier") or "unproven"), 0),
+        float(item.get("success_rate") or 0.0),
+        -float(item.get("escape_rate") or 0.0),
+        str(item.get("name") or item.get("product_id") or ""),
+    ))
+    return rows
 
 
 def category_scorecard(
@@ -602,6 +706,7 @@ def recompute_reliability_outcomes(
     scm_store: Any = None,
     incident_store: Any = None,
     product_event_store: Any = None,
+    product_store: Any = None,
     event_store: Any = None,
     project_id: Optional[str] = None,
     limit: int = 200,
@@ -615,6 +720,7 @@ def recompute_reliability_outcomes(
     outcomes: list[Dict[str, Any]] = []
     skipped: list[Dict[str, Any]] = []
     warnings: list[str] = []
+    product_by_project: dict[str, Optional[Dict[str, Any]]] = {}
     seen_keys: set[tuple[str, str]] = set()
     for plan in plans:
         for task in plan.get("tasks") or []:
@@ -633,6 +739,14 @@ def recompute_reliability_outcomes(
             pr_state = _latest_pr_state(scm_store, plan_id=plan_id, task_id=task_id)
             code_review = _latest_code_review_for_state(scm_store, pr_state=pr_state, plan_id=plan_id, task_id=task_id)
             readiness = _latest_readiness(scm_store, plan_id=plan_id, task_id=task_id)
+            task_project_id = resolve_project_id(task.get("project_id"), plan.get("project_id"))
+            if task_project_id not in product_by_project:
+                try:
+                    product_by_project[task_project_id] = (
+                        product_store.get_by_project_id(task_project_id) if product_store else None
+                    )
+                except Exception:
+                    product_by_project[task_project_id] = None
             try:
                 outcomes.append(reliability_store.upsert_outcome(compose_task_outcome(
                     plan=plan,
@@ -643,6 +757,7 @@ def recompute_reliability_outcomes(
                     readiness=readiness,
                     incidents=incidents,
                     product_events=product_events,
+                    product=product_by_project.get(task_project_id),
                     config=config,
                     now=now,
                 )))
@@ -1034,6 +1149,14 @@ def _matches_sha(expected: str, candidate: Any) -> bool:
 
 def _outcome_time(outcome: Dict[str, Any]) -> float:
     return float(outcome.get("completed_at") or outcome.get("updated_at") or outcome.get("created_at") or 0)
+
+
+def _product_group_key(outcome: Dict[str, Any]) -> str:
+    return (
+        str(outcome.get("product_id") or "").strip()
+        or str(outcome.get("project_id") or "").strip()
+        or "unknown"
+    )
 
 
 def _rate(numerator: int, denominator: int) -> Optional[float]:

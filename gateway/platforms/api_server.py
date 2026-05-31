@@ -839,6 +839,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_clarification_store: Optional[Any] = None
         self._dev_plan_artifact_store: Optional[Any] = None
         self._dev_project_goal_store: Optional[Any] = None
+        self._dev_product_store: Optional[Any] = None
         self._dev_verification_store: Optional[Any] = None
         self._dev_signal_store: Optional[Any] = None
         self._dev_product_event_store: Optional[Any] = None
@@ -1232,6 +1233,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             (self._dev_reliability_store, "dev_reliability_outcomes", "updated_at"),
             (self._dev_reliability_store, "dev_reliability_improvements", "measured_at"),
             (self._dev_project_goal_store, "dev_project_goals", "updated_at"),
+            (self._dev_product_store, "dev_products", "updated_at"),
             (self._subagent_event_store, "subagent_events", "event_id"),
         ):
             if store is None:
@@ -1264,6 +1266,18 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
     # Agent creation helper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reasoning_config_from_effort(raw: Any) -> Optional[Dict[str, Any]]:
+        """Parse a reasoning_effort string into an OpenRouter-style config dict."""
+        if raw is None:
+            return None
+        from hermes_constants import parse_reasoning_effort
+
+        effort = str(raw).strip()
+        if not effort:
+            return None
+        return parse_reasoning_effort(effort)
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -1276,6 +1290,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         context_usage_callback=None,
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1302,6 +1317,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             reasoning_override = self._session_reasoning_overrides.get(session_id)
             if reasoning_override is not None:
                 reasoning_config = reasoning_override
+        if reasoning_config_override is not None:
+            reasoning_config = reasoning_config_override
         model = self._request_model_override(model_override) or _resolve_gateway_model()
         model, runtime_kwargs = self._apply_session_model_override(session_id, model, runtime_kwargs)
 
@@ -1677,8 +1694,11 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
-            if parsed_reasoning is not None:
-                self._session_reasoning_overrides[session_id] = parsed_reasoning
+            if reasoning_effort is not None:
+                if parsed_reasoning is not None:
+                    self._session_reasoning_overrides[session_id] = parsed_reasoning
+                else:
+                    self._session_reasoning_overrides.pop(session_id, None)
             return web.json_response({
                 "object": "hermes.session.model",
                 "session_id": session_id,
@@ -3843,6 +3863,18 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 status=400,
             )
 
+        request_reasoning_config = None
+        if "reasoning_effort" in body:
+            request_reasoning_config = self._reasoning_config_from_effort(body.get("reasoning_effort"))
+            if body.get("reasoning_effort") is not None and str(body.get("reasoning_effort")).strip():
+                if request_reasoning_config is None:
+                    return web.json_response(
+                        _openai_error(
+                            "Invalid reasoning_effort. Valid: none, minimal, low, medium, high, xhigh."
+                        ),
+                        status=400,
+                    )
+
         project_overlay = build_chat_project_context_overlay(body)
         if project_overlay:
             system_prompt = (
@@ -4100,6 +4132,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 model_override=model_name,
                 approval_notify_callback=_on_approval_request,
                 run_id=completion_id,
+                reasoning_config_override=request_reasoning_config,
             ))
             self._active_run_tasks[completion_id] = agent_task
 
@@ -4126,6 +4159,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 model_override=model_name,
+                reasoning_config_override=request_reasoning_config,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5893,6 +5927,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         model_override: Optional[str] = None,
         approval_notify_callback=None,
         run_id: Optional[str] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5923,6 +5958,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 context_usage_callback=context_usage_callback,
                 gateway_session_key=gateway_session_key,
                 model_override=model_override,
+                reasoning_config_override=reasoning_config_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
