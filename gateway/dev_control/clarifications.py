@@ -70,6 +70,7 @@ DISCOVERY_MIN_ANSWERS = 4
 DISCOVERY_MAX_QUESTIONS = 12
 DISCOVERY_KICKOFF_QUESTION_ID = "disc_kickoff"
 DISCOVERY_MIN_NARRATIVE_CHARS = 12
+DISCOVERY_BRIEF_CONTEXT_MAX_CHARS = 8000
 FEATURE_SCOPE_BY_OPTION = {
     "a": "narrow_pilot",
     "b": "complete_workflow",
@@ -384,7 +385,7 @@ def start_clarification(
         elif kind == "project_discovery":
             brief = PROJECT_DISCOVERY_VISION_SEED
         elif kind == "feature_onboarding":
-            brief = str((normalized_project_context or {}).get("vision") or "").strip() or FEATURE_ONBOARDING_VISION_SEED
+            brief = _project_context_vision_hint(normalized_project_context).strip() or FEATURE_ONBOARDING_VISION_SEED
         else:
             raise ValueError("vision_brief is required")
     question_count = max(MIN_TARGET_QUESTIONS, min(int(max_questions or DEFAULT_MAX_QUESTIONS), MAX_QUESTION_LIMIT))
@@ -1101,7 +1102,7 @@ def _feature_onboarding_questions(
 ) -> list[Dict[str, Any]]:
     repositories = (project_context or {}).get("repositories") or []
     project_name = str((project_context or {}).get("project_name") or "").strip() or "this project"
-    vision_hint = str((project_context or {}).get("vision") or vision_brief or "").strip()
+    vision_hint = _project_context_vision_hint(project_context, vision_brief=vision_brief)
     questions = [
         {
             "question_id": "feat_outcome",
@@ -2017,12 +2018,30 @@ def _normalize_project_context(
         for item in (value.get("work_items") or [])
         if str(item).strip()
     ]
+    discovery_brief = str(value.get("discovery_brief_markdown") or "").strip() or None
+    if discovery_brief and len(discovery_brief) > DISCOVERY_BRIEF_CONTEXT_MAX_CHARS:
+        discovery_brief = discovery_brief[:DISCOVERY_BRIEF_CONTEXT_MAX_CHARS].rstrip() + "…"
     context = {
         "project_id": str(value.get("project_id") or project_id or "").strip() or None,
         "project_name": str(value.get("project_name") or "").strip() or None,
         "vision": str(value.get("vision") or "").strip() or None,
+        "discovery_brief_markdown": discovery_brief,
         "coordinator_profile": str(value.get("coordinator_profile") or "").strip() or None,
         "repositories": repositories[:10],
         "work_items": work_items[:20],
     }
-    return context if any(context.get(key) for key in ("project_id", "project_name", "vision", "coordinator_profile")) or repositories or work_items else None
+    return context if any(context.get(key) for key in ("project_id", "project_name", "vision", "discovery_brief_markdown", "coordinator_profile")) or repositories or work_items else None
+
+
+def _project_context_vision_hint(
+    project_context: Optional[Dict[str, Any]],
+    *,
+    vision_brief: str = "",
+) -> str:
+    vision = str((project_context or {}).get("vision") or "").strip()
+    if vision:
+        return vision
+    discovery_brief = str((project_context or {}).get("discovery_brief_markdown") or "").strip()
+    if discovery_brief:
+        return discovery_brief
+    return str(vision_brief or "").strip()

@@ -32,11 +32,12 @@ def _normalize_project_context(value: Any) -> Optional[dict[str, Any]]:
         "project_id": str(value.get("project_id") or "").strip() or None,
         "project_name": str(value.get("project_name") or "").strip() or None,
         "vision": str(value.get("vision") or "").strip() or None,
+        "discovery_brief_markdown": str(value.get("discovery_brief_markdown") or "").strip() or None,
         "coordinator_profile": str(value.get("coordinator_profile") or "").strip() or None,
         "repositories": repositories[:10],
         "work_items": work_items[:20],
     }
-    if not any(context.get(key) for key in ("project_id", "project_name", "vision", "coordinator_profile")) and not repositories and not work_items:
+    if not any(context.get(key) for key in ("project_id", "project_name", "vision", "discovery_brief_markdown", "coordinator_profile")) and not repositories and not work_items:
         return None
     return context
 
@@ -67,6 +68,9 @@ def build_chat_project_context_overlay(body: Optional[dict[str, Any]]) -> Option
             sections.append(f"- Project name: {project_context['project_name']}")
         if project_context.get("vision"):
             sections.append(f"- Vision: {project_context['vision']}")
+        if project_context.get("discovery_brief_markdown"):
+            sections.append("- Discovery brief:")
+            sections.append(project_context["discovery_brief_markdown"])
         if project_context.get("coordinator_profile"):
             sections.append(f"- Coordinator profile: {project_context['coordinator_profile']}")
         if project_context.get("repositories"):
