@@ -734,7 +734,8 @@ class TestMatrixRequirements:
         from gateway.platforms.matrix import check_matrix_requirements
         try:
             import mautrix  # noqa: F401
-            assert check_matrix_requirements() is True
+            with patch("tools.lazy_deps.feature_missing", return_value=()):
+                assert check_matrix_requirements() is True
         except ImportError:
             with patch("tools.lazy_deps.ensure", side_effect=ImportError("mautrix unavailable")):
                 assert check_matrix_requirements() is False
@@ -774,7 +775,8 @@ class TestMatrixRequirements:
             # Still needs mautrix itself to be importable
             try:
                 import mautrix  # noqa: F401
-                assert matrix_mod.check_matrix_requirements() is True
+                with patch("tools.lazy_deps.feature_missing", return_value=()):
+                    assert matrix_mod.check_matrix_requirements() is True
             except ImportError:
                 with patch("tools.lazy_deps.ensure", side_effect=ImportError("mautrix unavailable")):
                     assert matrix_mod.check_matrix_requirements() is False
@@ -789,7 +791,8 @@ class TestMatrixRequirements:
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
             try:
                 import mautrix  # noqa: F401
-                assert matrix_mod.check_matrix_requirements() is True
+                with patch("tools.lazy_deps.feature_missing", return_value=()):
+                    assert matrix_mod.check_matrix_requirements() is True
             except ImportError:
                 with patch("tools.lazy_deps.ensure", side_effect=ImportError("mautrix unavailable")):
                     assert matrix_mod.check_matrix_requirements() is False

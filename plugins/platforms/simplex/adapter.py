@@ -482,17 +482,22 @@ class SimplexAdapter(BasePlatformAdapter):
 
     async def _send_ws(self, payload: dict) -> None:
         """Send a JSON payload over the WebSocket, queuing if not yet connected."""
-        import websockets as _wsexc
+        try:
+            import websockets as _wsexc
+            connection_closed = (_wsexc.ConnectionClosed,)
+        except ImportError:
+            connection_closed = ()
         ws = self._ws
         if not ws:
             logger.debug("SimpleX: WS not connected, dropping outbound command")
             return
         try:
             await ws.send(json.dumps(payload))
-        except _wsexc.ConnectionClosed:
-            logger.warning("SimpleX: WS closed while sending")
         except Exception as e:
-            logger.warning("SimpleX: WS send error: %s", e)
+            if connection_closed and isinstance(e, connection_closed):
+                logger.warning("SimpleX: WS closed while sending")
+            else:
+                logger.warning("SimpleX: WS send error: %s", e)
 
     async def send(
         self,

@@ -7,9 +7,12 @@ from gateway.dev_control.reliability import (
     compose_task_outcome,
     normalize_outcome,
     measure_category_improvement,
+    recompute_reliability_outcomes,
     scorecard,
     weakest_categories,
 )
+from gateway.dev_control.products import DevProductStore, create_product
+from gateway.dev_execution import DevExecutionStore
 
 
 def _config() -> ReliabilityConfig:
@@ -24,10 +27,23 @@ def _config() -> ReliabilityConfig:
     )
 
 
-def _outcome(index: int, *, category: str = "workspace.implement/high", success: bool = True, escaped: bool = False, completed_at: float = 1_000_000.0):
+def _outcome(
+    index: int,
+    *,
+    category: str = "workspace.implement/high",
+    success: bool = True,
+    escaped: bool = False,
+    completed_at: float = 1_000_000.0,
+    product_id: str | None = "prod-oryn",
+    project_id: str | None = "OrynWorkspace",
+    product_name: str | None = "Oryn Workspace",
+):
     return {
         "plan_id": f"plan-{index}",
         "task_id": f"task-{index}",
+        "project_id": project_id,
+        "product_id": product_id,
+        "product_name": product_name,
         "category": category,
         "profile_id": category.split("/", 1)[0],
         "risk_level": category.split("/", 1)[1],
@@ -99,6 +115,35 @@ def test_scorecard_rates_trend_and_tier_gating():
     assert category["escape_rate"] == 0.0
     assert category["trend"] == "improving"
     assert category["tier"] == "trusted"
+    assert card["summary"]["product_count"] == 1
+
+
+def test_scorecard_reports_product_quality_and_product_category_escapes():
+    now = 2_000_000.0
+    outcomes = [
+        _outcome(1, category="workspace.implement/high", completed_at=now - 10, product_id="prod-oryn", project_id="OrynWorkspace", product_name="Oryn"),
+        _outcome(2, category="workspace.implement/high", escaped=True, completed_at=now - 9, product_id="prod-oryn", project_id="OrynWorkspace", product_name="Oryn"),
+        _outcome(3, category="ovyon.ingest/medium", completed_at=now - 8, product_id="prod-ovyon", project_id="Ovyon", product_name="Ovyon"),
+    ]
+
+    card = scorecard(outcomes, now=now, config=_config())
+    by_product = {row["product_id"]: row for row in card["products"]}
+    oryn = by_product["prod-oryn"]
+    ovyon = by_product["prod-ovyon"]
+
+    assert card["summary"]["product_count"] == 2
+    assert card["summary"]["escape_count"] == 1
+    assert oryn["name"] == "Oryn"
+    assert oryn["sample_count"] == 2
+    assert oryn["success_count"] == 1
+    assert oryn["escape_count"] == 1
+    assert oryn["escape_rate"] == 0.5
+    assert oryn["tier"] == "unproven"
+    assert oryn["weakest_category"]["category"] == "workspace.implement/high"
+    assert oryn["categories"][0]["escape_count"] == 1
+    assert oryn["categories"][0]["escape_rate"] == 0.5
+    assert ovyon["sample_count"] == 1
+    assert card["categories"][0]["category"] in {"workspace.implement/high", "ovyon.ingest/medium"}
 
 
 def test_tier_gating_unproven_for_insufficient_samples_and_escape_demotes():
@@ -119,6 +164,98 @@ def test_tier_gating_unproven_for_insufficient_samples_and_escape_demotes():
     tier, reasons = classify_trust_tier(escaped, config=_config())
     assert tier == "unproven"
     assert "escape" in reasons[0]
+
+
+def test_recompute_attaches_product_identity_from_project_id(tmp_path):
+    db_path = tmp_path / "state.db"
+    reliability_store = DevReliabilityStore(db_path)
+    execution_store = DevExecutionStore(db_path)
+    product_store = DevProductStore(db_path)
+    try:
+        product = create_product(
+            store=product_store,
+            project_id="OrynWorkspace",
+            name="Oryn",
+            lifecycle_state="active",
+        )
+        plan = execution_store.create_plan(
+            title="Product quality",
+            vision_brief=None,
+            tasks=[{
+                "task_id": "task-quality",
+                "goal": "Measure Product quality",
+                "prompt": "Measure Product quality",
+                "project_id": "OrynWorkspace",
+                "profile_id": "workspace.implement",
+                "risk_level": "high",
+            }],
+        )
+        execution_store.update_task_launch(
+            plan_id=plan["plan_id"],
+            task_id="task-quality",
+            ao_session_id="ao-quality",
+            status="completed",
+        )
+
+        result = recompute_reliability_outcomes(
+            reliability_store=reliability_store,
+            execution_store=execution_store,
+            product_store=product_store,
+            now=1_000_000.0,
+        )
+        outcome = result["outcomes"][0]
+
+        assert outcome["project_id"] == "OrynWorkspace"
+        assert outcome["product_id"] == product["product_id"]
+        assert outcome["product_name"] == "Oryn"
+        assert outcome["source_refs"]["product_id"] == product["product_id"]
+        assert scorecard(reliability_store.list_outcomes(limit=10), now=time.time() + 1, config=_config())["products"][0]["product_id"] == product["product_id"]
+    finally:
+        product_store.close()
+        execution_store.close()
+        reliability_store.close()
+
+
+def test_recompute_falls_back_to_project_when_product_missing(tmp_path):
+    db_path = tmp_path / "state.db"
+    reliability_store = DevReliabilityStore(db_path)
+    execution_store = DevExecutionStore(db_path)
+    product_store = DevProductStore(db_path)
+    try:
+        plan = execution_store.create_plan(
+            title="Project fallback quality",
+            vision_brief=None,
+            tasks=[{
+                "task_id": "task-quality",
+                "goal": "Measure Product quality",
+                "prompt": "Measure Product quality",
+                "project_id": "UnmappedProduct",
+            }],
+        )
+        execution_store.update_task_launch(
+            plan_id=plan["plan_id"],
+            task_id="task-quality",
+            ao_session_id="ao-quality",
+            status="completed",
+        )
+
+        result = recompute_reliability_outcomes(
+            reliability_store=reliability_store,
+            execution_store=execution_store,
+            product_store=product_store,
+            now=1_000_000.0,
+        )
+        outcome = result["outcomes"][0]
+        card = scorecard(reliability_store.list_outcomes(limit=10), now=time.time() + 1, config=_config())
+
+        assert outcome["project_id"] == "UnmappedProduct"
+        assert outcome["product_id"] is None
+        assert card["products"][0]["product_id"] == "UnmappedProduct"
+        assert card["products"][0]["name"] == "UnmappedProduct"
+    finally:
+        product_store.close()
+        execution_store.close()
+        reliability_store.close()
 
 
 def test_draft_pr_only_success_excludes_unmeasured_ci_and_review():

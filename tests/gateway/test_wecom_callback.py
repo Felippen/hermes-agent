@@ -6,6 +6,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import wecom_callback as wecom_callback_mod
 from gateway.platforms.wecom_callback import WecomCallbackAdapter
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt
 
@@ -55,6 +56,11 @@ class TestWecomCrypto:
 
 
 class TestWecomCallbackEventConstruction:
+    pytestmark = pytest.mark.skipif(
+        wecom_callback_mod.ET is None,
+        reason="WeCom callback XML parsing requires optional defusedxml dependency.",
+    )
+
     def test_build_event_extracts_text_message(self):
         adapter = WecomCallbackAdapter(_config())
         xml_text = """
@@ -278,6 +284,11 @@ class TestWecomCallbackSendTokenRefresh:
 
 
 class TestWecomCallbackPollLoop:
+    pytestmark = pytest.mark.skipif(
+        wecom_callback_mod.ET is None,
+        reason="WeCom callback XML parsing requires optional defusedxml dependency.",
+    )
+
     @pytest.mark.asyncio
     async def test_poll_loop_dispatches_handle_message(self, monkeypatch):
         adapter = WecomCallbackAdapter(_config())

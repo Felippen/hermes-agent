@@ -839,6 +839,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         self._dev_clarification_store: Optional[Any] = None
         self._dev_plan_artifact_store: Optional[Any] = None
         self._dev_project_goal_store: Optional[Any] = None
+        self._dev_product_store: Optional[Any] = None
         self._dev_verification_store: Optional[Any] = None
         self._dev_signal_store: Optional[Any] = None
         self._dev_product_event_store: Optional[Any] = None
@@ -1230,6 +1231,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             (self._dev_reliability_store, "dev_reliability_outcomes", "updated_at"),
             (self._dev_reliability_store, "dev_reliability_improvements", "measured_at"),
             (self._dev_project_goal_store, "dev_project_goals", "updated_at"),
+            (self._dev_product_store, "dev_products", "updated_at"),
             (self._subagent_event_store, "subagent_events", "event_id"),
         ):
             if store is None:
