@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from gateway.dev_control.work_case_hooks import create_work_case_for_dispatch
 from gateway.dev_control.worker_output_contract import (
     append_worker_output_contract,
     parse_worker_output_contract,
@@ -31,6 +35,19 @@ Completed the inspection.
 
 FINAL_MARKER: PHASE26_DONE
 """
+
+
+def _install_runtime_fixture(tmp_path):
+    cases_root = tmp_path / "cases"
+    vault_root = tmp_path / "vault"
+    oryn_root = tmp_path / "Oryn"
+    package = oryn_root / "tools" / "dev_reliability"
+    package.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[3] / "tools" / "dev_reliability" / "work_case_runtime.py"
+    (package / "work_case_runtime.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    return oryn_root, cases_root, vault_root
 
 
 def test_worker_output_contract_parser_accepts_valid_markdown_json():
@@ -109,6 +126,68 @@ def test_subagent_complete_persists_and_status_uses_structured_evidence(tmp_path
     assert task_status["output_contract_status"] == "ok"
     assert task_status["files_read"] == ["apps/oryn-workspace/Sources/OrynWorkspaceCore/Models/WorkspaceSubagentActivity.swift"]
     assert "WorkspaceSubagentActivityTests passed." in task_status["verification_evidence"]
+
+
+def test_status_derivation_does_not_close_work_case_as_verified_from_worker_output(tmp_path, monkeypatch):
+    oryn_root, cases_root, vault_root = _install_runtime_fixture(tmp_path)
+    monkeypatch.setenv("ORYN_ROOT", str(oryn_root))
+    monkeypatch.setenv("ORYN_WORK_CASE_HOME", str(cases_root))
+    monkeypatch.setenv("HERMES_VAULT_ROOT", str(vault_root))
+    monkeypatch.setenv("HERMES_DEV_WORK_CASE_AUTO", "1")
+
+    store = DevExecutionStore(tmp_path / "state.db")
+    event_store = SubagentEventStore(tmp_path / "state.db")
+    plan = store.create_plan(
+        title="Work Case hook plan",
+        vision_brief=None,
+        tasks=[{
+            "goal": "Return PHASE26_DONE",
+            "prompt": "Inspect and return PHASE26_DONE.",
+        }],
+    )
+    task = plan["tasks"][0]
+    store.update_task_launch(
+        plan_id=plan["plan_id"],
+        task_id=task["task_id"],
+        ao_session_id="fixture-work-case-hook",
+    )
+    case_id = create_work_case_for_dispatch(
+        plan_id=plan["plan_id"],
+        task=task,
+        ao_session_id="fixture-work-case-hook",
+        runtime="fixture",
+        project_id="OrynWorkspace",
+    )
+    assert case_id
+    store.patch_task_payload(
+        plan_id=plan["plan_id"],
+        task_id=task["task_id"],
+        payload_updates={"work_case_id": case_id},
+    )
+
+    event_store.append_event({
+        "event": "subagent.complete",
+        "subagent_id": "fixture:work-case-hook",
+        "ao_session_id": "fixture-work-case-hook",
+        "runtime": "fixture",
+        "status": "completed",
+        "summary": VALID_OUTPUT,
+        "goal": "Return PHASE26_DONE",
+        "launch_plan_id": plan["plan_id"],
+        "launch_task_id": task["task_id"],
+    })
+
+    status = derive_execution_plan_status(
+        store=store,
+        plan_id=plan["plan_id"],
+        event_store=event_store,
+    )
+
+    assert status["tasks"][0]["work_case_closed"] is True
+    metadata = json.loads((cases_root / case_id / "case.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "closed_unverified"
+    carry = json.loads((cases_root / case_id / "carry_forward.json").read_text(encoding="utf-8"))
+    assert carry["verification_state"] == "unknown"
 
 
 def test_missing_structured_evidence_is_warning_first_for_good_summary(tmp_path):

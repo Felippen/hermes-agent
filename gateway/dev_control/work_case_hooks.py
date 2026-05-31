@@ -136,14 +136,11 @@ def maybe_close_work_case_for_task(
         learnings = "\n\n".join(learnings_parts).strip()
         if learnings:
             work_case.update_carry_forward(case_id, {"summary": summary, "learnings": learnings})
-        verification_state = "passed" if status in {"completed", "done", "merged", "complete", "success", "succeeded"} else "unknown"
         if evidence_text:
-            work_case.record_verify(
+            work_case.record_event(
                 case_id,
-                tier="L1",
-                command="worker_output_contract",
-                outcome="passed" if verification_state == "passed" else "unknown",
-                evidence=evidence_text[:4000],
+                event_type="worker_reported_evidence",
+                message=evidence_text[:4000],
             )
         work_case.record_event(
             case_id,

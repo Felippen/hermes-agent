@@ -70,6 +70,16 @@ def test_maybe_close_work_case_for_task_closes_terminal_task(monkeypatch):
             store=store,
         )
         metadata = json.loads((cases_root / case_id / "case.json").read_text(encoding="utf-8"))
-        assert metadata["status"] == "closed"
+        assert metadata["status"] == "closed_unverified"
         assert derived["work_case_closed"] is True
+        carry = json.loads((cases_root / case_id / "carry_forward.json").read_text(encoding="utf-8"))
+        assert carry["verification_state"] == "unknown"
+        events = [
+            json.loads(line)
+            for line in (cases_root / case_id / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        event_types = {event["type"] for event in events}
+        assert "worker_reported_evidence" in event_types
+        assert "verification" not in event_types
         store.patch_task_payload.assert_called_once()
