@@ -225,6 +225,28 @@ def test_package_generation_is_advisory_and_blocks_unqualified(tmp_path):
     assert "Stable confirmation has not run" in packaged["package"]["body"]
 
 
+def test_package_can_reference_lab_experiment_without_stable_confirmation(tmp_path):
+    store = DevHarnessPromotionStore(tmp_path / "state.db")
+    promotion = store.create_promotion(_promotion_payload(
+        benchmark_evidence={
+            **_benchmark(),
+            "lab_experiment": {
+                "experiment_id": "devexp-123",
+                "decision_status": "promote",
+                "metric_deltas": {"score": {"delta": 0.09}},
+                "evidence_refs": [{"run_id": "bench-after", "role": "candidate"}],
+            },
+        },
+    ))
+    qualify_promotion(store=store, promotion_id=promotion["promotion_id"])
+    packaged = generate_promotion_package(store=store, promotion_id=promotion["promotion_id"])
+    assert packaged["package"]["evidence_ids"]["lab_experiment_id"] == "devexp-123"
+    assert packaged["package"]["lab_experiment"]["stable_confirmation_required"] is True
+    assert "Lab experiment: devexp-123" in packaged["package"]["body"]
+    assert packaged["stable_evidence"]["environment"] == "stable"
+    assert "confirmation" not in packaged["stable_evidence"]
+
+
 def test_stable_confirmation_is_separate_from_lab_evidence(tmp_path):
     store = DevHarnessPromotionStore(tmp_path / "state.db")
     promotion = store.create_promotion(_promotion_payload())

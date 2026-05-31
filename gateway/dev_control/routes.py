@@ -89,6 +89,13 @@ from gateway.dev_control.harness_promotions import (
     record_promotion_merge,
     record_promotion_pr,
 )
+from gateway.dev_control.lab_experiments import (
+    DevLabExperimentStore,
+    attach_experiment_evidence,
+    create_lab_experiment,
+    evaluate_lab_experiment,
+    generate_experiment_actions,
+)
 from gateway.dev_control.github_pr_automation import (
     DevGitHubPRAutomationStore,
     automation_summary,
@@ -236,6 +243,12 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_harness_promotion_pr": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/pr"},
         "dev_harness_promotion_merge": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/merge"},
         "dev_harness_promotion_confirm_stable": {"method": "POST", "path": "/v1/dev/harness/promotions/{promotion_id}/confirm-stable"},
+        "dev_lab_experiments": {"method": "GET", "path": "/v1/dev/lab/experiments"},
+        "dev_create_lab_experiment": {"method": "POST", "path": "/v1/dev/lab/experiments"},
+        "dev_lab_experiment_detail": {"method": "GET", "path": "/v1/dev/lab/experiments/{experiment_id}"},
+        "dev_lab_experiment_evidence": {"method": "POST", "path": "/v1/dev/lab/experiments/{experiment_id}/evidence"},
+        "dev_lab_experiment_evaluate": {"method": "POST", "path": "/v1/dev/lab/experiments/{experiment_id}/evaluate"},
+        "dev_lab_experiment_actions": {"method": "POST", "path": "/v1/dev/lab/experiments/{experiment_id}/actions"},
         "dev_deepswe_runs": {"method": "GET", "path": "/v1/dev/deepswe-runs"},
         "dev_start_deepswe_run": {"method": "POST", "path": "/v1/dev/deepswe-runs"},
         "dev_deepswe_run_detail": {"method": "GET", "path": "/v1/dev/deepswe-runs/{run_id}"},
@@ -320,6 +333,12 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/pr", adapter._handle_dev_harness_promotion_pr)
     app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/merge", adapter._handle_dev_harness_promotion_merge)
     app.router.add_post("/v1/dev/harness/promotions/{promotion_id}/confirm-stable", adapter._handle_dev_harness_promotion_confirm_stable)
+    app.router.add_get("/v1/dev/lab/experiments", adapter._handle_dev_lab_experiments)
+    app.router.add_post("/v1/dev/lab/experiments", adapter._handle_dev_lab_experiments)
+    app.router.add_get("/v1/dev/lab/experiments/{experiment_id}", adapter._handle_dev_lab_experiment_detail)
+    app.router.add_post("/v1/dev/lab/experiments/{experiment_id}/evidence", adapter._handle_dev_lab_experiment_evidence)
+    app.router.add_post("/v1/dev/lab/experiments/{experiment_id}/evaluate", adapter._handle_dev_lab_experiment_evaluate)
+    app.router.add_post("/v1/dev/lab/experiments/{experiment_id}/actions", adapter._handle_dev_lab_experiment_actions)
     app.router.add_get("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
     app.router.add_post("/v1/dev/deepswe-runs", adapter._handle_dev_deepswe_runs)
     app.router.add_get("/v1/dev/deepswe-runs/{run_id}", adapter._handle_dev_deepswe_run_detail)
@@ -822,6 +841,20 @@ class DevControlRouteMixin:
             logger.warning("Dev DeepSWE benchmark store unavailable: %s", exc)
             return None
         return self._dev_deepswe_benchmark_store
+
+    def _ensure_dev_lab_experiment_store(self) -> Optional[DevLabExperimentStore]:
+        """Create the Dev Lab experiment store on the same state.db as execution plans."""
+        if getattr(self, "_dev_lab_experiment_store", None) is not None:
+            return self._dev_lab_experiment_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_lab_experiment_store = DevLabExperimentStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev Lab experiment store unavailable: %s", exc)
+            return None
+        return self._dev_lab_experiment_store
 
     async def _handle_dev_clarifications(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/clarifications — list or start durable clarification sessions."""
@@ -1658,6 +1691,123 @@ class DevControlRouteMixin:
         except Exception as exc:
             return web.json_response({"error": {"message": f"Dev harness promotion Stable confirmation failed: {exc}"}}, status=500)
         return web.json_response(result)
+
+    async def _handle_dev_lab_experiments(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/lab/experiments — list or create Lab experiment records."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_lab_experiment_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment store unavailable"}}, status=503)
+        if request.method == "GET":
+            rows = store.list_experiments(
+                status=request.rel_url.query.get("status") or None,
+                target_area=request.rel_url.query.get("target_area") or None,
+                limit=request.rel_url.query.get("limit") or 50,
+            )
+            return web.json_response({"ok": True, "object": "list", "data": rows, "total": len(rows)})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = create_lab_experiment(store=store, payload=body)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev Lab experiment creation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_lab_experiment_detail(self, request: "web.Request") -> "web.Response":
+        """GET /v1/dev/lab/experiments/{experiment_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_lab_experiment_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment store unavailable"}}, status=503)
+        experiment = store.get_experiment(request.match_info["experiment_id"])
+        if experiment is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment not found"}}, status=404)
+        return web.json_response(experiment)
+
+    async def _handle_dev_lab_experiment_evidence(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/lab/experiments/{experiment_id}/evidence — attach compact evidence refs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_lab_experiment_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = attach_experiment_evidence(
+                store=store,
+                experiment_id=request.match_info["experiment_id"],
+                evidence=body.get("evidence") or body.get("evidence_refs") or body,
+                stores={
+                    "lab": self._ensure_dev_lab_loop_store(),
+                    "deepswe": self._ensure_dev_deepswe_benchmark_store(),
+                },
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev Lab experiment evidence attach failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_lab_experiment_evaluate(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/lab/experiments/{experiment_id}/evaluate."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_lab_experiment_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = evaluate_lab_experiment(
+                store=store,
+                experiment_id=request.match_info["experiment_id"],
+                thresholds=body.get("thresholds") or {},
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev Lab experiment evaluation failed: {exc}"}}, status=500)
+        return web.json_response(result)
+
+    async def _handle_dev_lab_experiment_actions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/lab/experiments/{experiment_id}/actions — create advisory follow-up actions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        store = self._ensure_dev_lab_experiment_store()
+        if store is None:
+            return web.json_response({"error": {"message": "Dev Lab experiment store unavailable"}}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = generate_experiment_actions(
+                store=store,
+                experiment_id=request.match_info["experiment_id"],
+                signal_store=self._ensure_dev_signal_store() if _coerce_request_bool(body.get("create_backlog_proposals"), default=False) else None,
+                lab_store=self._ensure_dev_lab_loop_store() if _coerce_request_bool(body.get("create_lab_candidates"), default=False) else None,
+                create_backlog_proposals=_coerce_request_bool(body.get("create_backlog_proposals"), default=False),
+                create_lab_candidates=_coerce_request_bool(body.get("create_lab_candidates"), default=False),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": {"message": str(exc)}}, status=404)
+        except Exception as exc:
+            return web.json_response({"error": {"message": f"Dev Lab experiment action generation failed: {exc}"}}, status=500)
+        return web.json_response({"ok": True, "object": "list", "data": result, "total": len(result)})
 
     async def _handle_dev_deepswe_runs(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/deepswe-runs — list or start Lab DeepSWE benchmark runs."""

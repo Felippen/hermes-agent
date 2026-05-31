@@ -537,6 +537,7 @@ def _build_package(promotion: Dict[str, Any]) -> Dict[str, Any]:
         f"- Improvement category: {promotion.get('improvement_category')}",
         f"- Draft artifact/head SHA: {_draft_ref(lab) or 'missing'}",
         f"- Touched paths: {', '.join(touched_paths) if touched_paths else 'none recorded'}",
+        f"- Lab experiment: {_lab_experiment_id(promotion) or 'none'}",
         "",
         "## Qualification",
         "",
@@ -568,9 +569,11 @@ def _build_package(promotion: Dict[str, Any]) -> Dict[str, Any]:
             "lab_pass_id": promotion.get("lab_pass_id"),
             "candidate_id": promotion.get("candidate_id"),
             "benchmark_run_ids": benchmark_ids,
+            "lab_experiment_id": _lab_experiment_id(promotion),
         },
         "benchmark_deltas": qualification.get("metric_deltas") or {},
         "deepswe_evidence": _deepswe_package_summary(promotion),
+        "lab_experiment": _lab_experiment_summary(promotion),
         "gate_summary": lab.get("gate_verdicts") or lab.get("gates") or {},
         "touched_paths": touched_paths,
         "affected_repos": [target_repo, "Oryn"],
@@ -600,6 +603,26 @@ def _deepswe_package_lines(promotion: Dict[str, Any]) -> list[str]:
         f"- Action IDs: {', '.join(summary.get('action_ids') or []) or 'none'}",
         "- Raw DeepSWE prompts, reference solutions, verifier patches, and trajectories are intentionally omitted.",
     ]
+
+
+def _lab_experiment_id(promotion: Dict[str, Any]) -> Optional[str]:
+    summary = _lab_experiment_summary(promotion)
+    return _first_str(summary.get("experiment_id"))
+
+
+def _lab_experiment_summary(promotion: Dict[str, Any]) -> Dict[str, Any]:
+    benchmark = promotion.get("benchmark_evidence") or {}
+    lab = promotion.get("lab_evidence") or {}
+    experiment = benchmark.get("lab_experiment") or benchmark.get("experiment") or lab.get("lab_experiment") or {}
+    if not isinstance(experiment, dict):
+        return {}
+    return _compact_evidence({
+        "experiment_id": experiment.get("experiment_id"),
+        "decision_status": experiment.get("decision_status") or experiment.get("status"),
+        "metric_deltas": experiment.get("metric_deltas"),
+        "evidence_refs": experiment.get("evidence_refs"),
+        "stable_confirmation_required": True,
+    })
 
 
 def _deepswe_package_summary(promotion: Dict[str, Any]) -> Dict[str, Any]:
