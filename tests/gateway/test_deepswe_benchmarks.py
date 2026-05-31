@@ -142,6 +142,24 @@ def test_pier_command_matches_current_cli_for_task_selection():
     assert "--jobs-dir" in single["argv"]
     assert "--agent-env" in single["argv"]
     assert "CODEX_AUTH_JSON_PATH=/lab/.codex/auth.json" in single["argv"]
+    assert "--agent-kwarg" in single["argv"]
+    config_toml = single["argv"][single["argv"].index("--agent-kwarg") + 1]
+    assert config_toml.startswith("config_toml=")
+    assert 'url = "https://chatgpt.com"' in config_toml
+
+    with_existing_toml = build_pier_command(normalize_deepswe_context(_context(
+        deepswe_checkout_path="/lab/deep-swe",
+        task_ids=["abs-module-cache-flags"],
+        network_policy={
+            "mode": "agent_allowlist",
+            "auth_mode": "codex_subscription",
+            "codex_auth_json_path": "/lab/.codex/auth.json",
+            "agent_kwargs": {"config_toml": "[profile.default]\\nmodel = \"gpt-5.5\""},
+        },
+    )))
+    merged_toml = with_existing_toml["argv"][with_existing_toml["argv"].index("--agent-kwarg") + 1]
+    assert "[profile.default]" in merged_toml
+    assert 'url = "https://chatgpt.com"' in merged_toml
 
     multiple = build_pier_command(normalize_deepswe_context(_context(
         deepswe_checkout_path="/lab/deep-swe",
@@ -192,6 +210,24 @@ def test_parser_ingests_pier_trial_result_without_raw_trajectory(tmp_path):
     assert "trajectory" not in parsed["task_results"][0]
     assert "Expected outcomes" not in parsed["task_results"][0]["message"]
     assert parsed["task_results"][0]["message"] == "NonZeroAgentExitCodeError: missing or invalid agent credentials."
+
+
+def test_parser_does_not_attach_failure_message_to_passed_pier_trial(tmp_path):
+    result_path = tmp_path / "jobs" / "job" / "task__abc" / "result.json"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_text(
+        """
+        {
+          "task_name": "abs-module-cache-flags",
+          "verifier_result": {"rewards": {"reward": 1.0}},
+          "agent_result": {"cost_usd": 2.5, "n_input_tokens": 100, "n_output_tokens": 20}
+        }
+        """,
+        encoding="utf-8",
+    )
+    parsed = parse_deepswe_result_artifact(tmp_path / "jobs")
+    assert parsed["task_results"][0]["status"] == "passed"
+    assert parsed["task_results"][0]["message"] is None
 
 
 def test_parser_classifies_subscription_proxy_block_as_environment(tmp_path):

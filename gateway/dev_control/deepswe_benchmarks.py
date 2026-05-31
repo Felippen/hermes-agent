@@ -505,6 +505,8 @@ def build_pier_command(context: Dict[str, Any]) -> Dict[str, Any]:
         command.extend(["--n-concurrent", str(resource_limits["n_concurrent"])])
     for agent_env in _pier_agent_env(context):
         command.extend(["--agent-env", agent_env])
+    for agent_kwarg in _pier_agent_kwargs(context):
+        command.extend(["--agent-kwarg", agent_kwarg])
     if len(task_ids) > 1:
         for task_id in task_ids:
             command.extend(["--include-task-name", task_id])
@@ -528,6 +530,55 @@ def _pier_agent_env(context: Dict[str, Any]) -> list[str]:
         auth_path = _lab_codex_auth_path(network_policy)
         values.append(f"CODEX_AUTH_JSON_PATH={auth_path}")
     return values
+
+
+def _pier_agent_kwargs(context: Dict[str, Any]) -> list[str]:
+    network_policy = context.get("network_policy") if isinstance(context.get("network_policy"), dict) else {}
+    values: list[str] = []
+    agent_kwargs = network_policy.get("agent_kwargs") if isinstance(network_policy.get("agent_kwargs"), dict) else {}
+    values.extend(
+        f"{key}={value}"
+        for key, value in agent_kwargs.items()
+        if str(key or "").strip() and str(value or "").strip()
+    )
+    auth_mode = str(network_policy.get("auth_mode") or network_policy.get("credentials") or "").strip().lower()
+    if auth_mode in {"codex_subscription", "codex_auth_json", "subscription"}:
+        allowlist_toml = _codex_subscription_allowlist_toml(network_policy)
+        if allowlist_toml:
+            for index, value in enumerate(values):
+                if value.startswith("config_toml="):
+                    values[index] = f"{value}\n{allowlist_toml}"
+                    break
+            else:
+                values.append(f"config_toml={allowlist_toml}")
+    return values
+
+
+def _codex_subscription_allowlist_toml(network_policy: Dict[str, Any]) -> str:
+    hosts = [
+        "chatgpt.com",
+        *(
+            str(host)
+            for host in (network_policy.get("allowed_hosts") or [])
+            if str(host or "").strip()
+        ),
+    ]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for host in hosts:
+        normalized = host.strip().lower().rstrip(".")
+        if not normalized or normalized.startswith(".") or any(char in normalized for char in "/:*"):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(f"https://{normalized}")
+    if not urls:
+        return ""
+    return "\n".join(
+        f'[[pier_network_allowlist.urls]]\nurl = "{url}"'
+        for url in urls
+    )
 
 
 def _lab_codex_auth_path(network_policy: Dict[str, Any]) -> str:
@@ -592,7 +643,7 @@ def _pier_trial_task_result(payload: Dict[str, Any], path: Path) -> Optional[Dic
         "status": status,
         "verifier_status": "passed" if reward is not None and reward >= 1.0 else ("error" if exception_info else "failed"),
         "failure_category": failure_category,
-        "message": _compact_pier_failure_message(failure_category, exception_info),
+        "message": _compact_pier_failure_message(failure_category, exception_info) if status != "passed" else None,
         "cost_usd": (payload.get("agent_result") or {}).get("cost_usd") if isinstance(payload.get("agent_result"), dict) else None,
         "input_tokens": (payload.get("agent_result") or {}).get("n_input_tokens") if isinstance(payload.get("agent_result"), dict) else None,
         "output_tokens": (payload.get("agent_result") or {}).get("n_output_tokens") if isinstance(payload.get("agent_result"), dict) else None,
