@@ -1,15 +1,22 @@
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 from gateway.dev_control import production_signals
+from gateway.dev_control.acceptance_verification import DevVerificationStore
+from gateway.dev_control.lab_loop import DevLabLoopStore, loop_health
 from gateway.dev_control.laminar_exporter import export_subagent_event, redact_attributes, trace_attributes_for_event
 from gateway.dev_control.production_signals import (
     DevProductionSignalStore,
     generate_signal_report,
     measure_proposal_outcome,
+    run_signal_digest_sources,
     signal_health,
     transition_backlog_proposal,
 )
+from gateway.dev_control.reliability import DevReliabilityStore
 from gateway.dev_control.signal_source import DeterministicSignalSource, LaminarSignalSource, SignalWindow, default_thresholds
 from gateway.subagent_events import SubagentEventStore
 
@@ -77,6 +84,97 @@ def test_report_generation_persists_distinct_empty_clustered_and_failed_states(t
     failed = generate_signal_report(signal_store=signal_store, event_store=event_store, window_days=7)
     assert failed["status"] == "analysis_failed"
     assert failed["warnings"]
+
+
+def test_multi_source_digest_reports_partial_failure_and_reuses_proposals(tmp_path, monkeypatch):
+    signal_store = DevProductionSignalStore(tmp_path / "state.db")
+    event_store = _event_store(tmp_path)
+    _append_signal(event_store)
+    _append_signal(event_store)
+    _append_signal(event_store)
+
+    original_source_impl = production_signals._source_impl
+
+    class FailingSource:
+        def fetch_clusters(self, window, filters=None):
+            raise RuntimeError("source down")
+
+    def source_impl(source, **kwargs):
+        if source == "broken":
+            return FailingSource()
+        return original_source_impl(source, **kwargs)
+
+    monkeypatch.setattr(production_signals, "_source_impl", source_impl)
+    first = run_signal_digest_sources(
+        signal_store=signal_store,
+        event_store=event_store,
+        sources=["deterministic", "broken"],
+        window_days=7,
+    )
+    proposal_count = len(signal_store.list_proposals(limit=50))
+    second = run_signal_digest_sources(
+        signal_store=signal_store,
+        event_store=event_store,
+        sources=["deterministic"],
+        window_days=7,
+    )
+
+    assert first["ok"] is False
+    assert first["status"] == "partial_source_failure"
+    assert first["summary"]["failed_source_count"] == 1
+    assert second["ok"] is True
+    assert len(signal_store.list_proposals(limit=50)) == proposal_count
+
+
+def test_signal_digest_runner_lock_skip_is_advisory_success(tmp_path):
+    db_path = tmp_path / "state.db"
+    lock_path = tmp_path / "digest.lock"
+    lock_path.write_text("held")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[2] / "scripts" / "run_dev_signal_digest.py"),
+            "--db-path",
+            str(db_path),
+            "--lock-path",
+            str(lock_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout.strip())
+    assert completed.returncode == 0
+    assert payload["ok"] is True
+    assert payload["status"] == "skipped_lock"
+
+
+def test_signal_health_exposes_never_ran_status(tmp_path):
+    signal_store = DevProductionSignalStore(tmp_path / "state.db")
+    health = signal_health(signal_store=signal_store, event_store=None)
+    assert health["status"] == "never_ran"
+    assert health["latest_report"] is None
+
+
+def test_front_half_dev_data_can_still_have_empty_self_improvement_loop(tmp_path):
+    db_path = tmp_path / "state.db"
+    event_store = SubagentEventStore(db_path)
+    _append_signal(event_store)
+    signal_store = DevProductionSignalStore(db_path)
+    verification_store = DevVerificationStore(db_path)
+    reliability_store = DevReliabilityStore(db_path)
+    lab_store = DevLabLoopStore(db_path)
+
+    assert event_store.list_events(limit=10)
+    assert signal_store.list_reports(limit=10) == []
+    assert signal_store.list_proposals(limit=10) == []
+    assert verification_store.list_runs(limit=10) == []
+    assert reliability_store.list_outcomes(limit=10) == []
+    assert lab_store.list_passes(limit=10) == []
+    assert signal_health(signal_store=signal_store, event_store=event_store)["status"] == "never_ran"
+    lab_health = loop_health(db_path=db_path)
+    assert lab_health["state"]["status"] == "idle"
+    assert lab_health["recent_passes"] == []
 
 
 def test_laminar_sql_source_uses_parameters_and_fails_open(monkeypatch):

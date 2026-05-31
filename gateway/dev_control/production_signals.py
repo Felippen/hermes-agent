@@ -281,40 +281,73 @@ def run_signal_digest_sources(
         for source in (sources or ["deterministic", "product", "reliability"])
         if str(source or "").strip()
     ]
-    reports = [
-        run_signal_digest(
+    reports: list[Dict[str, Any]] = []
+    for source in selected_sources:
+        try:
+            reports.append(run_signal_digest(
+                signal_store=signal_store,
+                event_store=event_store,
+                product_event_store=product_event_store,
+                reliability_store=reliability_store,
+                execution_store=execution_store,
+                source=source,
+                window_days=window_days,
+                filters=filters,
+                persist=persist,
+            ))
+        except Exception as exc:
+            reports.append({
+                "ok": False,
+                "object": "hermes.dev_signal_report",
+                "source": source,
+                "status": "analysis_failed",
+                "counts": {"cluster_count": 0, "analyzed_event_count": 0, "proposal_count": 0},
+                "warnings": [f"Signal digest source failed before report persistence: {exc}"],
+                "proposals": [],
+            })
+    try:
+        measurement_sweep = sweep_reliability_proposal_outcomes(
             signal_store=signal_store,
-            event_store=event_store,
-            product_event_store=product_event_store,
             reliability_store=reliability_store,
             execution_store=execution_store,
-            source=source,
             window_days=window_days,
-            filters=filters,
-            persist=persist,
         )
-        for source in selected_sources
-    ]
-    measurement_sweep = sweep_reliability_proposal_outcomes(
-        signal_store=signal_store,
-        reliability_store=reliability_store,
-        execution_store=execution_store,
-        window_days=window_days,
-    )
+    except Exception as exc:
+        measurement_sweep = {
+            "ok": False,
+            "object": "hermes.dev_reliability_outcome_sweep",
+            "measured": [],
+            "skipped": [],
+            "measured_count": 0,
+            "skipped_count": 0,
+            "warnings": [f"Reliability proposal outcome sweep failed: {exc}"],
+        }
     reliability_reports = [report for report in reports if report.get("source") == "reliability"]
     reliability_proposals = [
         proposal
         for report in reliability_reports
         for proposal in report.get("proposals") or []
     ]
+    failed_sources = [
+        {"source": report.get("source"), "status": report.get("status"), "warnings": report.get("warnings") or []}
+        for report in reports
+        if not report.get("ok", False)
+    ]
+    status = "completed"
+    if failed_sources or not measurement_sweep.get("ok"):
+        status = "partial_source_failure" if reports else "failed"
     return {
         "ok": all(report.get("ok", False) for report in reports) and bool(measurement_sweep.get("ok")),
         "object": "hermes.dev_signal_digest_summary",
+        "status": status,
         "sources": selected_sources,
         "reports": reports,
         "measurement_sweep": measurement_sweep,
+        "failed_sources": failed_sources,
         "summary": {
             "report_count": len(reports),
+            "successful_report_count": sum(1 for report in reports if report.get("ok")),
+            "failed_source_count": len(failed_sources),
             "cluster_count": sum(int((report.get("counts") or {}).get("cluster_count") or 0) for report in reports),
             "proposal_count": sum(int((report.get("counts") or {}).get("proposal_count") or 0) for report in reports),
             "reliability_proposal_count": len(reliability_proposals),
@@ -654,6 +687,14 @@ def signal_health(*, signal_store: DevProductionSignalStore, event_store: Any = 
     clusters = sum(int((report.get("counts") or {}).get("cluster_count") or 0) for report in reports)
     return {
         "object": "hermes.dev_signal_health",
+        "status": "never_ran" if latest is None else latest.get("status"),
+        "latest_report": {
+            "report_id": latest.get("report_id"),
+            "source": latest.get("source"),
+            "status": latest.get("status"),
+            "created_at": latest.get("created_at"),
+            "updated_at": latest.get("updated_at"),
+        } if latest else None,
         "last_analyzed_at": latest.get("created_at") if latest else None,
         "last_analysis_status": latest.get("status") if latest else "never_run",
         "coverage": {

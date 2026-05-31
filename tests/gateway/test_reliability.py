@@ -12,7 +12,8 @@ from gateway.dev_control.reliability import (
     weakest_categories,
 )
 from gateway.dev_control.products import DevProductStore, create_product
-from gateway.dev_execution import DevExecutionStore
+from gateway.dev_execution import DevExecutionStore, set_execution_plan_test_state
+from gateway.subagent_events import SubagentEventStore
 
 
 def _config() -> ReliabilityConfig:
@@ -350,3 +351,92 @@ def test_weakest_categories_and_before_after_measurement(tmp_path):
     assert measurement["before_sample_count"] == 10
     assert measurement["after_sample_count"] == 10
     assert store.list_improvement_measurements(category="workspace.implement/high")[0]["proposal_id"] == "proposal-1"
+
+
+def test_recompute_reports_nonterminal_skips_and_unknown_gates(tmp_path):
+    db_path = tmp_path / "state.db"
+    execution_store = DevExecutionStore(db_path)
+    event_store = SubagentEventStore(db_path)
+    reliability_store = DevReliabilityStore(db_path)
+    plan = execution_store.create_plan(
+        title="Reliability recompute",
+        vision_brief=None,
+        tasks=[
+            {
+                "goal": "Running task",
+                "prompt": "Still running.",
+                "profile_id": "workspace.implement",
+                "project_id": "OrynWorkspace",
+                "permissions": "edit",
+                "acceptance_criteria": [],
+            },
+            {
+                "goal": "Completed task",
+                "prompt": "Already done.",
+                "profile_id": "workspace.implement",
+                "project_id": "OrynWorkspace",
+                "permissions": "edit",
+                "acceptance_criteria": [],
+            },
+        ],
+    )
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=plan["tasks"][0]["task_id"],
+        state="running",
+        event_store=event_store,
+    )
+    set_execution_plan_test_state(
+        store=execution_store,
+        plan_id=plan["plan_id"],
+        task_id=plan["tasks"][1]["task_id"],
+        state="completed_ok",
+        event_store=event_store,
+    )
+
+    result = recompute_reliability_outcomes(
+        reliability_store=reliability_store,
+        execution_store=execution_store,
+        event_store=event_store,
+        config=_config(),
+    )
+    outcomes = reliability_store.list_outcomes(limit=20)
+
+    assert result["count"] == 1
+    assert result["skipped_by_reason"]["non_terminal"] >= 1
+    assert outcomes[0]["success"] is False
+    assert outcomes[0]["verification_verdict"] is None
+    assert outcomes[0]["source_refs"]["gates"]["verification"] == "unknown"
+
+
+def test_recompute_seeds_terminal_ao_event_without_execution_plan(tmp_path):
+    db_path = tmp_path / "state.db"
+    event_store = SubagentEventStore(db_path)
+    reliability_store = DevReliabilityStore(db_path)
+    execution_store = DevExecutionStore(db_path)
+    event_store.append_event({
+        "event": "subagent.complete",
+        "subagent_id": "fixture:task-1",
+        "runtime": "fixture",
+        "status": "completed",
+        "summary": "AO terminal event",
+        "launch_plan_id": "external-plan",
+        "launch_task_id": "external-task",
+        "launch_profile_id": "workspace.implement",
+        "output_contract_score": 0.8,
+    })
+
+    result = recompute_reliability_outcomes(
+        reliability_store=reliability_store,
+        execution_store=execution_store,
+        event_store=event_store,
+        config=_config(),
+    )
+    outcomes = reliability_store.list_outcomes(limit=20)
+
+    assert result["count"] == 1
+    assert outcomes[0]["plan_id"] == "external-plan"
+    assert outcomes[0]["task_id"] == "external-task"
+    assert outcomes[0]["source_refs"]["source"] == "ao_terminal_event"
+    assert outcomes[0]["success"] is False

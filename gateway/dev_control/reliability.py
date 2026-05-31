@@ -337,6 +337,12 @@ def compose_task_outcome(
     code_review_verdict = _optional_lower((code_review or {}).get("verdict"))
     if not code_review_verdict and readiness:
         code_review_verdict = _optional_lower((readiness.get("code_review") or {}).get("verdict"))
+    source_refs["gates"] = {
+        "verification": verification_verdict or "unknown",
+        "ci": ci_state or "unknown",
+        "review": code_review_verdict or "unknown",
+        "merge": str((pr_state or {}).get("merge_state") or "unknown").lower(),
+    }
     merged = _merged_from_sources(terminal_status, pr_state=pr_state, readiness=readiness)
     completed_at = _optional_float(task.get("updated_at")) or _optional_float(plan.get("updated_at")) or now_value
     merged_at = _optional_float((pr_state or {}).get("merged_at")) or (completed_at if merged else None)
@@ -701,6 +707,7 @@ def recompute_reliability_outcomes(
     incident_store: Any = None,
     product_event_store: Any = None,
     product_store: Any = None,
+    event_store: Any = None,
     project_id: Optional[str] = None,
     limit: int = 200,
     now: Optional[float] = None,
@@ -711,15 +718,23 @@ def recompute_reliability_outcomes(
     incidents = incident_store.list_incidents(limit=500) if incident_store else []
     product_events = product_event_store.list_events(limit=1000) if product_event_store else []
     outcomes: list[Dict[str, Any]] = []
+    skipped: list[Dict[str, Any]] = []
     warnings: list[str] = []
     product_by_project: dict[str, Optional[Dict[str, Any]]] = {}
+    seen_keys: set[tuple[str, str]] = set()
     for plan in plans:
         for task in plan.get("tasks") or []:
             status = str(task.get("status") or plan.get("status") or "").strip().lower()
-            if status not in TERMINAL_STATUSES:
-                continue
             plan_id = str(plan.get("plan_id") or "")
             task_id = str(task.get("task_id") or "")
+            if status not in TERMINAL_STATUSES:
+                skipped.append({
+                    "plan_id": plan_id,
+                    "task_id": task_id,
+                    "reason": "non_terminal",
+                    "status": status or "unknown",
+                })
+                continue
             verification = _latest_verification(verification_store, plan_id=plan_id, task_id=task_id)
             pr_state = _latest_pr_state(scm_store, plan_id=plan_id, task_id=task_id)
             code_review = _latest_code_review_for_state(scm_store, pr_state=pr_state, plan_id=plan_id, task_id=task_id)
@@ -746,13 +761,55 @@ def recompute_reliability_outcomes(
                     config=config,
                     now=now,
                 )))
+                seen_keys.add((plan_id, task_id))
             except Exception as exc:
                 warnings.append(f"{plan_id}/{task_id}: {exc}")
+    for event in _terminal_ao_events(event_store, limit=max(limit * 5, 100)):
+        plan_id = str(event.get("launch_plan_id") or event.get("plan_id") or "").strip()
+        task_id = str(event.get("launch_task_id") or event.get("task_id") or "").strip()
+        if not plan_id or not task_id:
+            skipped.append({
+                "event_id": event.get("event_id"),
+                "reason": "missing_plan_or_task",
+                "status": event.get("status"),
+            })
+            continue
+        if (plan_id, task_id) in seen_keys:
+            skipped.append({
+                "event_id": event.get("event_id"),
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "reason": "covered_by_execution_task",
+                "status": event.get("status"),
+            })
+            continue
+        terminal_status = _event_terminal_status(event)
+        if terminal_status not in TERMINAL_STATUSES:
+            skipped.append({
+                "event_id": event.get("event_id"),
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "reason": "non_terminal_event",
+                "status": event.get("status"),
+            })
+            continue
+        try:
+            outcomes.append(reliability_store.upsert_outcome(_outcome_from_terminal_event(
+                event,
+                terminal_status=terminal_status,
+                now=now,
+            )))
+            seen_keys.add((plan_id, task_id))
+        except Exception as exc:
+            warnings.append(f"{plan_id}/{task_id} event {event.get('event_id')}: {exc}")
     return {
         "ok": True,
         "object": "hermes.dev_reliability_recompute",
         "outcomes": outcomes,
         "count": len(outcomes),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "skipped_by_reason": _count_by_reason(skipped),
         "warnings": warnings,
     }
 
@@ -776,6 +833,89 @@ def outcome_success(outcome: Dict[str, Any]) -> bool:
         and str(outcome.get("code_review_verdict") or "").lower() in SUCCESS_REVIEW_VERDICTS
         and not bool(outcome.get("escaped"))
     )
+
+
+def _terminal_ao_events(event_store: Any, *, limit: int) -> list[Dict[str, Any]]:
+    if not event_store:
+        return []
+    try:
+        events = event_store.list_events(limit=limit)
+    except Exception:
+        return []
+    return [
+        event for event in events
+        if str(event.get("event") or "").lower() == "subagent.complete"
+        or _event_terminal_status(event) in TERMINAL_STATUSES
+    ]
+
+
+def _event_terminal_status(event: Dict[str, Any]) -> str:
+    status = str(event.get("status") or "").strip().lower()
+    if status in {"complete", "done", "success", "succeeded"}:
+        return "completed"
+    if status in {"error", "errored", "terminated", "killed", "exited"}:
+        return "failed"
+    if status in TERMINAL_STATUSES:
+        return status
+    return status
+
+
+def _outcome_from_terminal_event(
+    event: Dict[str, Any],
+    *,
+    terminal_status: str,
+    now: Optional[float],
+) -> Dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    profile_id = str(
+        event.get("launch_profile_id")
+        or payload.get("launch_profile_id")
+        or event.get("profile_id")
+        or payload.get("profile_id")
+        or "unknown"
+    ).strip() or "unknown"
+    risk_level = normalize_risk_level(event.get("risk_level") or payload.get("risk_level") or payload.get("risk"))
+    completed_at = _optional_float(event.get("created_at")) or _optional_float(payload.get("created_at")) or now or time.time()
+    source_refs = {
+        "source": "ao_terminal_event",
+        "event_id": event.get("event_id"),
+        "ao_session_id": event.get("ao_session_id"),
+        "runtime": event.get("runtime"),
+        "gates": {
+            "verification": "unknown",
+            "ci": "unknown",
+            "review": "unknown",
+            "merge": "unknown",
+        },
+    }
+    return normalize_outcome({
+        "plan_id": event.get("launch_plan_id") or event.get("plan_id"),
+        "task_id": event.get("launch_task_id") or event.get("task_id"),
+        "profile_id": profile_id,
+        "risk_level": risk_level,
+        "terminal_status": terminal_status,
+        "merged": terminal_status in MERGED_STATUSES,
+        "verification_verdict": None,
+        "ci_state": None,
+        "code_review_verdict": None,
+        "output_contract_score": event.get("output_contract_score") or payload.get("output_contract_score"),
+        "rework_count": 0,
+        "escaped": False,
+        "escape_refs": [],
+        "source_refs": source_refs,
+        "created_at": completed_at,
+        "updated_at": now or time.time(),
+        "completed_at": completed_at,
+        "merged_at": completed_at if terminal_status in {"merged", "shipped"} else None,
+    })
+
+
+def _count_by_reason(items: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        reason = str(item.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 def _draft_gate_success_or_unmeasured(outcome: Dict[str, Any], *, gate: str, success_states: set[str]) -> bool:
