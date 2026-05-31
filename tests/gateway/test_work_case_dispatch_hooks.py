@@ -8,6 +8,60 @@ from gateway.dev_control.work_case_hooks import (
     maybe_close_work_case_for_task,
 )
 
+_RUNTIME_FIXTURE = r'''
+import json
+import time
+from pathlib import Path
+
+
+class WorkCaseRuntime:
+    def __init__(self, cases_root=None):
+        self.cases_root = Path(cases_root)
+        self.cases_root.mkdir(parents=True, exist_ok=True)
+
+    def case_path(self, case_id):
+        return self.cases_root / case_id
+
+    def read_json(self, path):
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def _write_json(self, path, payload):
+        Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def create_case(self, *, title, summary, dispatch):
+        case_id = "wc-test-1"
+        root = self.case_path(case_id)
+        root.mkdir(parents=True, exist_ok=True)
+        self._write_json(root / "case.json", {
+            "case_id": case_id,
+            "title": title,
+            "summary": summary,
+            "status": "open",
+            "dispatch": dispatch,
+        })
+        self._write_json(root / "carry_forward.json", {"verification_state": "unknown"})
+        (root / "events.jsonl").write_text("", encoding="utf-8")
+        return case_id
+
+    def record_event(self, case_id, *, event_type, message):
+        with (self.case_path(case_id) / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": event_type, "message": message, "created_at": time.time()}) + "\n")
+
+    def update_carry_forward(self, case_id, updates):
+        path = self.case_path(case_id) / "carry_forward.json"
+        current = self.read_json(path)
+        current.update(updates)
+        self._write_json(path, current)
+
+    def close_case(self, case_id, *, learnings=None, require_verified=True):
+        path = self.case_path(case_id) / "case.json"
+        metadata = self.read_json(path)
+        metadata["status"] = "closed_verified" if require_verified else "closed_unverified"
+        if learnings:
+            metadata["learnings"] = learnings
+        self._write_json(path, metadata)
+'''
+
 
 def _install_runtime_fixture(tmp: str) -> tuple[Path, Path, Path]:
     cases_root = Path(tmp) / "cases"
@@ -15,8 +69,7 @@ def _install_runtime_fixture(tmp: str) -> tuple[Path, Path, Path]:
     oryn_root = Path(tmp) / "Oryn"
     package = oryn_root / "tools" / "dev_reliability"
     package.mkdir(parents=True)
-    source = Path(__file__).resolve().parents[3] / "tools" / "dev_reliability" / "work_case_runtime.py"
-    (package / "work_case_runtime.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    (package / "work_case_runtime.py").write_text(_RUNTIME_FIXTURE, encoding="utf-8")
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package.parent / "__init__.py").write_text("", encoding="utf-8")
     return oryn_root, cases_root, vault_root

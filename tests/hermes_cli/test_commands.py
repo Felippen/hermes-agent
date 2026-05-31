@@ -67,7 +67,7 @@ class TestCommandRegistry:
                         f"Alias '{alias}' of '{cmd.name}' shadows canonical '{target.name}'"
 
     def test_every_entry_has_valid_category(self):
-        valid_categories = {"Session", "Configuration", "Tools & Skills", "Info", "Exit"}
+        valid_categories = {"Session", "Dev", "Configuration", "Tools & Skills", "Info", "Exit"}
         for cmd in COMMAND_REGISTRY:
             assert cmd.category in valid_categories, f"{cmd.name} has invalid category '{cmd.category}'"
 
@@ -366,7 +366,11 @@ class TestSlackNativeSlashes:
         slack_norm = {_norm(n) for n in slack_names}
         tg_norm = {_norm(n) for n in tg_names}
         reserved_norm = {_norm(n) for n in _SLACK_RESERVED_COMMANDS}
-        missing = (tg_norm - slack_norm) - reserved_norm
+        # Slack app manifests are capped at 50 slash commands. Keep the
+        # current curation explicit so newly displaced Telegram commands still
+        # fail loudly instead of silently falling out of Slack autocomplete.
+        curated_slack_omissions = {"debug", "platform", "update"}
+        missing = (tg_norm - slack_norm) - reserved_norm - curated_slack_omissions
         assert not missing, (
             f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
         )
