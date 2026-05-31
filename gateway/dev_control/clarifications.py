@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sqlite3
@@ -166,6 +167,13 @@ CLARIFIED_BRIEF_JSON_SCHEMA: Dict[str, Any] = {
 
 DISCOVERY_QUESTION_ITEM_SCHEMA: Dict[str, Any] = QUESTION_JSON_SCHEMA["properties"]["questions"]["items"]
 
+DISCOVERY_FOLLOWUP_QUESTION_ITEM_SCHEMA: Dict[str, Any] = copy.deepcopy(DISCOVERY_QUESTION_ITEM_SCHEMA)
+DISCOVERY_FOLLOWUP_QUESTION_ITEM_SCHEMA["required"] = [
+    field
+    for field in DISCOVERY_FOLLOWUP_QUESTION_ITEM_SCHEMA["required"]
+    if field != "question_id"
+]
+
 DISCOVERY_ADVANCE_JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -173,7 +181,7 @@ DISCOVERY_ADVANCE_JSON_SCHEMA: Dict[str, Any] = {
     "properties": {
         "action": {"type": "string", "enum": ["continue", "ready"]},
         "reason": {"type": "string"},
-        "question": DISCOVERY_QUESTION_ITEM_SCHEMA,
+        "question": DISCOVERY_FOLLOWUP_QUESTION_ITEM_SCHEMA,
     },
 }
 
@@ -484,11 +492,14 @@ def list_clarifications(
     clarification_kind: Optional[str] = None,
     limit: int = 50,
 ) -> Dict[str, Any]:
+    normalized_kind = None
+    if clarification_kind:
+        normalized_kind = _normalize_clarification_kind(clarification_kind)
     data = [_with_current_question(item) for item in store.list(
         project_id=project_id,
         session_id=session_id,
         status=status,
-        clarification_kind=clarification_kind,
+        clarification_kind=normalized_kind,
         limit=limit,
     )]
     return {"object": "list", "data": data, "total": len(data)}
@@ -557,7 +568,9 @@ def answer_clarification(
                 narrative_updates["initial_narrative"] = narrative
         if narrative_updates:
             updated = store.update(clarification_id, narrative_updates)
-        updated = _advance_discovery_session(store=store, clarification_id=clarification_id, payload=updated)
+        questions_after = updated.get("questions") or []
+        if next_index >= len(questions_after):
+            updated = _advance_discovery_session(store=store, clarification_id=clarification_id, payload=updated)
     return _with_current_question(updated)
 
 
@@ -1002,6 +1015,17 @@ def _answer_text_value(answer: Optional[Dict[str, Any]]) -> str:
     return str(answer.get("option_label") or "").strip()
 
 
+def _scope_exclusion_from_answer(answer: Optional[Dict[str, Any]]) -> list[str]:
+    """Map out-of-scope answers to non_goals regardless of option vs freeform."""
+    if not isinstance(answer, dict) or answer.get("skipped"):
+        return []
+    text = str(answer.get("answer_text") or "").strip()
+    if text:
+        return [text]
+    label = str(answer.get("option_label") or "").strip()
+    return [label] if label else []
+
+
 def _build_project_onboarding_profile(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str]]:
     answers = _answers_by_question_id(payload)
     project_context = payload.get("project_context") or {}
@@ -1028,15 +1052,7 @@ def _build_project_onboarding_profile(payload: Dict[str, Any]) -> tuple[Dict[str
 
     constraints_answer = answers.get("onb_constraints") or {}
     constraints: list[str] = []
-    non_goals: list[str] = []
-    if not constraints_answer.get("skipped"):
-        constraint_text = str(constraints_answer.get("answer_text") or "").strip()
-        if constraint_text:
-            constraints.append(constraint_text)
-        else:
-            label = str(constraints_answer.get("option_label") or "").strip()
-            if label:
-                non_goals.append(label)
+    non_goals = _scope_exclusion_from_answer(constraints_answer)
 
     repositories: list[Dict[str, Any]] = []
     warning = None
@@ -1187,16 +1203,7 @@ def _build_feature_onboarding_brief(payload: Dict[str, Any]) -> tuple[Dict[str, 
         repo_focus = _answer_text_value(repo_answer) or str(repo_answer.get("option_label") or "").strip() or None
 
     constraints: list[str] = []
-    non_goals: list[str] = []
-    constraints_answer = answers.get("feat_constraints") or {}
-    if not constraints_answer.get("skipped"):
-        constraint_text = str(constraints_answer.get("answer_text") or "").strip()
-        if constraint_text:
-            constraints.append(constraint_text)
-        else:
-            label = str(constraints_answer.get("option_label") or "").strip()
-            if label:
-                non_goals.append(label)
+    non_goals = _scope_exclusion_from_answer(answers.get("feat_constraints"))
 
     feature_title = _feature_title_from_outcome(
         outcome,

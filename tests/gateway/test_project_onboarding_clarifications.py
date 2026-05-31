@@ -138,6 +138,55 @@ def test_project_onboarding_list_filters_by_kind(tmp_path):
         store.close()
 
 
+def test_project_onboarding_list_normalizes_kind_filter_case(tmp_path):
+    store = DevClarificationStore(db_path=tmp_path / "state.db")
+    try:
+        start_clarification(
+            store=store,
+            vision_brief="",
+            project_id="OrynWorkspace",
+            clarification_kind="project_onboarding",
+        )
+        onboarding = list_clarifications(
+            store=store,
+            project_id="OrynWorkspace",
+            clarification_kind="Project_Onboarding",
+        )
+        assert onboarding["total"] == 1
+    finally:
+        store.close()
+
+
+def test_project_onboarding_freeform_scope_exclusion_goes_to_non_goals(tmp_path):
+    store = DevClarificationStore(db_path=tmp_path / "state.db")
+    try:
+        session = start_clarification(
+            store=store,
+            vision_brief="",
+            project_id="AlphaProject",
+            clarification_kind="project_onboarding",
+            project_context={"project_id": "AlphaProject", "project_name": "Alpha Project"},
+        )
+        clarification_id = session["clarification_id"]
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="onb_name", answer_text="Alpha Project")
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="onb_intent", option_id="b")
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="onb_vision", answer_text="Ship onboarding.")
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="onb_repo", skipped=True)
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="onb_extra_repos", option_id="b")
+        answer_clarification(
+            store=store,
+            clarification_id=clarification_id,
+            question_id="onb_constraints",
+            answer_text="No automatic execution yet.",
+        )
+        completed = complete_clarification(store=store, clarification_id=clarification_id)
+        profile = completed["clarified_brief"]
+        assert profile["non_goals"] == ["No automatic execution yet."]
+        assert profile["constraints"] == []
+    finally:
+        store.close()
+
+
 def test_project_onboarding_migrates_legacy_clarification_table(tmp_path):
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))

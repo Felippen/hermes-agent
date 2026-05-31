@@ -256,6 +256,44 @@ def test_project_discovery_approve_and_revise(mock_llm, tmp_path):
         store.close()
 
 
+@patch("gateway.dev_control.clarifications._call_discovery_llm")
+def test_project_discovery_reanswer_does_not_append_follow_up(mock_llm, tmp_path):
+    mock_llm.side_effect = [_discovery_advance_continue(), _discovery_advance_continue()]
+    store = DevClarificationStore(db_path=tmp_path / "state.db")
+    try:
+        narrative = (
+            "Planning keeps drifting because project intent stays shallow. "
+            "I want Dev to run projects with durable context."
+        )
+        session = start_clarification(
+            store=store,
+            vision_brief=narrative,
+            project_id="AlphaProject",
+            clarification_kind="project_discovery",
+            project_context={"project_id": "AlphaProject", "project_name": "Alpha Project"},
+        )
+        clarification_id = session["clarification_id"]
+        first_question = session["questions"][0]
+        session = answer_clarification(
+            store=store,
+            clarification_id=clarification_id,
+            question_id=first_question["question_id"],
+            answer_text="First answer.",
+        )
+        assert len(session["questions"]) == 2
+        session = answer_clarification(store=store, clarification_id=clarification_id, back=True)
+        session = answer_clarification(
+            store=store,
+            clarification_id=clarification_id,
+            question_id=first_question["question_id"],
+            answer_text="Revised first answer.",
+        )
+        assert len(session["questions"]) == 2
+        assert mock_llm.call_count == 2
+    finally:
+        store.close()
+
+
 def test_project_discovery_rejects_unknown_kind(tmp_path):
     store = DevClarificationStore(db_path=tmp_path / "state.db")
     try:

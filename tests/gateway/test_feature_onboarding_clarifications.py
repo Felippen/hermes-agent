@@ -119,3 +119,35 @@ def test_feature_onboarding_complete_builds_planning_brief(tmp_path):
         assert brief["non_goals"]
     finally:
         store.close()
+
+
+def test_feature_onboarding_freeform_scope_exclusion_goes_to_non_goals(tmp_path):
+    store = DevClarificationStore(db_path=tmp_path / "state.db")
+    try:
+        session = start_clarification(
+            store=store,
+            vision_brief="Improve project planning",
+            project_id="OrynWorkspace",
+            clarification_kind="feature_onboarding",
+            project_context={
+                "project_id": "OrynWorkspace",
+                "project_name": "Oryn",
+                "vision": "Make Dev planning reliable.",
+            },
+        )
+        clarification_id = session["clarification_id"]
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="feat_outcome", answer_text="Ship feature onboarding.")
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="feat_scope", option_id="a")
+        answer_clarification(store=store, clarification_id=clarification_id, question_id="feat_acceptance", option_id="b")
+        answer_clarification(
+            store=store,
+            clarification_id=clarification_id,
+            question_id="feat_constraints",
+            answer_text="No broad refactor in the first slice.",
+        )
+        completed = complete_clarification(store=store, clarification_id=clarification_id)
+        brief = completed["clarified_brief"]
+        assert brief["non_goals"] == ["No broad refactor in the first slice."]
+        assert brief["constraints"] == []
+    finally:
+        store.close()
