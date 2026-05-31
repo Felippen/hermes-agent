@@ -765,7 +765,7 @@ def test_product_progression_loop_manual_portfolio_autonomy_blocks_bounded_produ
         product_store.close()
 
 
-def test_product_progression_loop_bounded_autonomy_launches_one_planned_task(tmp_path):
+def test_product_progression_loop_bounded_autonomy_launches_one_planned_task(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     product_store = DevProductStore(db_path)
     execution_store = DevExecutionStore(db_path)
@@ -785,6 +785,23 @@ def test_product_progression_loop_bounded_autonomy_launches_one_planned_task(tmp
                 "payload": {"runtime": "ao"},
             }],
         )
+
+        def fake_launch_execution_plan(*, store, plan_id, task_ids=None, bridge=None, event_store=None):
+            task_id = (task_ids or ["bounded-launch-task"])[0]
+            session = bridge.spawn("ao", project_id="BoundedLaunch", prompt="Launch bounded worker")
+            store.update_task_launch(plan_id=plan_id, task_id=task_id, ao_session_id=session.id)
+            return {
+                "ok": True,
+                "launched": [{
+                    "task_id": task_id,
+                    "goal": "Launch bounded worker",
+                    "ao_session_id": session.id,
+                }],
+                "failures": [],
+                "launch_record": {"launch_id": "launch-test"},
+            }
+
+        monkeypatch.setattr("gateway.dev_execution.launch_execution_plan", fake_launch_execution_plan)
 
         tick = tick_product_progression_loop(
             store=product_store,
