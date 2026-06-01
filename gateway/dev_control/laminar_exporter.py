@@ -168,8 +168,8 @@ def _otlp_payload(
     scope: str = "hermes.dev.production_signals",
 ) -> Dict[str, Any]:
     now_ns = int(float(event.get("created_at") or time.time()) * 1_000_000_000)
-    trace_id = str(event.get("trace_id") or "").strip()[:32]
-    if not trace_id:
+    trace_id = str(event.get("trace_id") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", trace_id):
         trace_id = hashlib.sha256(str(attrs.get("session_id") or now_ns).encode("utf-8")).hexdigest()[:32]
     span_id = hashlib.sha256(str(event.get("event_id") or now_ns).encode("utf-8")).hexdigest()[:16]
     return {

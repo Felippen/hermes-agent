@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from aiohttp import web
 
+from hermes_constants import get_hermes_home
 from gateway.dev_execution import (
     DevExecutionStore,
     apply_execution_plan_review,
@@ -3566,7 +3567,13 @@ class DevControlRouteMixin:
         except Exception:
             body = {}
         body = body if isinstance(body, dict) else {}
-        output_dir = Path(str(body.get("output_dir") or "tests/ovyon_situation_awareness/fixtures/answer_feedback"))
+        safe_root = (get_hermes_home() / "exports" / "answer_feedback").resolve()
+        requested = str(body.get("output_dir") or "").strip()
+        requested_path = Path(requested) if requested else safe_root
+        candidate = requested_path if requested_path.is_absolute() else safe_root / requested_path
+        output_dir = candidate.resolve()
+        if output_dir != safe_root and safe_root not in output_dir.parents:
+            return web.json_response(_openai_error("output_dir must be inside Hermes answer-feedback export directory"), status=400)
         try:
             return web.json_response(feedback_store.export_ovyon_fixture(event_id, output_dir))
         except ValueError as exc:

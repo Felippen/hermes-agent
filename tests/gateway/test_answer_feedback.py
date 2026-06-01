@@ -41,7 +41,7 @@ def _feedback(**overrides):
 
 
 def test_normalize_answer_feedback_redacts_and_derives_trace_id():
-    event = normalize_answer_feedback(_feedback(trace_id="", reason_tags=["missing_context", "not-real"]))
+    event = normalize_answer_feedback(_feedback(trace_id="not-a-hex-trace", reason_tags=["missing_context", "not-real"]))
 
     assert event["trace_id"] == answer_feedback_trace_id("session-1", "message-1")
     assert event["reason_tags"] == ["missing_context"]
@@ -60,6 +60,16 @@ def test_store_preserves_individual_feedback_and_filters(tmp_path):
     assert result["accepted"] == 2
     assert len(store.list_events()) == 2
     assert [event["event_id"] for event in missing] == ["feedback-1"]
+
+
+def test_reason_filter_applies_before_limit(tmp_path):
+    store = DevAnswerFeedbackStore(tmp_path / "state.db")
+    store.ingest_batch({"events": [_feedback(event_id="feedback-match", reason_tags=["missing_context"])]})
+    store.ingest_batch({"events": [_feedback(event_id=f"feedback-newer-{index}", reason_tags=["wrong_priority"]) for index in range(3)]})
+
+    missing = store.list_events(profile="ovyon", rating="down", reason="missing_context", limit=1)
+
+    assert [event["event_id"] for event in missing] == ["feedback-match"]
 
 
 def test_store_judges_and_exports_ovyon_fixture(tmp_path):
@@ -90,7 +100,7 @@ def test_laminar_answer_feedback_export_redacts_and_fails_open(monkeypatch):
 
 
 def test_laminar_answer_feedback_export_payload(monkeypatch):
-    event = normalize_answer_feedback(_feedback(event_id="feedback-1"))
+    event = normalize_answer_feedback(_feedback(event_id="feedback-1", trace_id="f" * 32))
     captured = {}
 
     class Response:
@@ -116,6 +126,31 @@ def test_laminar_answer_feedback_export_payload(monkeypatch):
     assert span["name"] == "answer.feedback.judge"
 
 
+def test_laminar_export_falls_back_for_invalid_trace_id(monkeypatch):
+    event = {**normalize_answer_feedback(_feedback(event_id="feedback-1")), "trace_id": "not-a-valid-trace-id"}
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode())
+        return Response()
+
+    monkeypatch.setenv("HERMES_LAMINAR_EXPORT_ENABLED", "1")
+    monkeypatch.setattr("gateway.dev_control.laminar_exporter.urllib.request.urlopen", fake_urlopen)
+
+    export_answer_feedback_event(event)
+
+    span = captured["body"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    assert span["traceId"] != "not-a-valid-trace-id"
+    assert len(span["traceId"]) == 32
+
+
 @pytest.mark.asyncio
 async def test_answer_feedback_api_ingests_lists_and_judges(tmp_path):
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-secret"}))
@@ -125,6 +160,7 @@ async def test_answer_feedback_api_ingests_lists_and_judges(tmp_path):
     app.router.add_get("/v1/dev/answer-feedback", adapter._handle_dev_answer_feedback)
     app.router.add_post("/v1/dev/answer-feedback", adapter._handle_dev_answer_feedback)
     app.router.add_post("/v1/dev/answer-feedback/{event_id}/judge", adapter._handle_dev_answer_feedback_judge)
+    app.router.add_post("/v1/dev/answer-feedback/{event_id}/export-ovyon-fixture", adapter._handle_dev_answer_feedback_export)
 
     async with TestClient(TestServer(app)) as cli:
         ingest = await cli.post(
@@ -140,10 +176,16 @@ async def test_answer_feedback_api_ingests_lists_and_judges(tmp_path):
             "/v1/dev/answer-feedback/feedback-1/judge",
             headers={"Authorization": "Bearer sk-secret"},
         )
+        unsafe_export = await cli.post(
+            "/v1/dev/answer-feedback/feedback-1/export-ovyon-fixture",
+            json={"output_dir": "../outside"},
+            headers={"Authorization": "Bearer sk-secret"},
+        )
 
         assert ingest.status == 200
         assert listed.status == 200
         assert judged.status == 200
+        assert unsafe_export.status == 400
         list_data = await listed.json()
         judge_data = await judged.json()
 

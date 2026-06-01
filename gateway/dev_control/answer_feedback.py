@@ -11,7 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from hermes_state import DEFAULT_DB_PATH, apply_wal_with_fallback
+from hermes_constants import get_hermes_home
+from hermes_state import apply_wal_with_fallback
 
 
 ANSWER_FEEDBACK_EVENT_TYPE = "ai.answer_feedback"
@@ -80,7 +81,7 @@ class DevAnswerFeedbackStore:
     """SQLite store preserving individual answer-feedback records."""
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or (get_hermes_home() / "state.db")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -260,7 +261,9 @@ class DevAnswerFeedbackStore:
             clauses.append("rating = ?")
             params.append(str(rating).strip().lower())
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(max(1, min(int(limit or 100), 500)))
+        bounded_limit = max(1, min(int(limit or 100), 500))
+        fetch_limit = 500 if reason else bounded_limit
+        params.append(fetch_limit)
         rows = self._conn.execute(
             f"""
             SELECT *
@@ -275,7 +278,7 @@ class DevAnswerFeedbackStore:
         if reason:
             reason = str(reason).strip().lower()
             events = [event for event in events if reason in (event.get("reason_tags") or [])]
-        return events
+        return events[:bounded_limit]
 
 
 def normalize_answer_feedback(raw: Any) -> Dict[str, Any]:
@@ -296,7 +299,7 @@ def normalize_answer_feedback(raw: Any) -> Dict[str, Any]:
     reason_tags = _normalized_reasons(raw.get("reason_tags") or raw.get("reasons") or [])
     if rating == "down" and not reason_tags:
         reason_tags = ["other"]
-    trace_id = _bounded(raw.get("trace_id"), 80) or answer_feedback_trace_id(session_id, message_id)
+    trace_id = _normalized_trace_id(raw.get("trace_id"), session_id=session_id, message_id=message_id)
     context = _normalized_context(raw.get("context") or {})
     return {
         "event_id": event_id,
@@ -320,6 +323,13 @@ def normalize_answer_feedback(raw: Any) -> Dict[str, Any]:
 
 def answer_feedback_trace_id(session_id: str, message_id: str) -> str:
     return hashlib.sha256(f"{session_id}:{message_id}".encode("utf-8")).hexdigest()[:32]
+
+
+def _normalized_trace_id(value: Any, *, session_id: str, message_id: str) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", candidate):
+        return candidate
+    return answer_feedback_trace_id(session_id, message_id)
 
 
 def heuristic_judge_scores(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,6 +427,8 @@ def _bounded(value: Any, max_chars: int) -> str:
 
 
 def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
     try:
         return float(value)
     except Exception:
