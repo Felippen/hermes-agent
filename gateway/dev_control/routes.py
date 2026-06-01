@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from aiohttp import web
@@ -50,6 +51,7 @@ from gateway.dev_control.acceptance_verification import (
     refresh_verification_run,
     trigger_terminal_task_verifications,
 )
+from gateway.dev_control.answer_feedback import DevAnswerFeedbackStore
 from gateway.dev_control.ci_status import fetch_ci_status
 from gateway.dev_control.clarifications import (
     DEFAULT_CLARIFICATION_KIND,
@@ -150,6 +152,7 @@ from gateway.dev_control.products import (
     upsert_product,
 )
 from gateway.dev_control.product_events import DevProductEventStore
+from gateway.dev_control.laminar_exporter import export_answer_feedback_event, export_answer_judge_event
 from gateway.dev_control.production_signals import (
     DevProductionSignalStore,
     generate_signal_report,
@@ -333,6 +336,10 @@ def dev_control_capabilities() -> dict[str, dict[str, str]]:
         "dev_create_signal_report": {"method": "POST", "path": "/v1/dev/signal-reports"},
         "dev_signal_report_detail": {"method": "GET", "path": "/v1/dev/signal-reports/{report_id}"},
         "dev_ci_status": {"method": "GET", "path": "/v1/dev/ci-status"},
+        "dev_answer_feedback": {"method": "GET", "path": "/v1/dev/answer-feedback"},
+        "dev_ingest_answer_feedback": {"method": "POST", "path": "/v1/dev/answer-feedback"},
+        "dev_judge_answer_feedback": {"method": "POST", "path": "/v1/dev/answer-feedback/{event_id}/judge"},
+        "dev_export_answer_feedback": {"method": "POST", "path": "/v1/dev/answer-feedback/{event_id}/export-ovyon-fixture"},
         "dev_product_events": {"method": "GET", "path": "/v1/dev/product-events"},
         "dev_ingest_product_events": {"method": "POST", "path": "/v1/dev/product-events"},
         "dev_detect_incidents": {"method": "POST", "path": "/v1/dev/incidents/detect"},
@@ -444,6 +451,10 @@ def register_dev_control_routes(app: web.Application, adapter: Any) -> None:
     app.router.add_post("/v1/dev/github-webhooks", adapter._handle_dev_github_webhooks)
     app.router.add_get("/v1/dev/pr-automation", adapter._handle_dev_pr_automation)
     app.router.add_post("/v1/dev/pr-automation/actions", adapter._handle_dev_pr_automation_actions)
+    app.router.add_get("/v1/dev/answer-feedback", adapter._handle_dev_answer_feedback)
+    app.router.add_post("/v1/dev/answer-feedback", adapter._handle_dev_answer_feedback)
+    app.router.add_post("/v1/dev/answer-feedback/{event_id}/judge", adapter._handle_dev_answer_feedback_judge)
+    app.router.add_post("/v1/dev/answer-feedback/{event_id}/export-ovyon-fixture", adapter._handle_dev_answer_feedback_export)
     app.router.add_get("/v1/dev/product-events", adapter._handle_dev_product_events)
     app.router.add_post("/v1/dev/product-events", adapter._handle_dev_product_events)
     app.router.add_post("/v1/dev/incidents/detect", adapter._handle_dev_incident_detect)
@@ -850,6 +861,20 @@ class DevControlRouteMixin:
             logger.warning("Dev product event store unavailable: %s", exc)
             return None
         return self._dev_product_event_store
+
+    def _ensure_dev_answer_feedback_store(self) -> Optional[DevAnswerFeedbackStore]:
+        """Create the answer-feedback store on the same state.db as execution plans."""
+        if getattr(self, "_dev_answer_feedback_store", None) is not None:
+            return self._dev_answer_feedback_store
+        execution_store = self._ensure_dev_execution_store()
+        if execution_store is None:
+            return None
+        try:
+            self._dev_answer_feedback_store = DevAnswerFeedbackStore(db_path=execution_store.db_path)
+        except Exception as exc:
+            logger.warning("Dev answer feedback store unavailable: %s", exc)
+            return None
+        return self._dev_answer_feedback_store
 
     def _ensure_dev_incident_store(self) -> Optional[DevIncidentStore]:
         """Create the Dev incident store on the same state.db as execution plans."""
@@ -3477,6 +3502,77 @@ class DevControlRouteMixin:
         except Exception as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         return web.json_response(result)
+
+    async def _handle_dev_answer_feedback(self, request: "web.Request") -> "web.Response":
+        """GET/POST /v1/dev/answer-feedback — inspect or ingest chat answer feedback."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        feedback_store = self._ensure_dev_answer_feedback_store()
+        if feedback_store is None:
+            return web.json_response(_openai_error("Dev answer feedback store unavailable"), status=503)
+        if request.method == "GET":
+            try:
+                return web.json_response({
+                    "ok": True,
+                    "object": "list",
+                    "data": feedback_store.list_events(
+                        profile=request.rel_url.query.get("profile") or None,
+                        rating=request.rel_url.query.get("rating") or None,
+                        reason=request.rel_url.query.get("reason") or None,
+                        limit=self._bounded_query_limit(request, default=100),
+                    ),
+                })
+            except Exception as exc:
+                return web.json_response(_openai_error(str(exc)), status=500)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        try:
+            return web.json_response(feedback_store.ingest_batch(body, export=export_answer_feedback_event))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_dev_answer_feedback_judge(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/answer-feedback/{event_id}/judge — run manual answer judge."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        feedback_store = self._ensure_dev_answer_feedback_store()
+        if feedback_store is None:
+            return web.json_response(_openai_error("Dev answer feedback store unavailable"), status=503)
+        event_id = request.match_info.get("event_id") or ""
+        try:
+            return web.json_response(feedback_store.judge_event(event_id, export=export_answer_judge_event))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=404)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_dev_answer_feedback_export(self, request: "web.Request") -> "web.Response":
+        """POST /v1/dev/answer-feedback/{event_id}/export-ovyon-fixture — export a benchmark fixture."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        feedback_store = self._ensure_dev_answer_feedback_store()
+        if feedback_store is None:
+            return web.json_response(_openai_error("Dev answer feedback store unavailable"), status=503)
+        event_id = request.match_info.get("event_id") or ""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        output_dir = Path(str(body.get("output_dir") or "tests/ovyon_situation_awareness/fixtures/answer_feedback"))
+        try:
+            return web.json_response(feedback_store.export_ovyon_fixture(event_id, output_dir))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc)), status=500)
 
     async def _handle_dev_product_events(self, request: "web.Request") -> "web.Response":
         """GET/POST /v1/dev/product-events — inspect or ingest shipped-product error events."""

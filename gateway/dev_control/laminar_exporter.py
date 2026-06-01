@@ -36,13 +36,61 @@ def export_subagent_event(event: Dict[str, Any], *, endpoint: Optional[str] = No
             target,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=_otlp_headers(),
         )
         with urllib.request.urlopen(request, timeout=_env_float("HERMES_LAMINAR_EXPORT_TIMEOUT_SECONDS", 2.0)):
             pass
         return {"ok": True, "status": "exported", "attributes": attrs}
     except Exception as exc:
         return {"ok": False, "status": "failed_open", "warning": str(exc)}
+
+
+def export_answer_feedback_event(event: Dict[str, Any], *, endpoint: Optional[str] = None) -> Dict[str, Any]:
+    """Export one answer-feedback event as a small OTLP/JSON span. Never raises."""
+
+    attrs = {
+        "hermes_signal_domain": "answer-feedback",
+        "event_id": event.get("event_id"),
+        "session_id": event.get("session_id"),
+        "message_id": event.get("message_id"),
+        "profile": event.get("profile"),
+        "mode": event.get("mode"),
+        "model": event.get("model"),
+        "rating": event.get("rating"),
+        "reason_tags": ",".join(event.get("reason_tags") or []),
+        "awareness_packet_id": event.get("awareness_packet_id"),
+        "laminar_kind": "feedback",
+    }
+    return _export_otlp_event(
+        event,
+        attrs=attrs,
+        name="answer.feedback",
+        scope="hermes.dev.answer_feedback",
+        endpoint=endpoint,
+    )
+
+
+def export_answer_judge_event(event: Dict[str, Any], *, endpoint: Optional[str] = None) -> Dict[str, Any]:
+    """Export judge scores linked to an answer-feedback trace. Never raises."""
+
+    scores = event.get("judge_scores") if isinstance(event.get("judge_scores"), dict) else {}
+    attrs = {
+        "hermes_signal_domain": "answer-feedback",
+        "event_id": event.get("event_id"),
+        "session_id": event.get("session_id"),
+        "message_id": event.get("message_id"),
+        "profile": event.get("profile"),
+        "rating": event.get("rating"),
+        "laminar_kind": "judge",
+        **{key: value for key, value in scores.items() if key.startswith("judge_")},
+    }
+    return _export_otlp_event(
+        event,
+        attrs=attrs,
+        name="answer.feedback.judge",
+        scope="hermes.dev.answer_feedback",
+        endpoint=endpoint,
+    )
 
 
 def trace_attributes_for_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -64,6 +112,36 @@ def trace_attributes_for_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return redact_attributes(attrs)
 
 
+def _export_otlp_event(
+    event: Dict[str, Any],
+    *,
+    attrs: Dict[str, Any],
+    name: str,
+    scope: str,
+    endpoint: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not laminar_export_enabled():
+        return {"ok": False, "status": "disabled"}
+    sample_rate = _env_float("HERMES_LAMINAR_SAMPLE_RATE", 1.0)
+    if sample_rate < 1.0 and random.random() > max(sample_rate, 0.0):
+        return {"ok": False, "status": "sampled_out"}
+    try:
+        safe_attrs = redact_attributes(attrs)
+        target = (endpoint or os.getenv("HERMES_LAMINAR_OTLP_HTTP_ENDPOINT") or "http://127.0.0.1:8000/v1/traces").rstrip("/")
+        body = json.dumps(_otlp_payload(safe_attrs, event, name=name, scope=scope)).encode("utf-8")
+        request = urllib.request.Request(
+            target,
+            data=body,
+            method="POST",
+            headers=_otlp_headers(),
+        )
+        with urllib.request.urlopen(request, timeout=_env_float("HERMES_LAMINAR_EXPORT_TIMEOUT_SECONDS", 2.0)):
+            pass
+        return {"ok": True, "status": "exported", "attributes": safe_attrs}
+    except Exception as exc:
+        return {"ok": False, "status": "failed_open", "warning": str(exc)}
+
+
 def redact_attributes(attrs: Dict[str, Any]) -> Dict[str, Any]:
     redacted: Dict[str, Any] = {}
     for key, value in attrs.items():
@@ -82,19 +160,27 @@ def redact_attributes(attrs: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
-def _otlp_payload(attrs: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
+def _otlp_payload(
+    attrs: Dict[str, Any],
+    event: Dict[str, Any],
+    *,
+    name: Optional[str] = None,
+    scope: str = "hermes.dev.production_signals",
+) -> Dict[str, Any]:
     now_ns = int(float(event.get("created_at") or time.time()) * 1_000_000_000)
-    trace_id = hashlib.sha256(str(attrs.get("session_id") or now_ns).encode("utf-8")).hexdigest()[:32]
+    trace_id = str(event.get("trace_id") or "").strip()[:32]
+    if not trace_id:
+        trace_id = hashlib.sha256(str(attrs.get("session_id") or now_ns).encode("utf-8")).hexdigest()[:32]
     span_id = hashlib.sha256(str(event.get("event_id") or now_ns).encode("utf-8")).hexdigest()[:16]
     return {
         "resourceSpans": [{
             "resource": {"attributes": [_attr("service.name", "hermes-agent")]},
             "scopeSpans": [{
-                "scope": {"name": "hermes.dev.production_signals"},
+                "scope": {"name": scope},
                 "spans": [{
                     "traceId": trace_id,
                     "spanId": span_id,
-                    "name": str(event.get("event") or "subagent.event"),
+                    "name": str(name or event.get("event") or "subagent.event"),
                     "kind": 1,
                     "startTimeUnixNano": now_ns,
                     "endTimeUnixNano": now_ns,
@@ -113,6 +199,14 @@ def _attr(key: str, value: Any) -> Dict[str, Any]:
     if isinstance(value, float):
         return {"key": key, "value": {"doubleValue": value}}
     return {"key": key, "value": {"stringValue": str(value)}}
+
+
+def _otlp_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = (os.getenv("HERMES_LAMINAR_API_KEY") or os.getenv("LAMINAR_PROJECT_API_KEY") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _cluster_key_hint(event: Dict[str, Any]) -> str:
