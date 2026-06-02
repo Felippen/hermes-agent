@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from hermes_constants import display_hermes_home, get_hermes_home
+from utils import atomic_json_write
 
 
 GMAIL_SCOPES = [
@@ -25,6 +27,7 @@ GMAIL_SCOPES = [
 DEFAULT_CLIENT_SECRET_NAME = "google_client_secret.json"
 DEFAULT_TOKEN_NAME = "google_token.json"
 DEFAULT_PENDING_NAME = "google_gmail_oauth_pending.json"
+_OAUTH_SCOPE_RELAX_LOCK = threading.Lock()
 
 
 class GmailOAuthError(RuntimeError):
@@ -67,15 +70,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _secure_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    os.chmod(path, 0o600)
+    atomic_json_write(path, payload, mode=0o600)
 
 
 def _normalize_authorized_user_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -245,17 +240,18 @@ def complete_gmail_oauth_callback(
         code_verifier=pending["code_verifier"],
     )
 
-    previous_relax = os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE")
-    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-    try:
-        flow.fetch_token(code=code)
-    except Exception as exc:
-        raise GmailOAuthError(f"Gmail OAuth token exchange failed: {exc}", status="failed") from exc
-    finally:
-        if previous_relax is None:
-            os.environ.pop("OAUTHLIB_RELAX_TOKEN_SCOPE", None)
-        else:
-            os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = previous_relax
+    with _OAUTH_SCOPE_RELAX_LOCK:
+        previous_relax = os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE")
+        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+        try:
+            flow.fetch_token(code=code)
+        except Exception as exc:
+            raise GmailOAuthError(f"Gmail OAuth token exchange failed: {exc}", status="failed") from exc
+        finally:
+            if previous_relax is None:
+                os.environ.pop("OAUTHLIB_RELAX_TOKEN_SCOPE", None)
+            else:
+                os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = previous_relax
 
     creds = flow.credentials
     token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))

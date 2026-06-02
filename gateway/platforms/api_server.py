@@ -2538,13 +2538,47 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 status=500,
             )
         except MailError as exc:
-            return web.json_response(_openai_error(str(exc)), status=400)
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            return web.json_response(_openai_error(message), status=400)
         except Exception as exc:
             logger.exception("Mail tool %s failed", tool_name)
             return web.json_response(
                 _openai_error(f"Mail tool failed: {exc}", err_type="server_error"),
                 status=500,
             )
+
+    def _mail_public_base_url(self, request: "web.Request") -> str:
+        """Resolve the public Hermes base URL used for Gmail OAuth callbacks."""
+        import os
+
+        from hermes_cli.dashboard_auth.prefix import _normalise_public_url, resolve_public_url
+
+        for env_name in ("HERMES_MAIL_PUBLIC_URL", "HERMES_DASHBOARD_PUBLIC_URL"):
+            configured = _normalise_public_url(os.environ.get(env_name, ""))
+            if configured:
+                return configured
+
+        configured = resolve_public_url()
+        if configured:
+            return configured
+
+        scheme = str(request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",", 1)[0].strip()
+        host = (
+            request.headers.get("X-Forwarded-Host")
+            or request.headers.get("Host")
+            or request.host
+        )
+        host = str(host or "").split(",", 1)[0].strip()
+        return f"{scheme}://{host}".rstrip("/")
+
+    def _mail_oauth_callback_url(self, request: "web.Request") -> str:
+        return f"{self._mail_public_base_url(request)}/v1/mail/oauth/callback"
 
     async def _mail_request_body(self, request: "web.Request") -> Dict[str, Any]:
         if not request.can_read_body:
@@ -2605,7 +2639,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         try:
             from tools.gmail_oauth import GmailOAuthError, start_gmail_oauth
 
-            redirect_uri = f"{request.scheme}://{request.host}/v1/mail/oauth/callback"
+            redirect_uri = self._mail_oauth_callback_url(request)
             return web.json_response(start_gmail_oauth(redirect_uri))
         except GmailOAuthError as exc:
             return web.json_response(
@@ -2644,35 +2678,21 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         try:
             from tools.gmail_oauth import GmailOAuthError, complete_gmail_oauth_callback
 
-            result = complete_gmail_oauth_callback(
+            complete_gmail_oauth_callback(
                 code=request.query.get("code"),
                 state=request.query.get("state"),
                 granted_scope=request.query.get("scope"),
                 error=request.query.get("error"),
             )
             title = "Gmail connected"
-            detail = "You can return to Oryn Workspace."
+            detail = "You can close this tab and return to Oryn Workspace."
             status = 200
         except GmailOAuthError as exc:
-            result = {
-                "object": "gmail.oauth_callback",
-                "provider": "gmail",
-                "status": exc.status,
-                "connected": False,
-                "message": str(exc),
-            }
             title = "Gmail connection failed"
             detail = str(exc)
             status = 400
         except Exception as exc:
             logger.exception("Gmail OAuth callback failed")
-            result = {
-                "object": "gmail.oauth_callback",
-                "provider": "gmail",
-                "status": "failed",
-                "connected": False,
-                "message": f"Gmail OAuth callback failed: {exc}",
-            }
             title = "Gmail connection failed"
             detail = "Hermes could not finish Gmail connection."
             status = 500
@@ -2685,7 +2705,6 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             "</head><body><main>"
             f"<h1>{html_escape(title)}</h1>"
             f"<p>{html_escape(detail)}</p>"
-            "<script>window.setTimeout(function(){window.close()},1200)</script>"
             "</main></body></html>"
         )
         return web.Response(text=html, status=status, content_type="text/html")

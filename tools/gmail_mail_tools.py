@@ -396,7 +396,11 @@ def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
             limit=limit,
             page_token=page_token,
         )
-        cache_ready = bool(rows) or cache.sync_status(account.account_id)["message_count"] > 0
+        cache_ready = bool(rows) or cache.has_sync_state(
+            account.account_id,
+            label=label,
+            query=gmail_query,
+        )
     else:
         rows, next_page_token = cache.list_messages(
             account_id=account.account_id,
@@ -804,6 +808,7 @@ def _modify_message(
 
 
 def archive_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    _require_approval(args, "archive_email")
     return _modify_message(args, remove_labels=["INBOX"])
 
 

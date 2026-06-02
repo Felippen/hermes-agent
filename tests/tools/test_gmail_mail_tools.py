@@ -234,7 +234,7 @@ def test_archive_reconciles_cached_inbox_view(monkeypatch):
     monkeypatch.setattr(mail, "build_gmail_service", lambda account: fake)
 
     mail.sync_email({"label": "inbox", "limit": 10})
-    archived = mail.archive_email({"message_id": "msg-1"})
+    archived = mail.archive_email({"message_id": "msg-1", "approved": True})
     inbox = mail.list_emails({"label": "inbox", "limit": 10})
     row = mail.read_email({"message_id": "msg-1"})
 
@@ -280,9 +280,12 @@ def test_mutations_and_bulk_require_approval(monkeypatch):
     fake = FakeGmailService({"msg-1": _message(), "msg-2": _message("msg-2")})
     monkeypatch.setattr(mail, "build_gmail_service", lambda account: fake)
 
-    archived = mail.archive_email({"message_id": "msg-1"})
+    archived = mail.archive_email({"message_id": "msg-1", "approved": True})
     assert archived["status"] == "modified"
     assert fake.modify_calls[-1]["body"]["removeLabelIds"] == ["INBOX"]
+
+    with pytest.raises(mail.MailError, match="requires explicit approval"):
+        mail.archive_email({"message_id": "msg-1"})
 
     with pytest.raises(mail.MailError, match="requires explicit approval"):
         mail.delete_email({"message_id": "msg-1"})

@@ -1018,6 +1018,49 @@ class TestMailEndpoints:
             assert data["connected"] is False
 
     @pytest.mark.asyncio
+    async def test_mail_oauth_start_uses_public_url_override(self, adapter, monkeypatch, tmp_path):
+        client_path = tmp_path / "google_client_secret.json"
+        client_path.write_text(
+            '{"installed": {"client_id": "client-id", "client_secret": "secret"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(client_path))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "pending.json"))
+        monkeypatch.setenv("HERMES_MAIL_PUBLIC_URL", "https://studio.example:8643")
+
+        class FakeFlow:
+            code_verifier = "verifier-1"
+
+            def authorization_url(self, **kwargs):
+                return "https://accounts.google.com/o/oauth2/v2/auth?state=state-1", "state-1"
+
+        from tools import gmail_oauth
+
+        monkeypatch.setattr(gmail_oauth, "_flow_from_client_secret", lambda **_kwargs: FakeFlow())
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/oauth/start")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["redirect_uri"] == "https://studio.example:8643/v1/mail/oauth/callback"
+
+    @pytest.mark.asyncio
+    async def test_mail_modify_returns_approval_required_without_approved(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/mail/messages/msg-1/modify",
+                json={"account_id": "acct-1", "operation": "archive", "approved": False},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "approval_required"
+            assert data["ok"] is False
+
+    @pytest.mark.asyncio
     async def test_mail_oauth_callback_does_not_require_api_key(self, auth_adapter, monkeypatch):
         from tools import gmail_oauth
 
