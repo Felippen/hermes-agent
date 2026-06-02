@@ -53,6 +53,10 @@ NORMALIZED_VIEW_TO_GMAIL_QUERY = {
 class MailError(RuntimeError):
     """Expected mail operation failure surfaced as a JSON error."""
 
+    def __init__(self, message: str, *, error_code: Optional[str] = None):
+        super().__init__(message)
+        self.error_code = error_code
+
 
 class TTLCache:
     def __init__(self, ttl_seconds: float):
@@ -83,6 +87,11 @@ class TTLCache:
 
 _list_cache = TTLCache(LIST_CACHE_TTL_SECONDS)
 _read_cache = TTLCache(READ_CACHE_TTL_SECONDS)
+
+
+def clear_cache_for_testing() -> None:
+    _list_cache.clear()
+    _read_cache.clear()
 
 
 def _mail_cache() -> GmailMailCache:
@@ -638,7 +647,7 @@ def _require_approval(args: Dict[str, Any], operation: str) -> None:
         args.get("approved") or args.get("confirmed") or args.get("approval_confirmed")
     )
     if not approved:
-        raise MailError(f"{operation} requires explicit approval")
+        raise MailError(f"{operation} requires explicit approval", error_code="approval_required")
 
 
 def _split_recipients(value: Any) -> str:

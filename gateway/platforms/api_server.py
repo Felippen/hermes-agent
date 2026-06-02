@@ -2539,7 +2539,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             )
         except MailError as exc:
             message = str(exc)
-            if "requires explicit approval" in message:
+            if getattr(exc, "error_code", None) == "approval_required":
                 return web.json_response({
                     "ok": False,
                     "status": "approval_required",
@@ -2684,8 +2684,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 granted_scope=request.query.get("scope"),
                 error=request.query.get("error"),
             )
-            title = "Gmail connected"
-            detail = "You can close this tab and return to Oryn Workspace."
+            title = "Authentication successful"
+            detail = "You can close this tab and return to your client."
             status = 200
         except GmailOAuthError as exc:
             title = "Gmail connection failed"

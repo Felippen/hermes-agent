@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tools import gmail_oauth as oauth
 
 
@@ -64,13 +66,10 @@ def test_callback_rejects_state_mismatch(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    try:
+    with pytest.raises(oauth.GmailOAuthError) as exc_info:
         oauth.complete_gmail_oauth_callback(code="code-1", state="wrong-state")
-    except oauth.GmailOAuthError as exc:
-        assert exc.status == "failed"
-        assert "state mismatch" in str(exc)
-    else:
-        raise AssertionError("expected state mismatch")
+    assert exc_info.value.status == "failed"
+    assert "state mismatch" in str(exc_info.value)
 
     assert not token_path.exists()
 

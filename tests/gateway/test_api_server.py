@@ -1085,7 +1085,8 @@ class TestMailEndpoints:
             resp = await cli.get("/v1/mail/oauth/callback?code=code-1&state=state-1")
             text = await resp.text()
             assert resp.status == 200
-            assert "Gmail connected" in text
+            assert "Authentication successful" in text
+            assert "Oryn Workspace" not in text
 
     @pytest.mark.asyncio
     async def test_mail_api_uses_cache_after_sync_and_archive(
@@ -1094,7 +1095,7 @@ class TestMailEndpoints:
         monkeypatch,
         tmp_path,
     ):
-        from tests.tools.test_gmail_mail_tools import FakeGmailService, _message
+        from tests.tools.gmail_test_fixtures import FakeGmailService, _message
         from tools import gmail_mail_tools
 
         token_path = tmp_path / "google_token.json"
@@ -1102,8 +1103,7 @@ class TestMailEndpoints:
         monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
         monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
         monkeypatch.setenv("HERMES_GMAIL_MAIL_CACHE_PATH", str(tmp_path / "gmail.sqlite3"))
-        gmail_mail_tools._list_cache.clear()
-        gmail_mail_tools._read_cache.clear()
+        gmail_mail_tools.clear_cache_for_testing()
         fake = FakeGmailService({"msg-1": _message()})
         monkeypatch.setattr(gmail_mail_tools, "build_gmail_service", lambda _account: fake)
 
@@ -1114,8 +1114,7 @@ class TestMailEndpoints:
             sync_data = await sync.json()
             assert sync_data["synced"] == 1
 
-            gmail_mail_tools._list_cache.clear()
-            gmail_mail_tools._read_cache.clear()
+            gmail_mail_tools.clear_cache_for_testing()
             listed = await cli.get("/v1/mail/messages?label=inbox&limit=10")
             read = await cli.get("/v1/mail/messages/msg-1")
             assert listed.status == 200
