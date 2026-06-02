@@ -2487,6 +2487,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "mail_accounts": {"method": "GET", "path": "/v1/mail/accounts"},
                 "mail_messages": {"method": "GET", "path": "/v1/mail/messages"},
                 "mail_search": {"method": "GET", "path": "/v1/mail/search"},
+                "mail_sync": {"method": "POST", "path": "/v1/mail/sync"},
                 "mail_message": {"method": "GET", "path": "/v1/mail/messages/{message_id}"},
                 "mail_send": {"method": "POST", "path": "/v1/mail/send"},
                 "mail_reply": {"method": "POST", "path": "/v1/mail/messages/{message_id}/reply"},
@@ -2581,6 +2582,16 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             "page_token": request.query.get("page_token", ""),
         }
         return await self._mail_json_response("search_emails", args)
+
+    async def _handle_mail_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("sync_email", body)
 
     async def _handle_mail_read(self, request: "web.Request") -> "web.Response":
         auth_err = self._check_auth(request)
@@ -8162,6 +8173,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_get("/v1/mail/accounts", self._handle_mail_accounts)
             self._app.router.add_get("/v1/mail/messages", self._handle_mail_messages)
             self._app.router.add_get("/v1/mail/search", self._handle_mail_search)
+            self._app.router.add_post("/v1/mail/sync", self._handle_mail_sync)
             self._app.router.add_post("/v1/mail/send", self._handle_mail_send)
             self._app.router.add_post("/v1/mail/messages/bulk", self._handle_mail_bulk)
             self._app.router.add_get("/v1/mail/messages/{message_id}", self._handle_mail_read)

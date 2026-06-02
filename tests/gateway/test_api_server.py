@@ -557,6 +557,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/mail/accounts", adapter._handle_mail_accounts)
     app.router.add_get("/v1/mail/messages", adapter._handle_mail_messages)
     app.router.add_get("/v1/mail/search", adapter._handle_mail_search)
+    app.router.add_post("/v1/mail/sync", adapter._handle_mail_sync)
     app.router.add_post("/v1/mail/send", adapter._handle_mail_send)
     app.router.add_post("/v1/mail/messages/bulk", adapter._handle_mail_bulk)
     app.router.add_get("/v1/mail/messages/{message_id}", adapter._handle_mail_read)
@@ -893,6 +894,7 @@ class TestMailEndpoints:
             data = await resp.json()
             assert data["features"]["gmail_mail_tools"] is True
             assert data["endpoints"]["mail_accounts"]["path"] == "/v1/mail/accounts"
+            assert data["endpoints"]["mail_sync"]["path"] == "/v1/mail/sync"
             assert data["endpoints"]["mail_send"]["path"] == "/v1/mail/send"
 
     @pytest.mark.asyncio
@@ -926,6 +928,81 @@ class TestMailEndpoints:
             assert resp.status == 400
             data = await resp.json()
             assert "requires explicit approval" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_mail_sync_dispatches_tool(self, adapter, monkeypatch):
+        from tools import gmail_mail_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "sync_email"
+            assert args["label"] == "inbox"
+            return {
+                "object": "gmail.sync",
+                "provider": "gmail",
+                "account_id": "gmail:user@example.com",
+                "synced": 1,
+                "updated": 1,
+                "cache_source": "gmail_api",
+                "synced_at": 100.0,
+            }
+
+        monkeypatch.setattr(gmail_mail_tools, "dispatch_mail_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/sync", json={"label": "inbox"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "gmail.sync"
+            assert data["synced"] == 1
+
+    @pytest.mark.asyncio
+    async def test_mail_api_uses_cache_after_sync_and_archive(
+        self,
+        adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        from tests.tools.test_gmail_mail_tools import FakeGmailService, _message
+        from tools import gmail_mail_tools
+
+        token_path = tmp_path / "google_token.json"
+        token_path.write_text(json.dumps({"token": "tok"}))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
+        monkeypatch.setenv("HERMES_GMAIL_MAIL_CACHE_PATH", str(tmp_path / "gmail.sqlite3"))
+        gmail_mail_tools._list_cache.clear()
+        gmail_mail_tools._read_cache.clear()
+        fake = FakeGmailService({"msg-1": _message()})
+        monkeypatch.setattr(gmail_mail_tools, "build_gmail_service", lambda _account: fake)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            sync = await cli.post("/v1/mail/sync", json={"label": "inbox", "limit": 10})
+            assert sync.status == 200
+            sync_data = await sync.json()
+            assert sync_data["synced"] == 1
+
+            gmail_mail_tools._list_cache.clear()
+            gmail_mail_tools._read_cache.clear()
+            listed = await cli.get("/v1/mail/messages?label=inbox&limit=10")
+            read = await cli.get("/v1/mail/messages/msg-1")
+            assert listed.status == 200
+            assert read.status == 200
+            listed_data = await listed.json()
+            read_data = await read.json()
+            assert listed_data["cache_source"] == "local_provider_cache"
+            assert read_data["cache_source"] == "local_provider_cache"
+
+            archived = await cli.post(
+                "/v1/mail/messages/msg-1/modify",
+                json={"operation": "archive"},
+            )
+            assert archived.status == 200
+            inbox = await cli.get("/v1/mail/messages?label=inbox&limit=10")
+            inbox_data = await inbox.json()
+            assert inbox_data["cache_source"] == "local_provider_cache"
+            assert inbox_data["data"] == []
 
 
 # ---------------------------------------------------------------------------

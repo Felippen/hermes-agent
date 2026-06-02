@@ -79,6 +79,7 @@ def clear_mail_state(monkeypatch, tmp_path):
     token_path.write_text(json.dumps({"token": "tok", "scopes": mail.SCOPES}))
     monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
     monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
+    monkeypatch.setenv("HERMES_GMAIL_MAIL_CACHE_PATH", str(tmp_path / "gmail.sqlite3"))
     monkeypatch.delenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", raising=False)
     mail._list_cache.clear()
     mail._read_cache.clear()
@@ -165,6 +166,45 @@ def test_read_email_parses_body_attachment_and_cache(monkeypatch):
     ]
     assert second["cache"] == "hit"
     assert len(fake.get_calls) == 1
+
+
+def test_sync_email_populates_provider_cache_for_list_and_read(monkeypatch):
+    fake = FakeGmailService({"msg-1": _message()})
+    monkeypatch.setattr(mail, "build_gmail_service", lambda account: fake)
+
+    sync = mail.sync_email({"label": "inbox", "limit": 10})
+    assert sync["synced"] == 1
+    assert sync["cache_source"] == "gmail_api"
+
+    mail._list_cache.clear()
+    mail._read_cache.clear()
+
+    def fail_build(_account):
+        pytest.fail("Gmail API should not be called for synced cache reads")
+
+    monkeypatch.setattr(mail, "build_gmail_service", fail_build)
+    listed = mail.list_emails({"label": "inbox", "limit": 10})
+    read = mail.read_email({"message_id": "msg-1"})
+
+    assert listed["cache_source"] == "local_provider_cache"
+    assert listed["data"][0]["message_id"] == "msg-1"
+    assert read["cache_source"] == "local_provider_cache"
+    assert read["text_body"] == "Plain body"
+
+
+def test_archive_reconciles_cached_inbox_view(monkeypatch):
+    fake = FakeGmailService({"msg-1": _message()})
+    monkeypatch.setattr(mail, "build_gmail_service", lambda account: fake)
+
+    mail.sync_email({"label": "inbox", "limit": 10})
+    archived = mail.archive_email({"message_id": "msg-1"})
+    inbox = mail.list_emails({"label": "inbox", "limit": 10})
+    row = mail.read_email({"message_id": "msg-1"})
+
+    assert archived["status"] == "modified"
+    assert inbox["cache_source"] == "local_provider_cache"
+    assert inbox["data"] == []
+    assert "INBOX" not in row["labels"]
 
 
 def test_send_requires_approval(monkeypatch):
