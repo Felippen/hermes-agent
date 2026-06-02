@@ -35,6 +35,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 from html import escape as html_escape
@@ -1716,6 +1718,67 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             logger.warning("Session model switch failed for %s: %s", session_id, exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    async def _handle_upload_session_attachment(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/attachments — stage a chat attachment on the server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = str(request.match_info.get("session_id", "")).strip()
+        if (
+            not session_id
+            or len(session_id) > self._MAX_SESSION_HEADER_LEN
+            or re.search(r"[\r\n\x00]", session_id)
+        ):
+            return web.json_response(
+                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        try:
+            maybe_body = request.json()
+            body = await maybe_body if inspect.isawaitable(maybe_body) else maybe_body
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        filename = str(body.get("filename") or "attachment").strip()
+        content_b64 = body.get("content_base64")
+        mime_type = str(body.get("mime_type") or "application/octet-stream").strip()
+        if not isinstance(content_b64, str) or not content_b64.strip():
+            return web.json_response(
+                _openai_error("'content_base64' is required"),
+                status=400,
+            )
+
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return web.json_response(
+                _openai_error("'content_base64' is not valid base64"),
+                status=400,
+            )
+
+        try:
+            from gateway.platforms.workspace_attachments import save_workspace_attachment
+
+            saved = save_workspace_attachment(
+                session_id=session_id,
+                original_filename=filename,
+                data=data,
+                mime_type=mime_type,
+            )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.warning("Session attachment upload failed for %s: %s", session_id, exc)
+            return web.json_response(_openai_error("Failed to store attachment"), status=500)
+
+        return web.json_response({
+            "object": "hermes.session.attachment",
+            "session_id": session_id,
+            **saved,
+        })
+
     # ── Session goals (/goal Ralph loop) ────────────────────────────────
 
     def _goal_max_turns_from_config(self) -> int:
@@ -2455,6 +2518,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "kanban": True,
                 "slash_execution": "full",
                 "gmail_mail_tools": True,
+                "session_attachment_upload": True,
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -2467,6 +2531,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     "path": "/v1/providers/openrouter/models",
                 },
                 "session_model": {"method": "POST", "path": "/v1/sessions/{session_id}/model"},
+                "session_attachment": {
+                    "method": "POST",
+                    "path": "/v1/sessions/{session_id}/attachments",
+                },
                 "commands": {"method": "GET", "path": "/v1/commands"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "complete_slash": {"method": "POST", "path": "/v1/complete/slash"},
@@ -8276,6 +8344,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             )
             self._app.router.add_get("/v1/sessions/{session_id}/model", self._handle_get_session_model)
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/attachments",
+                self._handle_upload_session_attachment,
+            )
             self._app.router.add_get("/v1/sessions/{session_id}/goal", self._handle_get_session_goal)
             self._app.router.add_post("/v1/sessions/{session_id}/goal", self._handle_post_session_goal)
             self._app.router.add_get("/v1/sessions", self._handle_v1_list_sessions)
