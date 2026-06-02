@@ -58,6 +58,10 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Gmail mailbox tools (gated on profile-scoped Gmail OAuth config)
+    "list_email_accounts", "list_emails", "search_emails", "read_email",
+    "send_email", "reply_to_email", "archive_email", "delete_email",
+    "mark_email_read", "bulk_email", "summarize_email", "draft_email_reply",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -194,6 +198,16 @@ TOOLSETS = {
     "messaging": {
         "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
         "tools": ["send_message"],
+        "includes": []
+    },
+
+    "gmail_mail": {
+        "description": "Gmail mailbox tools for list, read, search, send, reply, and triage",
+        "tools": [
+            "list_email_accounts", "list_emails", "search_emails", "read_email",
+            "send_email", "reply_to_email", "archive_email", "delete_email",
+            "mark_email_read", "bulk_email", "summarize_email", "draft_email_reply",
+        ],
         "includes": []
     },
 
