@@ -32,6 +32,9 @@ SCOPES = [
 
 LIST_CACHE_TTL_SECONDS = 30.0
 READ_CACHE_TTL_SECONDS = 300.0
+MAIL_LIST_LIMIT_MAX = 100
+MAIL_SYNC_LIMIT_MAX = 500
+GMAIL_LIST_PAGE_SIZE_MAX = 500
 MAIL_TOOLSET = "gmail_mail"
 
 NORMALIZED_VIEW_TO_GMAIL_QUERY = {
@@ -363,7 +366,7 @@ def list_email_accounts(args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
     account = _resolve_account(args.get("account_id"))
-    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), 100))
+    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), MAIL_LIST_LIMIT_MAX))
     page_token = str(args.get("page_token") or "")
     label = str(
         args.get("label") or args.get("folder") or ("inbox" if not search else "")
@@ -493,47 +496,57 @@ def search_emails(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def sync_email(args: Dict[str, Any]) -> Dict[str, Any]:
     account = _resolve_account(args.get("account_id"))
-    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), 100))
+    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), MAIL_SYNC_LIMIT_MAX))
     page_token = str(args.get("page_token") or "")
     label = str(args.get("label") or args.get("folder") or "inbox")
     query = str(args.get("query") or "")
     gmail_query = _view_query(label, query)
     service = build_gmail_service(account)
-    results = _execute(
-        service
-        .users()
-        .messages()
-        .list(
-            userId="me",
-            q=gmail_query,
-            maxResults=limit,
-            pageToken=page_token or None,
-        )
-    )
     cache = _mail_cache()
     synced_at = time.time()
     synced = 0
-    for meta in results.get("messages", []) or []:
-        message_id = meta.get("id")
-        if not message_id:
-            continue
-        msg = _execute(
+    remaining = limit
+    next_page_token = page_token
+    while remaining > 0:
+        results = _execute(
             service
             .users()
             .messages()
-            .get(
+            .list(
                 userId="me",
-                id=message_id,
-                format="full",
+                q=gmail_query,
+                maxResults=min(remaining, GMAIL_LIST_PAGE_SIZE_MAX),
+                pageToken=next_page_token or None,
             )
         )
-        cache.upsert_message(
-            account_id=account.account_id,
-            email=account.email,
-            message=_message_full(msg),
-            synced_at=synced_at,
-        )
-        synced += 1
+        messages = results.get("messages", []) or []
+        for meta in messages:
+            if remaining <= 0:
+                break
+            message_id = meta.get("id")
+            if not message_id:
+                continue
+            msg = _execute(
+                service
+                .users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full",
+                )
+            )
+            cache.upsert_message(
+                account_id=account.account_id,
+                email=account.email,
+                message=_message_full(msg),
+                synced_at=synced_at,
+            )
+            synced += 1
+            remaining -= 1
+        next_page_token = str(results.get("nextPageToken") or "")
+        if not next_page_token or not messages:
+            break
     cache.record_sync(
         account_id=account.account_id,
         email=account.email,
@@ -554,7 +567,7 @@ def sync_email(args: Dict[str, Any]) -> Dict[str, Any]:
         "query": gmail_query,
         "synced": synced,
         "updated": synced,
-        "next_page_token": results.get("nextPageToken", ""),
+        "next_page_token": next_page_token,
         "cache": "updated",
         "cache_source": "gmail_api",
         "synced_at": synced_at,
@@ -1062,7 +1075,7 @@ registry.register(
             "query": {"type": "string"},
             "limit": {
                 "type": "integer",
-                "description": "Maximum messages to sync, 1-100.",
+                "description": "Maximum messages to sync, 1-500.",
             },
             "page_token": {"type": "string"},
         },

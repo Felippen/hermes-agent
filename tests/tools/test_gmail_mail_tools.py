@@ -24,6 +24,15 @@ class FakeMessages:
 
     def list(self, **kwargs):
         self.service.list_calls.append(kwargs)
+        if self.service.pages is not None:
+            page_token = kwargs.get("pageToken") or ""
+            ids, next_page_token = self.service.pages.get(page_token, ([], ""))
+            return FakeCall({
+                "messages": [{"id": key} for key in ids],
+                "nextPageToken": next_page_token,
+            })
+        if kwargs.get("pageToken"):
+            return FakeCall({"messages": []})
         return FakeCall({
             "messages": [{"id": key} for key in self.service.messages.keys()],
             "nextPageToken": "next-page",
@@ -61,8 +70,9 @@ class FakeUsers:
 
 
 class FakeGmailService:
-    def __init__(self, messages):
+    def __init__(self, messages, pages=None):
         self.messages = messages
+        self.pages = pages
         self.list_calls = []
         self.get_calls = []
         self.send_calls = []
@@ -190,6 +200,33 @@ def test_sync_email_populates_provider_cache_for_list_and_read(monkeypatch):
     assert listed["data"][0]["message_id"] == "msg-1"
     assert read["cache_source"] == "local_provider_cache"
     assert read["text_body"] == "Plain body"
+
+
+def test_sync_email_follows_gmail_pages_until_requested_limit(monkeypatch):
+    messages = {
+        "sent-1": _message("sent-1", labels=["SENT"]),
+        "sent-2": _message("sent-2", labels=["SENT"]),
+        "sent-3": _message("sent-3", labels=["SENT"]),
+        "sent-4": _message("sent-4", labels=["SENT"]),
+    }
+    fake = FakeGmailService(
+        messages,
+        pages={
+            "": (["sent-1", "sent-2"], "page-2"),
+            "page-2": (["sent-3"], "page-3"),
+            "page-3": (["sent-4"], ""),
+        },
+    )
+    monkeypatch.setattr(mail, "build_gmail_service", lambda account: fake)
+
+    sync = mail.sync_email({"label": "sent", "limit": 3})
+    listed = mail.list_emails({"label": "sent", "limit": 10})
+
+    assert sync["synced"] == 3
+    assert sync["next_page_token"] == "page-3"
+    assert [call["pageToken"] for call in fake.list_calls] == [None, "page-2"]
+    assert [call["maxResults"] for call in fake.list_calls] == [3, 1]
+    assert {row["message_id"] for row in listed["data"]} == {"sent-1", "sent-2", "sent-3"}
 
 
 def test_archive_reconciles_cached_inbox_view(monkeypatch):

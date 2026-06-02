@@ -918,6 +918,31 @@ class TestMailEndpoints:
             assert data["data"][0]["account_id"] == "gmail:user@example.com"
 
     @pytest.mark.asyncio
+    async def test_mail_search_forwards_selected_label(self, adapter, monkeypatch):
+        from tools import gmail_mail_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "search_emails"
+            assert args["query"] == "invoice"
+            assert args["label"] == "sent"
+            return {
+                "object": "list",
+                "provider": "gmail",
+                "data": [],
+                "label": "sent",
+                "query": "in:sent invoice",
+            }
+
+        monkeypatch.setattr(gmail_mail_tools, "dispatch_mail_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/search?q=invoice&label=sent&limit=10")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["label"] == "sent"
+
+    @pytest.mark.asyncio
     async def test_mail_send_requires_approval(self, adapter, monkeypatch, tmp_path):
         token_path = tmp_path / "google_token.json"
         token_path.write_text(json.dumps({"token": "tok"}))

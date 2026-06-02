@@ -2581,6 +2581,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             return auth_err
         args = {
             "account_id": request.query.get("account_id", ""),
+            "label": request.query.get("label", request.query.get("folder", "")),
             "query": request.query.get("q", request.query.get("query", "")),
             "limit": request.query.get("limit", ""),
             "page_token": request.query.get("page_token", ""),
