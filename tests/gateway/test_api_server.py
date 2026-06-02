@@ -572,6 +572,19 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/mail/messages/{message_id}/modify", adapter._handle_mail_modify)
     app.router.add_post("/v1/mail/messages/{message_id}/summary", adapter._handle_mail_summary)
     app.router.add_post("/v1/mail/messages/{message_id}/draft-reply", adapter._handle_mail_draft_reply)
+    app.router.add_post("/v1/calendar/oauth/start", adapter._handle_calendar_oauth_start)
+    app.router.add_get("/v1/calendar/oauth/status", adapter._handle_calendar_oauth_status)
+    app.router.add_get("/v1/calendar/accounts", adapter._handle_calendar_accounts)
+    app.router.add_get("/v1/calendar/calendars", adapter._handle_calendar_calendars)
+    app.router.add_post("/v1/calendar/sync", adapter._handle_calendar_sync)
+    app.router.add_get("/v1/calendar/events", adapter._handle_calendar_events)
+    app.router.add_post("/v1/calendar/events", adapter._handle_calendar_create)
+    app.router.add_get("/v1/calendar/search", adapter._handle_calendar_search)
+    app.router.add_post("/v1/calendar/events/bulk", adapter._handle_calendar_bulk)
+    app.router.add_get("/v1/calendar/events/{event_id}", adapter._handle_calendar_read)
+    app.router.add_patch("/v1/calendar/events/{event_id}", adapter._handle_calendar_update)
+    app.router.add_delete("/v1/calendar/events/{event_id}", adapter._handle_calendar_delete)
+    app.router.add_post("/v1/calendar/events/{event_id}/respond", adapter._handle_calendar_respond)
     app.router.add_post("/v1/complete/slash", adapter._handle_complete_slash)
     app.router.add_post("/v1/complete/skills", adapter._handle_complete_skills)
     app.router.add_post("/v1/slash", adapter._handle_slash)
@@ -1140,6 +1153,175 @@ class TestMailEndpoints:
             inbox_data = await inbox.json()
             assert inbox_data["cache_source"] == "local_provider_cache"
             assert inbox_data["data"] == []
+
+
+# ---------------------------------------------------------------------------
+# /v1/calendar endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestCalendarEndpoints:
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_google_calendar_tools(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["google_calendar_tools"] is True
+            assert data["endpoints"]["calendar_accounts"]["path"] == "/v1/calendar/accounts"
+            assert data["endpoints"]["calendar_sync"]["path"] == "/v1/calendar/sync"
+            assert data["endpoints"]["calendar_oauth_start"]["path"] == "/v1/calendar/oauth/start"
+            assert data["endpoints"]["calendar_oauth_status"]["path"] == "/v1/calendar/oauth/status"
+            assert data["endpoints"]["calendar_event_create"]["path"] == "/v1/calendar/events"
+
+    @pytest.mark.asyncio
+    async def test_calendar_oauth_start_returns_authorization_url(self, adapter, monkeypatch, tmp_path):
+        client_path = tmp_path / "google_client_secret.json"
+        pending_path = tmp_path / "pending.json"
+        client_path.write_text(json.dumps({"installed": {"client_id": "client-id"}}), encoding="utf-8")
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(client_path))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(pending_path))
+
+        from tools import gmail_oauth
+
+        class FakeFlow:
+            code_verifier = "verifier-1"
+
+            def authorization_url(self, **kwargs):
+                assert kwargs["access_type"] == "offline"
+                assert kwargs["prompt"] == "consent"
+                return "https://accounts.google.com/o/oauth2/v2/auth?state=state-1", "state-1"
+
+        monkeypatch.setattr(gmail_oauth, "_flow_from_client_secret", lambda **_kwargs: FakeFlow())
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/calendar/oauth/start")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "google_calendar.oauth_start"
+            assert data["provider"] == "google_calendar"
+            assert data["status"] == "pending"
+            assert data["authorization_url"].startswith("https://accounts.google.com/")
+
+    @pytest.mark.asyncio
+    async def test_calendar_oauth_status_reports_non_secret_missing_scope(
+        self,
+        adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        client_path = tmp_path / "google_client_secret.json"
+        token_path = tmp_path / "google_token.json"
+        client_path.write_text(json.dumps({"installed": {"client_id": "client-id"}}), encoding="utf-8")
+        token_path.write_text(
+            json.dumps({
+                "token": "access-token",
+                "refresh_token": "refresh-token",
+                "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(client_path))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "pending.json"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/calendar/oauth/status")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "google_calendar.oauth_status"
+            assert data["status"] == "missing_scopes"
+            assert data["connected"] is False
+            assert "refresh-token" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_calendar_events_forwards_range_filters(self, adapter, monkeypatch):
+        from tools import google_calendar_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "list_calendar_events"
+            assert args["calendar_id"] == "primary"
+            assert args["start"] == "2026-06-01T00:00:00Z"
+            assert args["end"] == "2026-06-10T00:00:00Z"
+            return {
+                "object": "list",
+                "provider": "google_calendar",
+                "calendar_id": "primary",
+                "data": [],
+            }
+
+        monkeypatch.setattr(google_calendar_tools, "dispatch_calendar_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/calendar/events?calendar_id=primary"
+                "&start=2026-06-01T00:00:00Z&end=2026-06-10T00:00:00Z"
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["provider"] == "google_calendar"
+
+    @pytest.mark.asyncio
+    async def test_calendar_sync_dispatches_tool(self, adapter, monkeypatch):
+        from tools import google_calendar_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "sync_calendar"
+            assert args["calendar_id"] == "primary"
+            return {
+                "object": "google_calendar.sync",
+                "provider": "google_calendar",
+                "account_id": "google_calendar:user@example.com",
+                "calendar_id": "primary",
+                "synced": 1,
+            }
+
+        monkeypatch.setattr(google_calendar_tools, "dispatch_calendar_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/calendar/sync", json={"calendar_id": "primary"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "google_calendar.sync"
+            assert data["synced"] == 1
+
+    @pytest.mark.asyncio
+    async def test_calendar_create_returns_approval_required_without_approved(
+        self,
+        adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        token_path = tmp_path / "google_token.json"
+        token_path.write_text(
+            json.dumps({
+                "token": "tok",
+                "scopes": ["https://www.googleapis.com/auth/calendar"],
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GOOGLE_CALENDAR_ACCOUNT_EMAILS", "user@example.com")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/calendar/events",
+                json={
+                    "calendar_id": "primary",
+                    "summary": "Planning",
+                    "start": "2026-06-02T10:00:00Z",
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "approval_required"
+            assert data["ok"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -2519,6 +2519,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "slash_execution": "full",
                 "gmail_mail_tools": True,
                 "session_attachment_upload": True,
+                "google_calendar_tools": True,
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -2567,6 +2568,19 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "mail_bulk": {"method": "POST", "path": "/v1/mail/messages/bulk"},
                 "mail_summary": {"method": "POST", "path": "/v1/mail/messages/{message_id}/summary"},
                 "mail_draft_reply": {"method": "POST", "path": "/v1/mail/messages/{message_id}/draft-reply"},
+                "calendar_oauth_start": {"method": "POST", "path": "/v1/calendar/oauth/start"},
+                "calendar_oauth_status": {"method": "GET", "path": "/v1/calendar/oauth/status"},
+                "calendar_accounts": {"method": "GET", "path": "/v1/calendar/accounts"},
+                "calendar_calendars": {"method": "GET", "path": "/v1/calendar/calendars"},
+                "calendar_sync": {"method": "POST", "path": "/v1/calendar/sync"},
+                "calendar_events": {"method": "GET", "path": "/v1/calendar/events"},
+                "calendar_search": {"method": "GET", "path": "/v1/calendar/search"},
+                "calendar_event": {"method": "GET", "path": "/v1/calendar/events/{event_id}"},
+                "calendar_event_create": {"method": "POST", "path": "/v1/calendar/events"},
+                "calendar_event_update": {"method": "PATCH", "path": "/v1/calendar/events/{event_id}"},
+                "calendar_event_delete": {"method": "DELETE", "path": "/v1/calendar/events/{event_id}"},
+                "calendar_event_respond": {"method": "POST", "path": "/v1/calendar/events/{event_id}/respond"},
+                "calendar_bulk": {"method": "POST", "path": "/v1/calendar/events/bulk"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -2863,6 +2877,198 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc)), status=400)
         body["message_id"] = request.match_info.get("message_id", "")
         return await self._mail_json_response("draft_email_reply", body)
+
+    async def _calendar_json_response(self, tool_name: str, args: Dict[str, Any]) -> "web.Response":
+        try:
+            from tools.google_calendar_tools import CalendarError, dispatch_calendar_tool
+
+            return web.json_response(dispatch_calendar_tool(tool_name, args))
+        except ImportError as exc:
+            logger.exception("Calendar tool import failed")
+            return web.json_response(
+                _openai_error(f"Calendar tools unavailable: {exc}", err_type="server_error"),
+                status=500,
+            )
+        except CalendarError as exc:
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            return web.json_response(_openai_error(message), status=400)
+        except Exception as exc:
+            logger.exception("Calendar tool %s failed", tool_name)
+            return web.json_response(
+                _openai_error(f"Calendar tool failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.google_calendar_oauth import calendar_oauth_status
+
+            return web.json_response(calendar_oauth_status())
+        except Exception as exc:
+            logger.exception("Google Calendar OAuth status failed")
+            return web.json_response(
+                _openai_error(f"Google Calendar OAuth status failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError
+            from tools.google_calendar_oauth import start_calendar_oauth
+
+            redirect_uri = self._mail_oauth_callback_url(request)
+            return web.json_response(start_calendar_oauth(redirect_uri))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "google_calendar.oauth_start",
+                    "provider": "google_calendar",
+                    "status": exc.status,
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:
+            logger.exception("Google Calendar OAuth start failed")
+            return web.json_response(
+                _openai_error(f"Google Calendar OAuth start failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("list_calendar_accounts", {})
+
+    async def _handle_calendar_calendars(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "refresh": request.query.get("refresh", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("list_calendars", args)
+
+    async def _handle_calendar_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("sync_calendar", body)
+
+    async def _handle_calendar_events(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "start": request.query.get("start", request.query.get("time_min", "")),
+            "end": request.query.get("end", request.query.get("time_max", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+            "include_deleted": request.query.get("include_deleted", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("list_calendar_events", args)
+
+    async def _handle_calendar_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "query": request.query.get("q", request.query.get("query", "")),
+            "start": request.query.get("start", request.query.get("time_min", "")),
+            "end": request.query.get("end", request.query.get("time_max", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+            "include_deleted": request.query.get("include_deleted", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("search_calendar_events", args)
+
+    async def _handle_calendar_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "event_id": request.match_info.get("event_id", ""),
+            "occurrence_id": request.query.get("occurrence_id", ""),
+        }
+        return await self._calendar_json_response("read_calendar_event", args)
+
+    async def _handle_calendar_create(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("create_calendar_event", body)
+
+    async def _handle_calendar_update(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("update_calendar_event", body)
+
+    async def _handle_calendar_delete(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("delete_calendar_event", body)
+
+    async def _handle_calendar_respond(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("respond_to_calendar_event", body)
+
+    async def _handle_calendar_bulk(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("bulk_calendar_events", body)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -8374,6 +8580,19 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_post("/v1/mail/messages/{message_id}/modify", self._handle_mail_modify)
             self._app.router.add_post("/v1/mail/messages/{message_id}/summary", self._handle_mail_summary)
             self._app.router.add_post("/v1/mail/messages/{message_id}/draft-reply", self._handle_mail_draft_reply)
+            self._app.router.add_post("/v1/calendar/oauth/start", self._handle_calendar_oauth_start)
+            self._app.router.add_get("/v1/calendar/oauth/status", self._handle_calendar_oauth_status)
+            self._app.router.add_get("/v1/calendar/accounts", self._handle_calendar_accounts)
+            self._app.router.add_get("/v1/calendar/calendars", self._handle_calendar_calendars)
+            self._app.router.add_post("/v1/calendar/sync", self._handle_calendar_sync)
+            self._app.router.add_get("/v1/calendar/events", self._handle_calendar_events)
+            self._app.router.add_post("/v1/calendar/events", self._handle_calendar_create)
+            self._app.router.add_get("/v1/calendar/search", self._handle_calendar_search)
+            self._app.router.add_post("/v1/calendar/events/bulk", self._handle_calendar_bulk)
+            self._app.router.add_get("/v1/calendar/events/{event_id}", self._handle_calendar_read)
+            self._app.router.add_patch("/v1/calendar/events/{event_id}", self._handle_calendar_update)
+            self._app.router.add_delete("/v1/calendar/events/{event_id}", self._handle_calendar_delete)
+            self._app.router.add_post("/v1/calendar/events/{event_id}/respond", self._handle_calendar_respond)
             self._app.router.add_post("/v1/complete/slash", self._handle_complete_slash)
             self._app.router.add_post("/v1/complete/skills", self._handle_complete_skills)
             self._app.router.add_post("/v1/slash", self._handle_slash)
