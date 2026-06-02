@@ -955,9 +955,11 @@ class TestMailEndpoints:
                 "/v1/mail/send",
                 json={"to": ["to@example.com"], "subject": "Hi", "body": "Body"},
             )
-            assert resp.status == 400
+            assert resp.status == 200
             data = await resp.json()
-            assert "requires explicit approval" in data["error"]["message"]
+            assert data["status"] == "approval_required"
+            assert data["ok"] is False
+            assert "requires explicit approval" in data["message"]
 
     @pytest.mark.asyncio
     async def test_mail_sync_dispatches_tool(self, adapter, monkeypatch):
@@ -1125,9 +1127,11 @@ class TestMailEndpoints:
 
             archived = await cli.post(
                 "/v1/mail/messages/msg-1/modify",
-                json={"operation": "archive"},
+                json={"operation": "archive", "approved": True},
             )
             assert archived.status == 200
+            archived_data = await archived.json()
+            assert archived_data["status"] == "modified"
             inbox = await cli.get("/v1/mail/messages?label=inbox&limit=10")
             inbox_data = await inbox.json()
             assert inbox_data["cache_source"] == "local_provider_cache"
