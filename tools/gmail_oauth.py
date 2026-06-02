@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from hermes_constants import display_hermes_home, get_hermes_home
 from utils import atomic_json_write
@@ -178,15 +178,23 @@ def _flow_from_client_secret(*, scopes: list[str], redirect_uri: str, **kwargs: 
     )
 
 
-def start_gmail_oauth(redirect_uri: str) -> Dict[str, Any]:
+def start_gmail_oauth(
+    redirect_uri: str,
+    *,
+    scopes: Optional[Sequence[str]] = None,
+    provider: str = "gmail",
+    object_name: str = "gmail.oauth_start",
+    message: str = "Open the authorization_url to connect Gmail.",
+) -> Dict[str, Any]:
     if not _client_secret_available():
         raise GmailOAuthError(
             "Hermes has no Gmail OAuth client configuration for this profile.",
             status="configuration_needed",
         )
 
+    requested_scopes = list(scopes or GMAIL_SCOPES)
     flow = _flow_from_client_secret(
-        scopes=list(GMAIL_SCOPES),
+        scopes=requested_scopes,
         redirect_uri=redirect_uri,
         autogenerate_code_verifier=True,
     )
@@ -201,16 +209,17 @@ def start_gmail_oauth(redirect_uri: str) -> Dict[str, Any]:
             "state": state,
             "code_verifier": code_verifier,
             "redirect_uri": redirect_uri,
+            "requested_scopes": requested_scopes,
             "created_at": time.time(),
         },
     )
     return {
-        "object": "gmail.oauth_start",
-        "provider": "gmail",
+        "object": object_name,
+        "provider": provider,
         "status": "pending",
         "authorization_url": auth_url,
         "redirect_uri": redirect_uri,
-        "message": "Open the authorization_url to connect Gmail.",
+        "message": message,
     }
 
 

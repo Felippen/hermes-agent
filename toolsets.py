@@ -62,6 +62,11 @@ _HERMES_CORE_TOOLS = [
     "list_email_accounts", "list_emails", "search_emails", "read_email",
     "send_email", "reply_to_email", "archive_email", "delete_email",
     "mark_email_read", "bulk_email", "summarize_email", "draft_email_reply",
+    # Google Calendar tools (gated on profile-scoped Google Calendar OAuth scope)
+    "list_calendar_accounts", "list_calendars", "sync_calendar",
+    "list_calendar_events", "search_calendar_events", "read_calendar_event",
+    "create_calendar_event", "update_calendar_event", "delete_calendar_event",
+    "respond_to_calendar_event", "bulk_calendar_events",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -207,6 +212,17 @@ TOOLSETS = {
             "list_email_accounts", "list_emails", "search_emails", "read_email",
             "send_email", "reply_to_email", "archive_email", "delete_email",
             "mark_email_read", "bulk_email", "summarize_email", "draft_email_reply",
+        ],
+        "includes": []
+    },
+
+    "google_calendar": {
+        "description": "Google Calendar tools for calendars, event sync, event reads, and approved mutations",
+        "tools": [
+            "list_calendar_accounts", "list_calendars", "sync_calendar",
+            "list_calendar_events", "search_calendar_events", "read_calendar_event",
+            "create_calendar_event", "update_calendar_event", "delete_calendar_event",
+            "respond_to_calendar_event", "bulk_calendar_events",
         ],
         "includes": []
     },
