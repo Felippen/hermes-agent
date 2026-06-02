@@ -4261,20 +4261,53 @@ def _derive_task_status(task: Dict[str, Any], *, bridge: Any, event_store: Any =
     ):
         summary = event_summary
     contract_fields = output_contract_fields_from_event(latest_event)
-    if not contract_fields.get("output_contract_status"):
+    contract_status = str(contract_fields.get("output_contract_status") or "").lower()
+    should_reparse_contract = (
+        not contract_status
+        or (
+            contract_status == "warning"
+            and not contract_fields.get("structured_summary")
+        )
+    )
+    if should_reparse_contract:
+        transcript_tail = ""
+        if session is not None:
+            try:
+                transcript_tail = bridge.capture_output(runtime, session, lines=160) or ""
+            except Exception:
+                transcript_tail = ""
         contract_text = "\n".join(
             str(part or "")
             for part in (
                 summary,
                 event_summary,
                 (latest_event or {}).get("output_tail"),
+                transcript_tail,
             )
         )
-        contract_fields = parse_worker_output_contract(contract_text)
-        marker = contract_fields.get("final_marker")
-        contract_fields["output_contract_score"] = worker_output_contract_score(contract_fields, required_marker=marker)
+        reparsed_contract_fields = parse_worker_output_contract(contract_text)
+        marker = reparsed_contract_fields.get("final_marker")
+        reparsed_contract_fields["output_contract_score"] = worker_output_contract_score(reparsed_contract_fields, required_marker=marker)
+        if (
+            not contract_status
+            or reparsed_contract_fields.get("structured_summary")
+            or reparsed_contract_fields.get("files_read")
+            or reparsed_contract_fields.get("verification_evidence")
+        ):
+            contract_fields = reparsed_contract_fields
     if contract_fields.get("structured_summary"):
         summary = contract_fields["structured_summary"]
+    evidence_implied_status = _status_from_openhands_contract_evidence(
+        runtime=runtime,
+        current_status=task_status,
+        contract_fields=contract_fields,
+    )
+    if evidence_implied_status == "failed":
+        task_status = "failed"
+        reason = "OpenHands emitted failed verification evidence."
+    elif evidence_implied_status == "completed":
+        task_status = "completed"
+        reason = "OpenHands emitted terminal structured evidence."
     summary_for_warning = summary
     if contract_fields.get("final_marker"):
         summary_for_warning = f"{summary or ''}\n{contract_fields['final_marker']}"
@@ -4428,15 +4461,30 @@ def _sync_completion_from_transcript(
     except Exception:
         return None
     marker_complete = bool(markers) and all(marker in transcript for marker in markers)
-    transcript_complete = marker_complete or _transcript_has_terminal_answer(transcript)
+    contract_fields = parse_worker_output_contract(transcript)
+    marker = contract_fields.get("final_marker") or (markers[0] if len(markers) == 1 else None)
+    contract_fields["output_contract_score"] = worker_output_contract_score(contract_fields, required_marker=marker)
+    contract_implied_status = _status_from_openhands_contract_evidence(
+        runtime=runtime,
+        current_status="running",
+        contract_fields=contract_fields,
+    )
+    transcript_complete = (
+        marker_complete
+        or _transcript_has_terminal_answer(transcript)
+        or contract_implied_status in {"completed", "failed"}
+    )
     if not transcript_complete:
         return None
 
-    summary = (
-        _extract_completion_summary(transcript, markers)
-        if marker_complete
-        else _extract_terminal_transcript_summary(transcript)
-    )
+    if contract_implied_status in {"completed", "failed"} and contract_fields.get("structured_summary"):
+        summary = str(contract_fields["structured_summary"])
+    else:
+        summary = (
+            _extract_completion_summary(transcript, markers)
+            if marker_complete
+            else _extract_terminal_transcript_summary(transcript)
+        )
     if not summary:
         return None
     existing_summary = _first_non_empty(
@@ -4454,6 +4502,7 @@ def _sync_completion_from_transcript(
         payload.update(session.event_fields())
     except Exception:
         pass
+    terminal_status = "failed" if contract_implied_status == "failed" else "completed"
     payload.update({
         "event": "subagent.complete",
         "subagent_id": payload.get("subagent_id") or f"{runtime or DEFAULT_RUNTIME}:{task.get('ao_session_id')}",
@@ -4461,12 +4510,14 @@ def _sync_completion_from_transcript(
         "runtime_session_id": task.get("ao_session_id"),
         "runtime_project_id": payload.get("runtime_project_id") or task.get("project_id"),
         "goal": task.get("goal") or payload.get("goal"),
-        "status": "completed",
+        "status": terminal_status,
         "summary": summary,
         "message": summary,
         "preview": summary,
         "transcript_corrected": marker_complete,
-        "transcript_inferred_completion": not marker_complete,
+        "transcript_inferred_completion": not marker_complete and contract_implied_status != "failed",
+        "contract_inferred_completion": contract_implied_status == "completed",
+        "contract_inferred_failure": contract_implied_status == "failed",
         "tool": payload.get("tool") or "dev_execution_plan_status",
         "tool_name": payload.get("tool_name") or "dev_execution_plan_status",
         "launch_profile_id": payload.get("launch_profile_id") or task.get("profile_id"),
@@ -4476,9 +4527,6 @@ def _sync_completion_from_transcript(
         "acceptance_criteria": payload.get("acceptance_criteria") or task.get("acceptance_criteria") or [],
         "timestamp": time.time(),
     })
-    contract_fields = parse_worker_output_contract(transcript)
-    marker = contract_fields.get("final_marker") or (markers[0] if len(markers) == 1 else None)
-    contract_fields["output_contract_score"] = worker_output_contract_score(contract_fields, required_marker=marker)
     payload.update(contract_fields)
     if (runtime or DEFAULT_RUNTIME) in {DEFAULT_RUNTIME, "fixture"}:
         payload["ao_session_id"] = task.get("ao_session_id")
@@ -4593,6 +4641,10 @@ def _status_from_session_or_event(session: Any, latest_event: Optional[Dict[str,
         return "failed", runtime_health.get("runtime_warning") or "Worker runtime is stale."
 
     event_status = str((latest_event or {}).get("status") or "").lower()
+    if (latest_event or {}).get("contract_inferred_failure"):
+        return "failed", "OpenHands emitted failed verification evidence."
+    if (latest_event or {}).get("contract_inferred_completion"):
+        return "completed", "OpenHands emitted terminal structured evidence."
     if event_status in TASK_COMPLETED_STATUSES:
         return "completed", "Worker session completed."
     if event_status in TASK_FAILED_STATUSES:
@@ -4614,6 +4666,45 @@ def _status_from_session_or_event(session: Any, latest_event: Optional[Dict[str,
     if session is None:
         return "failed", "Worker session metadata is unavailable."
     return "running", "Worker session has been launched."
+
+
+def _status_from_openhands_contract_evidence(
+    *,
+    runtime: Optional[str],
+    current_status: str,
+    contract_fields: Dict[str, Any],
+) -> Optional[str]:
+    if normalize_runtime(runtime) != "openhands":
+        return None
+    if str(current_status or "").lower() not in {"running", "launched", "failed"}:
+        return None
+
+    verification_status = str(contract_fields.get("verification_status") or "").strip().lower()
+    contract_status = str(contract_fields.get("output_contract_status") or "").strip().lower()
+    if verification_status == "failed" or contract_status == "failed":
+        return "failed"
+
+    summary = str(contract_fields.get("structured_summary") or "").strip()
+    if not summary:
+        return None
+
+    try:
+        score = float(contract_fields.get("output_contract_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score < 0.75:
+        return None
+
+    tangible_evidence = (
+        contract_fields.get("files_read")
+        or contract_fields.get("files_changed")
+        or contract_fields.get("commands_run")
+        or contract_fields.get("verification_evidence")
+        or contract_fields.get("findings")
+    )
+    if not tangible_evidence:
+        return None
+    return "completed"
 
 
 def _rollup_plan_status(tasks: list[Dict[str, Any]]) -> str:
