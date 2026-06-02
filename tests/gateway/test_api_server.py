@@ -558,6 +558,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/mail/messages", adapter._handle_mail_messages)
     app.router.add_get("/v1/mail/search", adapter._handle_mail_search)
     app.router.add_post("/v1/mail/sync", adapter._handle_mail_sync)
+    app.router.add_post("/v1/mail/oauth/start", adapter._handle_mail_oauth_start)
+    app.router.add_get("/v1/mail/oauth/callback", adapter._handle_mail_oauth_callback)
+    app.router.add_get("/v1/mail/oauth/status", adapter._handle_mail_oauth_status)
     app.router.add_post("/v1/mail/send", adapter._handle_mail_send)
     app.router.add_post("/v1/mail/messages/bulk", adapter._handle_mail_bulk)
     app.router.add_get("/v1/mail/messages/{message_id}", adapter._handle_mail_read)
@@ -895,6 +898,8 @@ class TestMailEndpoints:
             assert data["features"]["gmail_mail_tools"] is True
             assert data["endpoints"]["mail_accounts"]["path"] == "/v1/mail/accounts"
             assert data["endpoints"]["mail_sync"]["path"] == "/v1/mail/sync"
+            assert data["endpoints"]["mail_oauth_start"]["path"] == "/v1/mail/oauth/start"
+            assert data["endpoints"]["mail_oauth_status"]["path"] == "/v1/mail/oauth/status"
             assert data["endpoints"]["mail_send"]["path"] == "/v1/mail/send"
 
     @pytest.mark.asyncio
@@ -955,6 +960,62 @@ class TestMailEndpoints:
             data = await resp.json()
             assert data["object"] == "gmail.sync"
             assert data["synced"] == 1
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_status_reports_non_secret_state(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(tmp_path / "missing-client.json"))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "missing-token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "missing-pending.json"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/oauth/status")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "gmail.oauth_status"
+            assert data["status"] == "configuration_needed"
+            assert data["connected"] is False
+            assert "refresh_token" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_start_returns_configuration_needed_without_client(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(tmp_path / "missing-client.json"))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "missing-token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "missing-pending.json"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/oauth/start")
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["object"] == "gmail.oauth_start"
+            assert data["status"] == "configuration_needed"
+            assert data["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_callback_does_not_require_api_key(self, auth_adapter, monkeypatch):
+        from tools import gmail_oauth
+
+        def fake_complete_gmail_oauth_callback(**kwargs):
+            assert kwargs["code"] == "code-1"
+            assert kwargs["state"] == "state-1"
+            return {
+                "object": "gmail.oauth_callback",
+                "provider": "gmail",
+                "status": "connected",
+                "connected": True,
+                "missing_scopes": [],
+                "message": "Gmail is connected.",
+            }
+
+        monkeypatch.setattr(gmail_oauth, "complete_gmail_oauth_callback", fake_complete_gmail_oauth_callback)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/oauth/callback?code=code-1&state=state-1")
+            text = await resp.text()
+            assert resp.status == 200
+            assert "Gmail connected" in text
 
     @pytest.mark.asyncio
     async def test_mail_api_uses_cache_after_sync_and_archive(

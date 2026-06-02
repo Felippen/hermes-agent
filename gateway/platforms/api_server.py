@@ -37,6 +37,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+from html import escape as html_escape
 import inspect
 import json
 import logging
@@ -2488,6 +2489,9 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "mail_messages": {"method": "GET", "path": "/v1/mail/messages"},
                 "mail_search": {"method": "GET", "path": "/v1/mail/search"},
                 "mail_sync": {"method": "POST", "path": "/v1/mail/sync"},
+                "mail_oauth_start": {"method": "POST", "path": "/v1/mail/oauth/start"},
+                "mail_oauth_callback": {"method": "GET", "path": "/v1/mail/oauth/callback"},
+                "mail_oauth_status": {"method": "GET", "path": "/v1/mail/oauth/status"},
                 "mail_message": {"method": "GET", "path": "/v1/mail/messages/{message_id}"},
                 "mail_send": {"method": "POST", "path": "/v1/mail/send"},
                 "mail_reply": {"method": "POST", "path": "/v1/mail/messages/{message_id}/reply"},
@@ -2592,6 +2596,98 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         return await self._mail_json_response("sync_email", body)
+
+    async def _handle_mail_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError, start_gmail_oauth
+
+            redirect_uri = f"{request.scheme}://{request.host}/v1/mail/oauth/callback"
+            return web.json_response(start_gmail_oauth(redirect_uri))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "gmail.oauth_start",
+                    "provider": "gmail",
+                    "status": exc.status,
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:
+            logger.exception("Gmail OAuth start failed")
+            return web.json_response(
+                _openai_error(f"Gmail OAuth start failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_mail_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import gmail_oauth_status
+
+            return web.json_response(gmail_oauth_status())
+        except Exception as exc:
+            logger.exception("Gmail OAuth status failed")
+            return web.json_response(
+                _openai_error(f"Gmail OAuth status failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_mail_oauth_callback(self, request: "web.Request") -> "web.Response":
+        try:
+            from tools.gmail_oauth import GmailOAuthError, complete_gmail_oauth_callback
+
+            result = complete_gmail_oauth_callback(
+                code=request.query.get("code"),
+                state=request.query.get("state"),
+                granted_scope=request.query.get("scope"),
+                error=request.query.get("error"),
+            )
+            title = "Gmail connected"
+            detail = "You can return to Oryn Workspace."
+            status = 200
+        except GmailOAuthError as exc:
+            result = {
+                "object": "gmail.oauth_callback",
+                "provider": "gmail",
+                "status": exc.status,
+                "connected": False,
+                "message": str(exc),
+            }
+            title = "Gmail connection failed"
+            detail = str(exc)
+            status = 400
+        except Exception as exc:
+            logger.exception("Gmail OAuth callback failed")
+            result = {
+                "object": "gmail.oauth_callback",
+                "provider": "gmail",
+                "status": "failed",
+                "connected": False,
+                "message": f"Gmail OAuth callback failed: {exc}",
+            }
+            title = "Gmail connection failed"
+            detail = "Hermes could not finish Gmail connection."
+            status = 500
+
+        html = (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>{html_escape(title)}</title>"
+            "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
+            "padding:48px;line-height:1.45;color:#111}main{max-width:560px}</style>"
+            "</head><body><main>"
+            f"<h1>{html_escape(title)}</h1>"
+            f"<p>{html_escape(detail)}</p>"
+            "<script>window.setTimeout(function(){window.close()},1200)</script>"
+            "</main></body></html>"
+        )
+        return web.Response(text=html, status=status, content_type="text/html")
 
     async def _handle_mail_read(self, request: "web.Request") -> "web.Response":
         auth_err = self._check_auth(request)
@@ -8174,6 +8270,9 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_get("/v1/mail/messages", self._handle_mail_messages)
             self._app.router.add_get("/v1/mail/search", self._handle_mail_search)
             self._app.router.add_post("/v1/mail/sync", self._handle_mail_sync)
+            self._app.router.add_post("/v1/mail/oauth/start", self._handle_mail_oauth_start)
+            self._app.router.add_get("/v1/mail/oauth/callback", self._handle_mail_oauth_callback)
+            self._app.router.add_get("/v1/mail/oauth/status", self._handle_mail_oauth_status)
             self._app.router.add_post("/v1/mail/send", self._handle_mail_send)
             self._app.router.add_post("/v1/mail/messages/bulk", self._handle_mail_bulk)
             self._app.router.add_get("/v1/mail/messages/{message_id}", self._handle_mail_read)
