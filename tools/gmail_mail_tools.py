@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from hermes_constants import get_hermes_home
+from tools.gmail_mail_store import GmailMailCache
 from tools.registry import registry
 
 
@@ -31,6 +32,9 @@ SCOPES = [
 
 LIST_CACHE_TTL_SECONDS = 30.0
 READ_CACHE_TTL_SECONDS = 300.0
+MAIL_LIST_LIMIT_MAX = 100
+MAIL_SYNC_LIMIT_MAX = 500
+GMAIL_LIST_PAGE_SIZE_MAX = 500
 MAIL_TOOLSET = "gmail_mail"
 
 NORMALIZED_VIEW_TO_GMAIL_QUERY = {
@@ -79,6 +83,10 @@ class TTLCache:
 
 _list_cache = TTLCache(LIST_CACHE_TTL_SECONDS)
 _read_cache = TTLCache(READ_CACHE_TTL_SECONDS)
+
+
+def _mail_cache() -> GmailMailCache:
+    return GmailMailCache()
 
 
 @dataclass(frozen=True)
@@ -199,7 +207,19 @@ def build_gmail_service(account: GmailAccount):
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
     except ImportError as exc:
-        raise MailError("Google API dependencies are not installed") from exc
+        try:
+            from tools.lazy_deps import FeatureUnavailable, ensure
+
+            ensure("skill.google_workspace", prompt=False)
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+        except FeatureUnavailable as lazy_exc:
+            raise MailError(f"Google API dependencies are not available: {lazy_exc}") from lazy_exc
+        except ImportError as retry_exc:
+            raise MailError("Google API dependencies are not installed") from retry_exc
+        except Exception as install_exc:
+            raise MailError(f"Google API dependencies could not be prepared: {install_exc}") from install_exc
 
     token_path = Path(account.token_path)
     if not token_path.exists():
@@ -330,7 +350,12 @@ def _view_query(label: Optional[str], query: str = "") -> str:
 
 
 def list_email_accounts(args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    accounts = [account.to_dict() for account in load_gmail_accounts()]
+    cache = _mail_cache()
+    accounts = []
+    for account in load_gmail_accounts():
+        data = account.to_dict()
+        data["cache"] = cache.sync_status(account.account_id)
+        accounts.append(data)
     return {
         "object": "list",
         "provider": "gmail",
@@ -341,7 +366,7 @@ def list_email_accounts(args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
     account = _resolve_account(args.get("account_id"))
-    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), 100))
+    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), MAIL_LIST_LIMIT_MAX))
     page_token = str(args.get("page_token") or "")
     label = str(
         args.get("label") or args.get("folder") or ("inbox" if not search else "")
@@ -361,6 +386,48 @@ def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
     cached = _list_cache.get(cache_key)
     if cached is not None:
         return {**cached, "cache": "hit"}
+
+    cache = _mail_cache()
+    if search:
+        rows, next_page_token = cache.search_messages(
+            account_id=account.account_id,
+            query=query,
+            label=label,
+            limit=limit,
+            page_token=page_token,
+        )
+        cache_ready = bool(rows) or cache.has_sync_state(
+            account.account_id,
+            label=label,
+            query=gmail_query,
+        )
+    else:
+        rows, next_page_token = cache.list_messages(
+            account_id=account.account_id,
+            label=label,
+            limit=limit,
+            page_token=page_token,
+        )
+        cache_ready = bool(rows) or cache.has_sync_state(
+            account.account_id,
+            label=label,
+            query=gmail_query,
+        )
+    if cache_ready:
+        payload = {
+            "object": "list",
+            "provider": "gmail",
+            "account_id": account.account_id,
+            "label": label,
+            "query": gmail_query,
+            "data": rows,
+            "next_page_token": next_page_token,
+            "cache": "local_provider_cache",
+            "cache_source": "local_provider_cache",
+            "cache_status": cache.sync_status(account.account_id, label=label, query=gmail_query),
+        }
+        _list_cache.set(cache_key, payload)
+        return payload
 
     service = build_gmail_service(account)
     list_call = (
@@ -391,7 +458,21 @@ def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
                 metadataHeaders=["From", "To", "Cc", "Subject", "Date"],
             )
         )
-        rows.append(_message_row(msg))
+        row = _message_row(msg)
+        rows.append(row)
+        cache.upsert_message(
+            account_id=account.account_id,
+            email=account.email,
+            message=row,
+        )
+    cache.record_sync(
+        account_id=account.account_id,
+        email=account.email,
+        label=label,
+        query=gmail_query,
+        limit=limit,
+        count=len(rows),
+    )
 
     payload = {
         "object": "list",
@@ -402,6 +483,8 @@ def _list_or_search(args: Dict[str, Any], *, search: bool) -> Dict[str, Any]:
         "data": rows,
         "next_page_token": results.get("nextPageToken", ""),
         "cache": "miss",
+        "cache_source": "gmail_api",
+        "cache_status": cache.sync_status(account.account_id, label=label, query=gmail_query),
     }
     _list_cache.set(cache_key, payload)
     return payload
@@ -415,6 +498,87 @@ def search_emails(args: Dict[str, Any]) -> Dict[str, Any]:
     return _list_or_search(args, search=True)
 
 
+def sync_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    account = _resolve_account(args.get("account_id"))
+    limit = max(1, min(int(args.get("limit") or args.get("max_results") or 25), MAIL_SYNC_LIMIT_MAX))
+    page_token = str(args.get("page_token") or "")
+    label = str(args.get("label") or args.get("folder") or "inbox")
+    query = str(args.get("query") or "")
+    gmail_query = _view_query(label, query)
+    service = build_gmail_service(account)
+    cache = _mail_cache()
+    synced_at = time.time()
+    synced = 0
+    remaining = limit
+    next_page_token = page_token
+    while remaining > 0:
+        results = _execute(
+            service
+            .users()
+            .messages()
+            .list(
+                userId="me",
+                q=gmail_query,
+                maxResults=min(remaining, GMAIL_LIST_PAGE_SIZE_MAX),
+                pageToken=next_page_token or None,
+            )
+        )
+        messages = results.get("messages", []) or []
+        for meta in messages:
+            if remaining <= 0:
+                break
+            message_id = meta.get("id")
+            if not message_id:
+                continue
+            msg = _execute(
+                service
+                .users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full",
+                )
+            )
+            cache.upsert_message(
+                account_id=account.account_id,
+                email=account.email,
+                message=_message_full(msg),
+                synced_at=synced_at,
+            )
+            synced += 1
+            remaining -= 1
+        next_page_token = str(results.get("nextPageToken") or "")
+        if not next_page_token or not messages:
+            break
+    cache.record_sync(
+        account_id=account.account_id,
+        email=account.email,
+        label=label,
+        query=gmail_query,
+        limit=limit,
+        count=synced,
+        synced_at=synced_at,
+    )
+    _list_cache.clear()
+    _read_cache.clear()
+    return {
+        "object": "gmail.sync",
+        "provider": "gmail",
+        "account_id": account.account_id,
+        "email": account.email,
+        "label": label,
+        "query": gmail_query,
+        "synced": synced,
+        "updated": synced,
+        "next_page_token": next_page_token,
+        "cache": "updated",
+        "cache_source": "gmail_api",
+        "synced_at": synced_at,
+        "cache_status": cache.sync_status(account.account_id, label=label, query=gmail_query),
+    }
+
+
 def read_email(args: Dict[str, Any]) -> Dict[str, Any]:
     account = _resolve_account(args.get("account_id"))
     message_id = str(args.get("message_id") or args.get("uid") or "")
@@ -424,6 +588,22 @@ def read_email(args: Dict[str, Any]) -> Dict[str, Any]:
     cached = _read_cache.get(cache_key)
     if cached is not None:
         return {**cached, "cache": "hit"}
+    cache = _mail_cache()
+    local = cache.get_message(account_id=account.account_id, message_id=message_id)
+    if local and (
+        local.get("text_body") or local.get("html_body") or local.get("attachments")
+    ):
+        payload = {
+            "object": "gmail.message",
+            "provider": "gmail",
+            "account_id": account.account_id,
+            **local,
+            "cache": "local_provider_cache",
+            "cache_source": "local_provider_cache",
+            "cache_status": cache.sync_status(account.account_id),
+        }
+        _read_cache.set(cache_key, payload)
+        return payload
     service = build_gmail_service(account)
     msg = _execute(
         service
@@ -441,7 +621,14 @@ def read_email(args: Dict[str, Any]) -> Dict[str, Any]:
         "account_id": account.account_id,
         **_message_full(msg),
         "cache": "miss",
+        "cache_source": "gmail_api",
     }
+    cache.upsert_message(
+        account_id=account.account_id,
+        email=account.email,
+        message=payload,
+    )
+    payload["cache_status"] = cache.sync_status(account.account_id)
     _read_cache.set(cache_key, payload)
     return payload
 
@@ -604,16 +791,24 @@ def _modify_message(
     )
     _read_cache.clear()
     _list_cache.clear()
+    result_id = result.get("id", message_id)
+    _mail_cache().apply_label_delta(
+        account_id=account.account_id,
+        message_id=result_id,
+        add_labels=add_labels or [],
+        remove_labels=remove_labels or [],
+    )
     return {
         "status": "modified",
         "provider": "gmail",
         "account_id": account.account_id,
-        "message_id": result.get("id", message_id),
+        "message_id": result_id,
         "labels": result.get("labelIds", []),
     }
 
 
 def archive_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    _require_approval(args, "archive_email")
     return _modify_message(args, remove_labels=["INBOX"])
 
 
@@ -627,11 +822,13 @@ def delete_email(args: Dict[str, Any]) -> Dict[str, Any]:
     result = _execute(service.users().messages().trash(userId="me", id=message_id))
     _read_cache.clear()
     _list_cache.clear()
+    result_id = result.get("id", message_id)
+    _mail_cache().mark_trashed(account_id=account.account_id, message_id=result_id)
     return {
         "status": "trashed",
         "provider": "gmail",
         "account_id": account.account_id,
-        "message_id": result.get("id", message_id),
+        "message_id": result_id,
         "labels": result.get("labelIds", []),
     }
 
@@ -763,6 +960,7 @@ _HANDLERS = {
     "list_email_accounts": list_email_accounts,
     "list_emails": list_emails,
     "search_emails": search_emails,
+    "sync_email": sync_email,
     "read_email": read_email,
     "send_email": send_email,
     "reply_to_email": reply_to_email,
@@ -865,6 +1063,29 @@ registry.register(
         ["query"],
     ),
     handler=_json_tool("search_emails"),
+    check_fn=gmail_mail_available,
+)
+registry.register(
+    name="sync_email",
+    toolset=MAIL_TOOLSET,
+    schema=_schema(
+        "sync_email",
+        "Sync a bounded Gmail mailbox/search into the local provider cache.",
+        {
+            **_COMMON,
+            "label": {
+                "type": "string",
+                "description": "Mailbox view to sync; defaults to inbox.",
+            },
+            "query": {"type": "string"},
+            "limit": {
+                "type": "integer",
+                "description": "Maximum messages to sync, 1-500.",
+            },
+            "page_token": {"type": "string"},
+        },
+    ),
+    handler=_json_tool("sync_email"),
     check_fn=gmail_mail_available,
 )
 registry.register(

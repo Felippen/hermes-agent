@@ -557,6 +557,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/mail/accounts", adapter._handle_mail_accounts)
     app.router.add_get("/v1/mail/messages", adapter._handle_mail_messages)
     app.router.add_get("/v1/mail/search", adapter._handle_mail_search)
+    app.router.add_post("/v1/mail/sync", adapter._handle_mail_sync)
+    app.router.add_post("/v1/mail/oauth/start", adapter._handle_mail_oauth_start)
+    app.router.add_get("/v1/mail/oauth/callback", adapter._handle_mail_oauth_callback)
+    app.router.add_get("/v1/mail/oauth/status", adapter._handle_mail_oauth_status)
     app.router.add_post("/v1/mail/send", adapter._handle_mail_send)
     app.router.add_post("/v1/mail/messages/bulk", adapter._handle_mail_bulk)
     app.router.add_get("/v1/mail/messages/{message_id}", adapter._handle_mail_read)
@@ -893,6 +897,9 @@ class TestMailEndpoints:
             data = await resp.json()
             assert data["features"]["gmail_mail_tools"] is True
             assert data["endpoints"]["mail_accounts"]["path"] == "/v1/mail/accounts"
+            assert data["endpoints"]["mail_sync"]["path"] == "/v1/mail/sync"
+            assert data["endpoints"]["mail_oauth_start"]["path"] == "/v1/mail/oauth/start"
+            assert data["endpoints"]["mail_oauth_status"]["path"] == "/v1/mail/oauth/status"
             assert data["endpoints"]["mail_send"]["path"] == "/v1/mail/send"
 
     @pytest.mark.asyncio
@@ -911,6 +918,31 @@ class TestMailEndpoints:
             assert data["data"][0]["account_id"] == "gmail:user@example.com"
 
     @pytest.mark.asyncio
+    async def test_mail_search_forwards_selected_label(self, adapter, monkeypatch):
+        from tools import gmail_mail_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "search_emails"
+            assert args["query"] == "invoice"
+            assert args["label"] == "sent"
+            return {
+                "object": "list",
+                "provider": "gmail",
+                "data": [],
+                "label": "sent",
+                "query": "in:sent invoice",
+            }
+
+        monkeypatch.setattr(gmail_mail_tools, "dispatch_mail_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/search?q=invoice&label=sent&limit=10")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["label"] == "sent"
+
+    @pytest.mark.asyncio
     async def test_mail_send_requires_approval(self, adapter, monkeypatch, tmp_path):
         token_path = tmp_path / "google_token.json"
         token_path.write_text(json.dumps({"token": "tok"}))
@@ -923,9 +955,187 @@ class TestMailEndpoints:
                 "/v1/mail/send",
                 json={"to": ["to@example.com"], "subject": "Hi", "body": "Body"},
             )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "approval_required"
+            assert data["ok"] is False
+            assert "requires explicit approval" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_mail_sync_dispatches_tool(self, adapter, monkeypatch):
+        from tools import gmail_mail_tools
+
+        def fake_dispatch(tool_name, args):
+            assert tool_name == "sync_email"
+            assert args["label"] == "inbox"
+            return {
+                "object": "gmail.sync",
+                "provider": "gmail",
+                "account_id": "gmail:user@example.com",
+                "synced": 1,
+                "updated": 1,
+                "cache_source": "gmail_api",
+                "synced_at": 100.0,
+            }
+
+        monkeypatch.setattr(gmail_mail_tools, "dispatch_mail_tool", fake_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/sync", json={"label": "inbox"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "gmail.sync"
+            assert data["synced"] == 1
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_status_reports_non_secret_state(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(tmp_path / "missing-client.json"))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "missing-token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "missing-pending.json"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/oauth/status")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "gmail.oauth_status"
+            assert data["status"] == "configuration_needed"
+            assert data["connected"] is False
+            assert "refresh_token" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_start_returns_configuration_needed_without_client(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(tmp_path / "missing-client.json"))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "missing-token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "missing-pending.json"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/oauth/start")
             assert resp.status == 400
             data = await resp.json()
-            assert "requires explicit approval" in data["error"]["message"]
+            assert data["object"] == "gmail.oauth_start"
+            assert data["status"] == "configuration_needed"
+            assert data["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_start_uses_public_url_override(self, adapter, monkeypatch, tmp_path):
+        client_path = tmp_path / "google_client_secret.json"
+        client_path.write_text(
+            '{"installed": {"client_id": "client-id", "client_secret": "secret"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_GMAIL_CLIENT_SECRETS_PATH", str(client_path))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(tmp_path / "token.json"))
+        monkeypatch.setenv("HERMES_GMAIL_OAUTH_PENDING_PATH", str(tmp_path / "pending.json"))
+        monkeypatch.setenv("HERMES_MAIL_PUBLIC_URL", "https://studio.example:8643")
+
+        class FakeFlow:
+            code_verifier = "verifier-1"
+
+            def authorization_url(self, **kwargs):
+                return "https://accounts.google.com/o/oauth2/v2/auth?state=state-1", "state-1"
+
+        from tools import gmail_oauth
+
+        monkeypatch.setattr(gmail_oauth, "_flow_from_client_secret", lambda **_kwargs: FakeFlow())
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/mail/oauth/start")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["redirect_uri"] == "https://studio.example:8643/v1/mail/oauth/callback"
+
+    @pytest.mark.asyncio
+    async def test_mail_modify_returns_approval_required_without_approved(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/mail/messages/msg-1/modify",
+                json={"account_id": "acct-1", "operation": "archive", "approved": False},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "approval_required"
+            assert data["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_mail_oauth_callback_does_not_require_api_key(self, auth_adapter, monkeypatch):
+        from tools import gmail_oauth
+
+        def fake_complete_gmail_oauth_callback(**kwargs):
+            assert kwargs["code"] == "code-1"
+            assert kwargs["state"] == "state-1"
+            return {
+                "object": "gmail.oauth_callback",
+                "provider": "gmail",
+                "status": "connected",
+                "connected": True,
+                "missing_scopes": [],
+                "message": "Gmail is connected.",
+            }
+
+        monkeypatch.setattr(gmail_oauth, "complete_gmail_oauth_callback", fake_complete_gmail_oauth_callback)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/oauth/callback?code=code-1&state=state-1")
+            text = await resp.text()
+            assert resp.status == 200
+            assert "Gmail connected" in text
+
+    @pytest.mark.asyncio
+    async def test_mail_api_uses_cache_after_sync_and_archive(
+        self,
+        adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        from tests.tools.test_gmail_mail_tools import FakeGmailService, _message
+        from tools import gmail_mail_tools
+
+        token_path = tmp_path / "google_token.json"
+        token_path.write_text(json.dumps({"token": "tok"}))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
+        monkeypatch.setenv("HERMES_GMAIL_MAIL_CACHE_PATH", str(tmp_path / "gmail.sqlite3"))
+        gmail_mail_tools._list_cache.clear()
+        gmail_mail_tools._read_cache.clear()
+        fake = FakeGmailService({"msg-1": _message()})
+        monkeypatch.setattr(gmail_mail_tools, "build_gmail_service", lambda _account: fake)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            sync = await cli.post("/v1/mail/sync", json={"label": "inbox", "limit": 10})
+            assert sync.status == 200
+            sync_data = await sync.json()
+            assert sync_data["synced"] == 1
+
+            gmail_mail_tools._list_cache.clear()
+            gmail_mail_tools._read_cache.clear()
+            listed = await cli.get("/v1/mail/messages?label=inbox&limit=10")
+            read = await cli.get("/v1/mail/messages/msg-1")
+            assert listed.status == 200
+            assert read.status == 200
+            listed_data = await listed.json()
+            read_data = await read.json()
+            assert listed_data["cache_source"] == "local_provider_cache"
+            assert read_data["cache_source"] == "local_provider_cache"
+
+            archived = await cli.post(
+                "/v1/mail/messages/msg-1/modify",
+                json={"operation": "archive", "approved": True},
+            )
+            assert archived.status == 200
+            archived_data = await archived.json()
+            assert archived_data["status"] == "modified"
+            inbox = await cli.get("/v1/mail/messages?label=inbox&limit=10")
+            inbox_data = await inbox.json()
+            assert inbox_data["cache_source"] == "local_provider_cache"
+            assert inbox_data["data"] == []
 
 
 # ---------------------------------------------------------------------------
