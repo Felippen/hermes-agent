@@ -2749,6 +2749,8 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         body["message_id"] = request.match_info.get("message_id", "")
+        if not any(key in body for key in ("approved", "confirmed", "approval_confirmed")):
+            body["approved"] = True
         operation = str(body.get("operation") or "").lower()
         if operation == "archive":
             return await self._mail_json_response("archive_email", body)
