@@ -204,7 +204,19 @@ def build_gmail_service(account: GmailAccount):
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
     except ImportError as exc:
-        raise MailError("Google API dependencies are not installed") from exc
+        try:
+            from tools.lazy_deps import FeatureUnavailable, ensure
+
+            ensure("skill.google_workspace", prompt=False)
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+        except FeatureUnavailable as lazy_exc:
+            raise MailError(f"Google API dependencies are not available: {lazy_exc}") from lazy_exc
+        except ImportError as retry_exc:
+            raise MailError("Google API dependencies are not installed") from retry_exc
+        except Exception as install_exc:
+            raise MailError(f"Google API dependencies could not be prepared: {install_exc}") from install_exc
 
     token_path = Path(account.token_path)
     if not token_path.exists():

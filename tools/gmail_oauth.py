@@ -154,10 +154,26 @@ def _flow_from_client_secret(*, scopes: list[str], redirect_uri: str, **kwargs: 
     try:
         from google_auth_oauthlib.flow import Flow
     except ImportError as exc:
-        raise GmailOAuthError(
-            "Google OAuth dependencies are not installed. Install hermes-agent[google].",
-            status="dependencies_missing",
-        ) from exc
+        try:
+            from tools.lazy_deps import FeatureUnavailable, ensure
+
+            ensure("skill.google_workspace", prompt=False)
+            from google_auth_oauthlib.flow import Flow
+        except FeatureUnavailable as lazy_exc:
+            raise GmailOAuthError(
+                f"Google OAuth dependencies are not available: {lazy_exc}",
+                status="dependencies_missing",
+            ) from lazy_exc
+        except ImportError as retry_exc:
+            raise GmailOAuthError(
+                "Google OAuth dependencies are not installed. Install hermes-agent[google].",
+                status="dependencies_missing",
+            ) from retry_exc
+        except Exception as install_exc:
+            raise GmailOAuthError(
+                f"Google OAuth dependencies could not be prepared: {install_exc}",
+                status="dependencies_missing",
+            ) from install_exc
 
     return Flow.from_client_secrets_file(
         str(client_secret_path()),
