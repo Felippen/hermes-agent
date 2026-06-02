@@ -2453,6 +2453,7 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "slash_chat_interception": True,
                 "kanban": True,
                 "slash_execution": "full",
+                "gmail_mail_tools": True,
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -2483,6 +2484,16 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                     "method": "POST",
                     "path": "/v1/background/tasks/{task_id}/follow-up",
                 },
+                "mail_accounts": {"method": "GET", "path": "/v1/mail/accounts"},
+                "mail_messages": {"method": "GET", "path": "/v1/mail/messages"},
+                "mail_search": {"method": "GET", "path": "/v1/mail/search"},
+                "mail_message": {"method": "GET", "path": "/v1/mail/messages/{message_id}"},
+                "mail_send": {"method": "POST", "path": "/v1/mail/send"},
+                "mail_reply": {"method": "POST", "path": "/v1/mail/messages/{message_id}/reply"},
+                "mail_modify": {"method": "POST", "path": "/v1/mail/messages/{message_id}/modify"},
+                "mail_bulk": {"method": "POST", "path": "/v1/mail/messages/bulk"},
+                "mail_summary": {"method": "POST", "path": "/v1/mail/messages/{message_id}/summary"},
+                "mail_draft_reply": {"method": "POST", "path": "/v1/mail/messages/{message_id}/draft-reply"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
@@ -2509,6 +2520,152 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "kanban_events": {"method": "GET", "path": "/v1/kanban/events"},
             },
         })
+
+    async def _mail_json_response(self, tool_name: str, args: Dict[str, Any]) -> "web.Response":
+        try:
+            from tools.gmail_mail_tools import MailError, dispatch_mail_tool
+
+            return web.json_response(dispatch_mail_tool(tool_name, args))
+        except ImportError as exc:
+            logger.exception("Mail tool import failed")
+            return web.json_response(
+                _openai_error(f"Mail tools unavailable: {exc}", err_type="server_error"),
+                status=500,
+            )
+        except MailError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.exception("Mail tool %s failed", tool_name)
+            return web.json_response(
+                _openai_error(f"Mail tool failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _mail_request_body(self, request: "web.Request") -> Dict[str, Any]:
+        if not request.can_read_body:
+            return {}
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            raise ValueError("Invalid JSON in request body")
+        if not isinstance(body, dict):
+            raise ValueError("JSON request body must be an object")
+        return body
+
+    async def _handle_mail_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response("list_email_accounts", {})
+
+    async def _handle_mail_messages(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "label": request.query.get("label", request.query.get("folder", "inbox")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+        }
+        return await self._mail_json_response("list_emails", args)
+
+    async def _handle_mail_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "query": request.query.get("q", request.query.get("query", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+        }
+        return await self._mail_json_response("search_emails", args)
+
+    async def _handle_mail_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "message_id": request.match_info.get("message_id", ""),
+        }
+        return await self._mail_json_response("read_email", args)
+
+    async def _handle_mail_send(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("send_email", body)
+
+    async def _handle_mail_reply(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("reply_to_email", body)
+
+    async def _handle_mail_modify(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        operation = str(body.get("operation") or "").lower()
+        if operation == "archive":
+            return await self._mail_json_response("archive_email", body)
+        if operation == "delete":
+            return await self._mail_json_response("delete_email", body)
+        if operation in {"mark_read", "mark_unread"}:
+            body["unread"] = operation == "mark_unread"
+            return await self._mail_json_response("mark_email_read", body)
+        return web.json_response(
+            _openai_error("operation must be archive, delete, mark_read, or mark_unread"),
+            status=400,
+        )
+
+    async def _handle_mail_bulk(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("bulk_email", body)
+
+    async def _handle_mail_summary(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("summarize_email", body)
+
+    async def _handle_mail_draft_reply(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("draft_email_reply", body)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -8002,6 +8159,16 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_get("/v1/mail/accounts", self._handle_mail_accounts)
+            self._app.router.add_get("/v1/mail/messages", self._handle_mail_messages)
+            self._app.router.add_get("/v1/mail/search", self._handle_mail_search)
+            self._app.router.add_post("/v1/mail/send", self._handle_mail_send)
+            self._app.router.add_post("/v1/mail/messages/bulk", self._handle_mail_bulk)
+            self._app.router.add_get("/v1/mail/messages/{message_id}", self._handle_mail_read)
+            self._app.router.add_post("/v1/mail/messages/{message_id}/reply", self._handle_mail_reply)
+            self._app.router.add_post("/v1/mail/messages/{message_id}/modify", self._handle_mail_modify)
+            self._app.router.add_post("/v1/mail/messages/{message_id}/summary", self._handle_mail_summary)
+            self._app.router.add_post("/v1/mail/messages/{message_id}/draft-reply", self._handle_mail_draft_reply)
             self._app.router.add_post("/v1/complete/slash", self._handle_complete_slash)
             self._app.router.add_post("/v1/complete/skills", self._handle_complete_skills)
             self._app.router.add_post("/v1/slash", self._handle_slash)

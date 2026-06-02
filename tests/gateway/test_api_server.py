@@ -554,6 +554,16 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/commands", adapter._handle_commands)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_get("/v1/mail/accounts", adapter._handle_mail_accounts)
+    app.router.add_get("/v1/mail/messages", adapter._handle_mail_messages)
+    app.router.add_get("/v1/mail/search", adapter._handle_mail_search)
+    app.router.add_post("/v1/mail/send", adapter._handle_mail_send)
+    app.router.add_post("/v1/mail/messages/bulk", adapter._handle_mail_bulk)
+    app.router.add_get("/v1/mail/messages/{message_id}", adapter._handle_mail_read)
+    app.router.add_post("/v1/mail/messages/{message_id}/reply", adapter._handle_mail_reply)
+    app.router.add_post("/v1/mail/messages/{message_id}/modify", adapter._handle_mail_modify)
+    app.router.add_post("/v1/mail/messages/{message_id}/summary", adapter._handle_mail_summary)
+    app.router.add_post("/v1/mail/messages/{message_id}/draft-reply", adapter._handle_mail_draft_reply)
     app.router.add_post("/v1/complete/slash", adapter._handle_complete_slash)
     app.router.add_post("/v1/complete/skills", adapter._handle_complete_skills)
     app.router.add_post("/v1/slash", adapter._handle_slash)
@@ -866,6 +876,56 @@ class TestOpenRouterModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /v1/mail endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestMailEndpoints:
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_gmail_mail_tools(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["gmail_mail_tools"] is True
+            assert data["endpoints"]["mail_accounts"]["path"] == "/v1/mail/accounts"
+            assert data["endpoints"]["mail_send"]["path"] == "/v1/mail/send"
+
+    @pytest.mark.asyncio
+    async def test_mail_accounts_returns_configured_state(self, adapter, monkeypatch, tmp_path):
+        token_path = tmp_path / "google_token.json"
+        token_path.write_text(json.dumps({"token": "tok"}))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/mail/accounts")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["configured"] is True
+            assert data["data"][0]["account_id"] == "gmail:user@example.com"
+
+    @pytest.mark.asyncio
+    async def test_mail_send_requires_approval(self, adapter, monkeypatch, tmp_path):
+        token_path = tmp_path / "google_token.json"
+        token_path.write_text(json.dumps({"token": "tok"}))
+        monkeypatch.setenv("HERMES_GMAIL_TOKEN_PATH", str(token_path))
+        monkeypatch.setenv("HERMES_GMAIL_ACCOUNT_EMAILS", "user@example.com")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/mail/send",
+                json={"to": ["to@example.com"], "subject": "Hi", "body": "Body"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert "requires explicit approval" in data["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
