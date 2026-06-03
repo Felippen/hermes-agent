@@ -26,6 +26,19 @@ class TestResolvePath:
         result = _resolve_path(str(absolute))
         assert result == absolute
 
+    def test_absolute_path_ignores_missing_process_cwd(self, monkeypatch, tmp_path):
+        """Absolute paths must not consult os.getcwd()."""
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setattr(
+            "tools.cwd_recovery.os.getcwd",
+            lambda: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        from tools.file_tools import _resolve_path
+
+        absolute = (tmp_path / "already-absolute.txt").resolve()
+        result = _resolve_path(str(absolute))
+        assert result == absolute
+
     def test_falls_back_to_cwd_without_terminal_cwd(self, monkeypatch):
         """Without TERMINAL_CWD, falls back to os.getcwd()."""
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
@@ -33,6 +46,19 @@ class TestResolvePath:
 
         result = _resolve_path("some_file.txt")
         assert result == Path(os.getcwd()) / "some_file.txt"
+
+    def test_relative_path_falls_back_when_process_cwd_deleted(self, monkeypatch, tmp_path):
+        """Relative paths use a stable fallback if process cwd is gone."""
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setattr(
+            "tools.cwd_recovery.os.getcwd",
+            lambda: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        monkeypatch.setattr("tools.cwd_recovery.Path.home", lambda: tmp_path)
+        from tools.file_tools import _resolve_path
+
+        result = _resolve_path("some_file.txt")
+        assert result == tmp_path / "some_file.txt"
 
     def test_tilde_expansion(self, monkeypatch, tmp_path):
         """~ is expanded before TERMINAL_CWD join (already absolute)."""

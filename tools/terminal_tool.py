@@ -74,6 +74,7 @@ from tools.tool_backend_helpers import (
     nous_tool_gateway_unavailable_message,
     resolve_modal_backend_state,
 )
+from tools.cwd_recovery import resolve_tool_cwd, safe_abspath, safe_getcwd
 
 
 def _safe_parse_import_env(
@@ -1019,6 +1020,8 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     env_type = os.getenv("TERMINAL_ENV", "local")
+    terminal_cwd_raw = os.getenv("TERMINAL_CWD")
+    terminal_cwd = os.path.expanduser(terminal_cwd_raw) if terminal_cwd_raw else None
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
 
@@ -1026,7 +1029,7 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, and everything else starts in the backend's default
     # root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = resolve_tool_cwd(terminal_cwd)
     elif env_type == "ssh":
         default_cwd = "~"
     else:
@@ -1036,14 +1039,20 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    if cwd:
-        cwd = os.path.expanduser(cwd)
+    cwd = terminal_cwd or default_cwd
+    if env_type == "local" and terminal_cwd and not os.path.isdir(terminal_cwd):
+        logger.info(
+            "Ignoring TERMINAL_CWD=%r for local backend because it is not a directory. "
+            "Using %r instead.",
+            terminal_cwd,
+            default_cwd,
+        )
+        cwd = default_cwd
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        docker_cwd_source = terminal_cwd or resolve_tool_cwd()
+        candidate = safe_abspath(docker_cwd_source)
         if (
             any(candidate.startswith(p) for p in host_prefixes)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
@@ -2468,7 +2477,7 @@ if __name__ == "__main__":
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
+    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD') or safe_getcwd() or resolve_tool_cwd()}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
