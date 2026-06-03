@@ -355,6 +355,53 @@ class TestRunBrowserCommandPathConstruction:
             "navigate",
         ]
 
+    def test_subprocess_gets_safe_cwd_when_process_cwd_deleted(self, tmp_path):
+        """Node/npm startup must not inherit a deleted process cwd."""
+        captured = {}
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.wait.return_value = 0
+
+        def capture_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["cwd"] = kwargs.get("cwd")
+            return mock_proc
+
+        fake_session = {
+            "session_name": "test-session",
+            "session_id": "test-id",
+            "cdp_url": None,
+        }
+        fake_json = json.dumps({"success": True})
+        hermes_home = str(tmp_path / "hermes-home")
+
+        with patch("tools.browser_tool._find_agent_browser", return_value="npx agent-browser"), \
+             patch("tools.browser_tool._chromium_installed", return_value=True), \
+             patch("tools.browser_tool._get_session_info", return_value=fake_session), \
+             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("tools.browser_tool._discover_homebrew_node_dirs", return_value=[]), \
+             patch("tools.cwd_recovery.os.getcwd", side_effect=FileNotFoundError), \
+             patch("subprocess.Popen", side_effect=capture_popen), \
+             patch("os.open", return_value=99), \
+             patch("os.close"), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.dict(
+                 os.environ,
+                 {
+                     "PATH": "/usr/bin:/bin",
+                     "HOME": "/home/test",
+                     "HERMES_HOME": hermes_home,
+                     "TERMINAL_CWD": str(tmp_path),
+                 },
+                 clear=True,
+             ):
+            with patch("builtins.open", mock_open(read_data=fake_json)):
+                _run_browser_command("test-task", "navigate", ["https://example.com"])
+
+        assert captured["cmd"] is not None
+        assert captured["cwd"] == str(tmp_path)
+
     def test_subprocess_path_includes_homebrew_node_dirs(self, tmp_path):
         """When _discover_homebrew_node_dirs returns dirs, they should appear
         in the subprocess env PATH passed to Popen."""

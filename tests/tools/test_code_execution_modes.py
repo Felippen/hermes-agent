@@ -15,8 +15,10 @@ there is no env-var override. Tests patch ``_load_config`` directly.
 import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -219,6 +221,20 @@ class TestResolveChildCwd(unittest.TestCase):
         home = str(pathlib.Path.home())
         with patch.dict(os.environ, {"TERMINAL_CWD": "~"}):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), home)
+
+    def test_project_uses_terminal_cwd_when_process_cwd_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"TERMINAL_CWD": td}), \
+                 patch("tools.cwd_recovery.os.getcwd", side_effect=FileNotFoundError):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), td)
+
+    def test_project_falls_back_when_process_cwd_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "TERMINAL_CWD"}
+            with patch.dict(os.environ, env, clear=True), \
+                 patch("tools.cwd_recovery.os.getcwd", side_effect=FileNotFoundError), \
+                 patch("tools.cwd_recovery.Path.home", return_value=Path(td)):
+                self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), td)
 
 
 # ---------------------------------------------------------------------------

@@ -114,7 +114,7 @@ class TestCwdHandling:
 
     def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch):
         """Docker should use /workspace when cwd mounting is explicitly enabled."""
-        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: "/home/user/project")
+        monkeypatch.setattr("tools.cwd_recovery.os.getcwd", lambda: "/home/user/project")
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
@@ -128,6 +128,17 @@ class TestCwdHandling:
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         config = _tt_mod._get_env_config()
         assert config["cwd"] == os.getcwd()
+
+    def test_local_backend_recovers_when_process_cwd_is_deleted(self, monkeypatch, tmp_path):
+        """A deleted gateway cwd must not crash terminal config resolution."""
+        monkeypatch.setattr(
+            "tools.cwd_recovery.os.getcwd",
+            lambda: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        config = _tt_mod._get_env_config()
+        assert config["cwd"] == str(tmp_path)
 
     def test_create_environment_passes_docker_host_cwd_and_flag(self, monkeypatch):
         """Docker host cwd and mount flag should reach DockerEnvironment."""

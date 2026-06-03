@@ -68,6 +68,7 @@ from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 from hermes_cli.config import cfg_get
+from tools.cwd_recovery import resolve_tool_cwd
 
 try:
     from tools.website_policy import check_website_access
@@ -910,6 +911,7 @@ def _run_chrome_fallback_command(
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
+                cwd=resolve_tool_cwd(os.environ.get("TERMINAL_CWD")),
                 **_popen_extra,
             )
         finally:
@@ -2074,6 +2076,7 @@ def _run_browser_command(
                 stderr=stderr_fd,
                 stdin=subprocess.DEVNULL,
                 env=browser_env,
+                cwd=resolve_tool_cwd(os.environ.get("TERMINAL_CWD")),
                 **_popen_extra,
             )
         finally:
