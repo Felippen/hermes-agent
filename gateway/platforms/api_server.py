@@ -2880,7 +2880,15 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
 
     async def _calendar_json_response(self, tool_name: str, args: Dict[str, Any]) -> "web.Response":
         try:
-            from tools.google_calendar_tools import CalendarError, dispatch_calendar_tool
+            try:
+                from tools.axon_calendar_tools import axon_calendar_requested
+            except ImportError:
+                axon_calendar_requested = None
+
+            if axon_calendar_requested is not None and axon_calendar_requested():
+                from tools.axon_calendar_tools import CalendarError, dispatch_calendar_tool
+            else:
+                from tools.google_calendar_tools import CalendarError, dispatch_calendar_tool
 
             return web.json_response(dispatch_calendar_tool(tool_name, args))
         except ImportError as exc:
