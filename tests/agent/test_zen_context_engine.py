@@ -253,3 +253,173 @@ def test_masking_failure_degrades_without_raising(monkeypatch) -> None:
 
     assert brief
     assert not [note for note in engine.zen_notes if note.masking is not None]
+
+
+def test_zen_decision_trace_snapshot_is_stable_and_privacy_safe() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    payload = "SENSITIVE_PAYLOAD_VALUE " * 120
+    messages = [
+        {"role": "tool", "content": payload},
+        {"role": "user", "content": "Use the source-backed summary only."},
+    ]
+
+    engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+
+    traces = [trace.to_safe_dict() for trace in engine.zen_decision_traces]
+    assert traces
+    assert set(traces[0]) == {
+        "action",
+        "reason_code",
+        "confidence",
+        "input_source",
+        "token_estimate",
+        "safety_policy",
+        "budget_impact",
+        "redacted",
+    }
+    assert any(trace["action"] == "masked" for trace in traces)
+    assert all(trace["redacted"] is True for trace in traces)
+    assert all(payload not in json.dumps(trace, sort_keys=True) for trace in traces)
+    assert engine.zen_metrics["trace_complete"] is True
+    assert engine.zen_metrics["privacy_safe"] is True
+
+
+def test_zen_metrics_track_context_shape_and_clear_on_reset_and_end() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    messages = [
+        {"role": "tool", "content": "large output " * 180},
+        {"role": "user", "content": "Continue with bounded context."},
+    ]
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+
+    metrics = engine.zen_metrics
+    assert brief
+    assert metrics["context_chars_in"] > metrics["context_chars_out"] > 0
+    assert metrics["masked_span_count"] == 1
+    assert metrics["masked_count"] >= 1
+    assert metrics["selected_count"] >= 1
+    assert metrics["compression_ratio"] < 1
+    assert metrics["trace_event_count"] == len(engine.zen_decision_traces)
+
+    engine.on_session_reset()
+    assert engine.zen_metrics["trace_event_count"] == 0
+    assert engine.zen_decision_traces == ()
+
+    engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+    assert engine.zen_decision_traces
+    engine.on_session_end("s1", messages)
+    assert engine.zen_metrics["trace_event_count"] == 0
+    assert engine.zen_decision_traces == ()
+
+
+def test_zen_operator_controls_force_fallback_and_session_bypass() -> None:
+    fallback = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"force_compressor_fallback": True},
+    )
+
+    assert fallback.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "tool", "content": "large output " * 200}],
+        current_turn_user_idx=0,
+    ) is None
+    assert fallback.zen_decision_traces[-1].action == "fallback"
+    assert fallback.zen_decision_traces[-1].reason_code == "compressor_fallback_forced"
+    assert fallback.zen_metrics["context_chars_out"] == 0
+
+    bypass = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"bypass_session_ids": {"s2"}},
+    )
+    assert bypass.compile_turn_context(
+        session_id="s2",
+        user_message="Continue.",
+        conversation_history=[{"role": "tool", "content": "large output " * 200}],
+        current_turn_user_idx=0,
+    ) is None
+    assert bypass.zen_decision_traces[-1].action == "bypassed"
+    assert bypass.zen_decision_traces[-1].reason_code == "session_bypassed"
+
+
+def test_zen_config_invalid_values_fall_back_and_strictness_changes_threshold() -> None:
+    relaxed = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"masking_strictness": "relaxed"},
+    )
+    strict = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"masking_strictness": "strict", "trace_verbosity": "unsupported"},
+    )
+    invalid = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"masking_strictness": "unsupported"},
+    )
+    payload = "threshold candidate " * 60
+    messages = [
+        {"role": "tool", "content": payload},
+        {"role": "user", "content": "Continue."},
+    ]
+
+    relaxed.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+    strict.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+    invalid.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+
+    assert not [note for note in relaxed.zen_notes if note.masking is not None]
+    assert [note for note in strict.zen_notes if note.masking is not None]
+    assert not [note for note in invalid.zen_notes if note.masking is not None]
+
+
+def test_zen_configure_hook_applies_host_controls() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+
+    engine.configure_zen({"enabled": False})
+
+    assert engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "tool", "content": "large output " * 200}],
+        current_turn_user_idx=0,
+    ) is None
+    assert engine.zen_decision_traces[-1].reason_code == "zen_disabled"
