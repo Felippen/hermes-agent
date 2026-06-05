@@ -522,6 +522,30 @@ def test_continue_without_prior_goal_detects_empty_brief() -> None:
     assert "prior_goal needed because continue_without_prior_goal" in brief
 
 
+def test_continue_without_prior_goal_runs_with_no_existing_zen_notes() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert engine.zen_notes == ()
+    assert "needed_context advisory" in brief
+    need = engine.zen_context_needs[0]
+    assert need.reason == "continue_without_prior_goal"
+    assert need.triggering_source.startswith("turn:0:user:")
+    assert engine.zen_source_pointers[need.triggering_source].role == "user"
+    assert any(
+        trace.reason_code == "context_need_continue_without_prior_goal"
+        and trace.input_source == need.triggering_source
+        for trace in engine.zen_decision_traces
+    )
+
+
 def test_source_claim_missing_evidence_need_is_detected() -> None:
     engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
     messages = [

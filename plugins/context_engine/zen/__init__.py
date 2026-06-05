@@ -637,10 +637,18 @@ class ZenContextEngine(ContextCompressor):
             key=lambda note: (_kind_rank(note.kind), note.source.message_index),
         )
         selected = _latest_by_kind_then_rank(ordered, self.max_brief_notes)
+        fallback_source = _latest_source(selected)
+        if fallback_source is None and user_message.strip():
+            fallback_source = self._source_pointer(
+                current_turn_user_idx if current_turn_user_idx is not None and current_turn_user_idx >= 0 else 0,
+                "user",
+                user_message,
+            )
         needs = self._sense_context_needs(
             selected,
             user_message=user_message,
             current_turn_user_idx=current_turn_user_idx,
+            fallback_source=fallback_source,
         )
         need_lines = self._context_need_brief_lines(needs)
         if not selected and not need_lines:
@@ -674,6 +682,7 @@ class ZenContextEngine(ContextCompressor):
         *,
         user_message: str,
         current_turn_user_idx: int | None = None,
+        fallback_source: ZenSourcePointer | None = None,
     ) -> list[ZenContextNeed]:
         if not self._zen_config["proactive_sensing_enabled"]:
             self._record_trace(
@@ -688,7 +697,7 @@ class ZenContextEngine(ContextCompressor):
             if current_turn_user_idx is None or note.source.message_index != current_turn_user_idx
         ]
         selected_text = " ".join(note.summary for note in prior_selected).lower()
-        trigger = _latest_source(selected)
+        trigger = _latest_source(selected) or fallback_source
 
         repeated_failed = _repeated_failed_fingerprint(self._zen_notes)
         if repeated_failed and trigger is not None:
