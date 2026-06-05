@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -28,6 +29,27 @@ logger = logging.getLogger("agent.lsp.workspace")
 # Cleared on shutdown.  Keyed by absolute resolved path so symlink
 # folds collapse to one entry.
 _workspace_cache: dict = {}
+
+
+def _is_system_temp_root(path: Path) -> bool:
+    """Return True for temp-directory roots such as /tmp or /private/tmp."""
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = path
+
+    candidates = {Path(tempfile.gettempdir())}
+    if os.name != "nt":
+        candidates.update({Path("/tmp"), Path("/private/tmp")})
+
+    for candidate in candidates:
+        try:
+            if resolved == candidate.resolve(strict=False):
+                return True
+        except (OSError, RuntimeError):
+            if path == candidate:
+                return True
+    return False
 
 
 def normalize_path(path: str) -> str:
@@ -73,6 +95,12 @@ def find_git_worktree(start: str) -> Optional[str]:
         git_marker = cur / ".git"
         try:
             if git_marker.exists():
+                if _is_system_temp_root(cur):
+                    parent = cur.parent
+                    if parent == cur:
+                        break
+                    cur = parent
+                    continue
                 resolved = str(cur)
                 _workspace_cache[str(start_path)] = (resolved, True)
                 return resolved
