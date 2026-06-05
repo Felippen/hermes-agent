@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 
 from plugins.context_engine.zen import ZenContextEngine
@@ -103,5 +104,152 @@ def test_zen_core_does_not_reference_axon_synapse_or_persistent_storage() -> Non
 
     source = inspect.getsource(zen_module)
 
-    for forbidden in ("Synapse", "Spine", "Cortex", "Axon", "sqlite", "open("):
+    for forbidden in (
+        "Synapse",
+        "Spine",
+        "Cortex",
+        "Axon",
+        "sqlite",
+        "open(",
+        "zen_expand",
+        "zen_search_notes",
+        "zen_pin_context",
+        "Meta-Thinker",
+    ):
         assert forbidden not in source
+
+
+def test_large_tool_observation_is_masked_with_bounded_source_backed_summary() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    noisy_payload = "pytest output line with useful pass signal\n" + ("detail line " * 260)
+    messages = [
+        {"role": "user", "content": "Summarize the test status."},
+        {"role": "tool", "content": noisy_payload},
+        {"role": "user", "content": "Use the latest observation."},
+    ]
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=2,
+    )
+
+    masked = [note for note in engine.zen_notes if note.masking is not None]
+    assert masked
+    note = masked[0]
+    assert note.masking.observation_class == "large"
+    assert note.masking.original_chars == len(noisy_payload)
+    assert note.masking.summary_chars <= 280
+    assert noisy_payload not in note.summary
+    assert note.source.pointer_id in brief
+
+
+def test_repeated_tool_observation_dedupes_with_source_coverage() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    repeated = "same status block: all generated files are unchanged"
+    messages = [
+        {"role": "tool", "content": repeated},
+        {"role": "assistant", "content": "Plan: check the repeated output."},
+        {"role": "tool", "content": repeated},
+        {"role": "user", "content": "Continue from the latest result."},
+    ]
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=3,
+    )
+
+    repeated_notes = [
+        note for note in engine.zen_notes
+        if note.masking is not None and note.masking.observation_class == "repeated"
+    ]
+    assert len(repeated_notes) == 1
+    note = repeated_notes[0]
+    assert note.masking.occurrence_count == 2
+    assert len(note.masking.source_pointer_ids) == 2
+    assert "Repeated tool observation" in note.summary
+    assert "sources:" in brief
+
+
+def test_failed_tool_observation_becomes_failed_path_not_evidence() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    failure = "command failed with exit code 1: missing dependency in build.sh"
+
+    engine.compile_turn_context(
+        session_id="s1",
+        user_message="Fix it without repeating the same command.",
+        conversation_history=[
+            {"role": "tool", "content": failure},
+            {"role": "user", "content": "Fix it without repeating the same command."},
+        ],
+        current_turn_user_idx=1,
+    )
+
+    failed = [note for note in engine.zen_notes if note.kind == "failed_path"]
+    evidence = [note for note in engine.zen_notes if note.kind == "evidence"]
+    assert failed
+    assert all(note.masking is None or note.masking.observation_class != "failed" for note in evidence)
+    assert "avoid repeating" in failed[0].summary
+
+
+def test_stale_observation_is_marked_uncertain_in_brief() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    messages = [{"role": "tool", "content": "old observation says retry the previous approach"}]
+    messages.extend({"role": "assistant", "content": f"intermediate turn {idx}"} for idx in range(13))
+    messages.append({"role": "user", "content": "Use the newer correction instead."})
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=len(messages) - 1,
+    )
+
+    stale_notes = [note for note in engine.zen_notes if note.masking and note.masking.stale]
+    assert stale_notes
+    assert "stale/uncertain" in brief
+
+
+def test_masking_does_not_mutate_canonical_messages() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    messages = [
+        {"role": "tool", "content": "large output " * 200},
+        {"role": "user", "content": "Keep the original transcript intact."},
+    ]
+    before = copy.deepcopy(messages)
+
+    engine.compile_turn_context(
+        session_id="s1",
+        user_message=messages[-1]["content"],
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+
+    assert messages == before
+
+
+def test_masking_failure_degrades_without_raising(monkeypatch) -> None:
+    import plugins.context_engine.zen as zen_module
+
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    monkeypatch.setattr(
+        zen_module,
+        "_classify_observation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[
+            {"role": "tool", "content": "large output " * 200},
+            {"role": "user", "content": "Continue."},
+        ],
+        current_turn_user_idx=1,
+    )
+
+    assert brief
+    assert not [note for note in engine.zen_notes if note.masking is not None]
