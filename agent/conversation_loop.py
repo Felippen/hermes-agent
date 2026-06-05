@@ -727,6 +727,28 @@ def run_conversation(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Context-engine-native turn context. This follows the same request-copy
+    # injection path as memory prefetch and pre_llm_call plugin context.
+    _context_engine_user_context = ""
+    try:
+        _compile_turn_context = getattr(agent.context_compressor, "compile_turn_context", None)
+        if callable(_compile_turn_context):
+            _compiled_context = _compile_turn_context(
+                session_id=agent.session_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                current_turn_user_idx=current_turn_user_idx,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                system_prompt_chars=len(active_system_prompt or ""),
+            )
+            if isinstance(_compiled_context, dict) and _compiled_context.get("context"):
+                _context_engine_user_context = str(_compiled_context["context"])
+            elif isinstance(_compiled_context, str) and _compiled_context.strip():
+                _context_engine_user_context = _compiled_context
+    except Exception as exc:
+        logger.warning("context engine turn context failed: %s", exc)
+
     # Main conversation loop
     api_call_count = 0
     final_response = None
@@ -961,6 +983,8 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                if _context_engine_user_context:
+                    _injections.append(_context_engine_user_context)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):

@@ -187,6 +187,27 @@ class ContextEngine(ABC):
         import json
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
+    # -- Optional: turn-local request context ------------------------------
+
+    def compile_turn_context(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        conversation_history: List[Dict[str, Any]],
+        current_turn_user_idx: int,
+        model: str = "",
+        platform: str = "",
+        system_prompt_chars: int = 0,
+    ) -> str | Dict[str, Any] | None:
+        """Return ephemeral context to append to the current user message.
+
+        The host calls this after preflight compression and before API request
+        assembly. Returned text is injected only into the request copy, never
+        into canonical conversation history or the system prompt.
+        """
+        return None
+
     # -- Optional: status / display ----------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
