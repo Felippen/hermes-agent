@@ -1432,6 +1432,12 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        try:
+            _configure_context_engine = getattr(_selected_engine, "configure_zen", None)
+            if callable(_configure_context_engine):
+                _configure_context_engine(_ctx_cfg.get("zen", {}) if isinstance(_ctx_cfg, dict) else {})
+        except Exception as _ce_config_err:
+            _ra().logger.debug("Context engine config hook failed: %s", _ce_config_err)
         agent.context_compressor = _selected_engine
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length

@@ -36,6 +36,22 @@ _LARGE_OBSERVATION_CHARS = 1200
 _MASKED_SUMMARY_CHARS = 280
 _STALE_MESSAGE_AGE = 12
 _OBSERVATION_WINDOW = 40
+_MASKING_THRESHOLDS = {
+    "relaxed": 2000,
+    "standard": _LARGE_OBSERVATION_CHARS,
+    "strict": 800,
+}
+_TRACE_VERBOSITIES = {"standard", "debug"}
+_TRACE_ACTIONS = {
+    "kept",
+    "compressed",
+    "masked",
+    "dropped",
+    "deferred",
+    "selected",
+    "fallback",
+    "bypassed",
+}
 
 
 @dataclass(frozen=True)
@@ -58,6 +74,69 @@ class ZenMaskingMetadata:
 
 
 @dataclass(frozen=True)
+class ZenDecisionTrace:
+    action: str
+    reason_code: str
+    confidence: str
+    input_source: str
+    token_estimate: int
+    safety_policy: str
+    budget_impact: int
+    redacted: bool = True
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "reason_code": self.reason_code,
+            "confidence": self.confidence,
+            "input_source": self.input_source,
+            "token_estimate": self.token_estimate,
+            "safety_policy": self.safety_policy,
+            "budget_impact": self.budget_impact,
+            "redacted": self.redacted,
+        }
+
+
+@dataclass
+class ZenMetrics:
+    context_chars_in: int = 0
+    context_chars_out: int = 0
+    masked_span_count: int = 0
+    kept_count: int = 0
+    compressed_count: int = 0
+    masked_count: int = 0
+    dropped_count: int = 0
+    deferred_count: int = 0
+    selected_count: int = 0
+    trace_event_count: int = 0
+    trace_complete: bool = True
+    privacy_safe: bool = True
+
+    @property
+    def compression_ratio(self) -> float:
+        if self.context_chars_in <= 0:
+            return 0.0
+        return round(self.context_chars_out / self.context_chars_in, 4)
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        return {
+            "context_chars_in": self.context_chars_in,
+            "context_chars_out": self.context_chars_out,
+            "masked_span_count": self.masked_span_count,
+            "compression_ratio": self.compression_ratio,
+            "kept_count": self.kept_count,
+            "compressed_count": self.compressed_count,
+            "masked_count": self.masked_count,
+            "dropped_count": self.dropped_count,
+            "deferred_count": self.deferred_count,
+            "selected_count": self.selected_count,
+            "trace_event_count": self.trace_event_count,
+            "trace_complete": self.trace_complete,
+            "privacy_safe": self.privacy_safe,
+        }
+
+
+@dataclass(frozen=True)
 class ZenNote:
     kind: str
     summary: str
@@ -76,7 +155,13 @@ class ZenContextEngine(ContextCompressor):
     def name(self) -> str:
         return "zen"
 
-    def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        model: str = "",
+        *args: Any,
+        zen_config: Dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(model=model, *args, **kwargs)
         self._zen_session_id = ""
         self._zen_notes: list[ZenNote] = []
@@ -84,10 +169,18 @@ class ZenContextEngine(ContextCompressor):
         self._zen_source_pointers: dict[str, ZenSourcePointer] = {}
         self._zen_observation_fingerprints: dict[str, int] = {}
         self._zen_observation_sources: dict[str, tuple[str, ...]] = {}
+        self._zen_decision_traces: list[ZenDecisionTrace] = []
+        self._zen_metrics = ZenMetrics()
         self._zen_last_brief_chars = 0
+        self._zen_config = _normalize_zen_config(zen_config)
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         self._zen_session_id = session_id or ""
+        if "zen_config" in kwargs:
+            self.configure_zen(kwargs.get("zen_config"))
+
+    def configure_zen(self, config: Dict[str, Any] | None) -> None:
+        self._zen_config = _normalize_zen_config(config)
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
@@ -109,10 +202,57 @@ class ZenContextEngine(ContextCompressor):
     ) -> str | None:
         if session_id and session_id != self._zen_session_id:
             self._zen_session_id = session_id
+        self._zen_metrics.context_chars_in = _history_chars(conversation_history)
+        if not self._zen_config["enabled"]:
+            self._record_trace(
+                action="bypassed",
+                reason_code="zen_disabled",
+                safety_policy="operator_control",
+            )
+            self._zen_last_brief_chars = 0
+            self._zen_metrics.context_chars_out = 0
+            return None
+        if self._zen_config["force_compressor_fallback"]:
+            self._record_trace(
+                action="fallback",
+                reason_code="compressor_fallback_forced",
+                safety_policy="operator_control",
+            )
+            self._zen_last_brief_chars = 0
+            self._zen_metrics.context_chars_out = 0
+            return None
+        if session_id and session_id in self._zen_config["bypass_session_ids"]:
+            self._record_trace(
+                action="bypassed",
+                reason_code="session_bypassed",
+                safety_policy="operator_control",
+            )
+            self._zen_last_brief_chars = 0
+            self._zen_metrics.context_chars_out = 0
+            return None
         self._ingest_messages(conversation_history, current_turn_user_idx)
         brief = self._assemble_working_brief(user_message=user_message)
         self._zen_last_brief_chars = len(brief)
+        self._zen_metrics.context_chars_out = len(brief)
         return brief or None
+
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+    ) -> List[Dict[str, Any]]:
+        before_chars = _history_chars(messages)
+        result = super().compress(messages, current_tokens=current_tokens, focus_topic=focus_topic)
+        after_chars = _history_chars(result)
+        self._record_trace(
+            action="compressed",
+            reason_code="inherited_compressor_compress",
+            token_estimate=current_tokens if current_tokens is not None else _estimate_tokens(str(before_chars)),
+            budget_impact=after_chars - before_chars,
+            safety_policy="compressor_owned",
+        )
+        return result
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
@@ -129,6 +269,10 @@ class ZenContextEngine(ContextCompressor):
                 "zen_notes": len(self._zen_notes),
                 "zen_source_pointers": len(self._zen_source_pointers),
                 "zen_last_brief_chars": self._zen_last_brief_chars,
+                "zen_traces": len(self._zen_decision_traces),
+                "zen_trace_complete": self._zen_metrics.trace_complete,
+                "zen_privacy_safe": self._zen_metrics.privacy_safe,
+                "zen_metrics": self._zen_metrics.to_safe_dict(),
             }
         )
         return status
@@ -141,12 +285,22 @@ class ZenContextEngine(ContextCompressor):
     def zen_source_pointers(self) -> dict[str, ZenSourcePointer]:
         return dict(self._zen_source_pointers)
 
+    @property
+    def zen_decision_traces(self) -> tuple[ZenDecisionTrace, ...]:
+        return tuple(self._zen_decision_traces)
+
+    @property
+    def zen_metrics(self) -> dict[str, Any]:
+        return self._zen_metrics.to_safe_dict()
+
     def _clear_zen_state(self) -> None:
         self._zen_notes.clear()
         self._zen_seen.clear()
         self._zen_source_pointers.clear()
         self._zen_observation_fingerprints.clear()
         self._zen_observation_sources.clear()
+        self._zen_decision_traces.clear()
+        self._zen_metrics = ZenMetrics()
         self._zen_last_brief_chars = 0
 
     def _ingest_messages(self, messages: List[Dict[str, Any]], current_turn_user_idx: int) -> None:
@@ -163,6 +317,13 @@ class ZenContextEngine(ContextCompressor):
                     if self._ingest_tool_observation(content, idx, current_turn_user_idx, pointer):
                         continue
                 except Exception:
+                    self._record_trace(
+                        action="dropped",
+                        reason_code="masking_error",
+                        source=pointer,
+                        token_estimate=_estimate_tokens(content),
+                        safety_policy="request_copy_only",
+                    )
                     continue
             for kind, summary in self._extract_notes(role, content, idx, current_turn_user_idx):
                 self._append_note(kind, summary, pointer)
@@ -233,11 +394,19 @@ class ZenContextEngine(ContextCompressor):
             idx=idx,
             current_turn_user_idx=current_turn_user_idx,
             seen_fingerprints=self._zen_observation_sources,
+            large_threshold=self._zen_large_observation_chars,
         )
         prior_sources = self._zen_observation_sources.get(classification.payload_fingerprint, ())
         if pointer.pointer_id not in prior_sources:
             self._zen_observation_sources[classification.payload_fingerprint] = prior_sources + (pointer.pointer_id,)
         if classification.observation_class == "ordinary":
+            self._record_trace(
+                action="deferred",
+                reason_code="observation_ordinary",
+                source=pointer,
+                token_estimate=_estimate_tokens(content),
+                safety_policy="source_backed",
+            )
             return False
         if classification.observation_class == "repeated":
             self._merge_repeated_observation(classification, pointer, content)
@@ -258,6 +427,16 @@ class ZenContextEngine(ContextCompressor):
         note = self._append_note(kind, summary, pointer, masking=metadata)
         if note is not None:
             self._zen_observation_fingerprints[classification.payload_fingerprint] = len(self._zen_notes) - 1
+            self._zen_metrics.masked_span_count += 1
+            self._record_trace(
+                action="masked",
+                reason_code=f"observation_{classification.observation_class}",
+                source=pointer,
+                token_estimate=_estimate_tokens(content),
+                budget_impact=len(summary) - len(content),
+                confidence="uncertain" if classification.stale else "observed",
+                safety_policy="source_backed",
+            )
         return True
 
     def _merge_repeated_observation(
@@ -282,6 +461,16 @@ class ZenContextEngine(ContextCompressor):
             note = self._append_note("evidence", summary, pointer, masking=metadata)
             if note is not None:
                 self._zen_observation_fingerprints[classification.payload_fingerprint] = len(self._zen_notes) - 1
+                self._zen_metrics.masked_span_count += 1
+                self._record_trace(
+                    action="masked",
+                    reason_code="observation_repeated",
+                    source=pointer,
+                    token_estimate=_estimate_tokens(content),
+                    budget_impact=len(summary) - len(content),
+                    confidence="observed",
+                    safety_policy="source_backed",
+                )
             return
         note = self._zen_notes[note_idx]
         if note.masking is None:
@@ -303,6 +492,15 @@ class ZenContextEngine(ContextCompressor):
             confidence="observed",
             masking=metadata,
         )
+        self._record_trace(
+            action="masked",
+            reason_code="observation_repeated",
+            source=pointer,
+            token_estimate=_estimate_tokens(content),
+            budget_impact=len(summary) - len(content),
+            confidence="observed",
+            safety_policy="source_backed",
+        )
 
     def _append_note(
         self,
@@ -319,10 +517,27 @@ class ZenContextEngine(ContextCompressor):
             return None
         key = (kind, summary, source.pointer_id)
         if key in self._zen_seen:
+            self._record_trace(
+                action="dropped",
+                reason_code="duplicate_note",
+                source=source,
+                token_estimate=_estimate_tokens(summary),
+                safety_policy="privacy_safe_trace",
+            )
             return None
         self._zen_seen.add(key)
         note = ZenNote(kind=kind, summary=summary, source=source, masking=masking)
         self._zen_notes.append(note)
+        if masking is None:
+            self._record_trace(
+                action="kept",
+                reason_code=f"{kind}_note_extracted",
+                source=source,
+                token_estimate=_estimate_tokens(summary),
+                budget_impact=len(summary),
+                confidence="observed",
+                safety_policy="source_backed",
+            )
         return note
 
     def _assemble_working_brief(self, *, user_message: str) -> str:
@@ -337,6 +552,15 @@ class ZenContextEngine(ContextCompressor):
             return ""
         lines = ["Hermes Zen working brief (session-local, source-backed):"]
         for note in selected:
+            self._record_trace(
+                action="selected",
+                reason_code="working_brief_selected",
+                source=note.source,
+                token_estimate=_estimate_tokens(note.summary),
+                budget_impact=len(note.summary),
+                confidence=note.confidence,
+                safety_policy="request_copy_only",
+            )
             stale = " stale/uncertain" if note.masking and note.masking.stale else ""
             coverage = ""
             if note.masking and note.masking.occurrence_count > 1:
@@ -347,6 +571,51 @@ class ZenContextEngine(ContextCompressor):
         if _has_conflicting_constraints(selected):
             lines.append("- uncertainty: constraints may conflict; verify against the latest user turn before acting")
         return "\n".join(lines)
+
+    @property
+    def _zen_large_observation_chars(self) -> int:
+        return _MASKING_THRESHOLDS[self._zen_config["masking_strictness"]]
+
+    def _record_trace(
+        self,
+        *,
+        action: str,
+        reason_code: str,
+        source: ZenSourcePointer | None = None,
+        token_estimate: int = 0,
+        safety_policy: str = "privacy_safe_trace",
+        budget_impact: int = 0,
+        confidence: str = "observed",
+    ) -> None:
+        if action not in _TRACE_ACTIONS:
+            action = "deferred"
+            reason_code = "invalid_trace_action"
+        trace = ZenDecisionTrace(
+            action=action,
+            reason_code=reason_code,
+            confidence=confidence if confidence in {"observed", "inferred", "uncertain"} else "uncertain",
+            input_source=source.pointer_id if source is not None else "",
+            token_estimate=max(0, int(token_estimate)),
+            safety_policy=safety_policy,
+            budget_impact=int(budget_impact),
+            redacted=True,
+        )
+        self._zen_decision_traces.append(trace)
+        if action == "kept":
+            self._zen_metrics.kept_count += 1
+        elif action == "compressed":
+            self._zen_metrics.compressed_count += 1
+        elif action == "masked":
+            self._zen_metrics.masked_count += 1
+        elif action == "dropped":
+            self._zen_metrics.dropped_count += 1
+        elif action == "deferred":
+            self._zen_metrics.deferred_count += 1
+        elif action == "selected":
+            self._zen_metrics.selected_count += 1
+        self._zen_metrics.trace_event_count = len(self._zen_decision_traces)
+        self._zen_metrics.trace_complete = all(_trace_complete(item) for item in self._zen_decision_traces)
+        self._zen_metrics.privacy_safe = all(item.redacted and _trace_privacy_safe(item) for item in self._zen_decision_traces)
 
 
 def register(ctx: Any) -> None:
@@ -377,6 +646,58 @@ def _content_to_text(content: Any) -> str:
     if content is None:
         return ""
     return str(content)
+
+
+def _normalize_zen_config(config: Dict[str, Any] | None) -> dict[str, Any]:
+    raw = config if isinstance(config, dict) else {}
+    strictness = str(raw.get("masking_strictness", "standard") or "standard").lower()
+    if strictness not in _MASKING_THRESHOLDS:
+        strictness = "standard"
+    verbosity = str(raw.get("trace_verbosity", "standard") or "standard").lower()
+    if verbosity not in _TRACE_VERBOSITIES:
+        verbosity = "standard"
+    bypass_raw = raw.get("bypass_session_ids", ())
+    if isinstance(bypass_raw, str):
+        bypass_session_ids = frozenset({bypass_raw}) if bypass_raw else frozenset()
+    else:
+        try:
+            bypass_session_ids = frozenset(str(item) for item in bypass_raw if str(item))
+        except TypeError:
+            bypass_session_ids = frozenset()
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "force_compressor_fallback": bool(raw.get("force_compressor_fallback", False)),
+        "masking_strictness": strictness,
+        "trace_verbosity": verbosity,
+        "bypass_session_ids": bypass_session_ids,
+    }
+
+
+def _history_chars(messages: List[Dict[str, Any]]) -> int:
+    return sum(len(_content_to_text(msg.get("content", ""))) for msg in messages)
+
+
+def _estimate_tokens(text: str) -> int:
+    compact = _compact(text)
+    if not compact:
+        return 0
+    return max(1, (len(compact) + 3) // 4)
+
+
+def _trace_complete(trace: ZenDecisionTrace) -> bool:
+    return bool(
+        trace.action
+        and trace.reason_code
+        and trace.confidence
+        and trace.safety_policy
+        and trace.action in _TRACE_ACTIONS
+    )
+
+
+def _trace_privacy_safe(trace: ZenDecisionTrace) -> bool:
+    raw_markers = ("\n", "traceback", "large output", "detail line", "secret", "api_key")
+    fields = (trace.reason_code, trace.input_source, trace.safety_policy)
+    return not any(marker in field.lower() for field in fields for marker in raw_markers)
 
 
 def _compact(text: str) -> str:
@@ -419,6 +740,7 @@ def _classify_observation(
     idx: int,
     current_turn_user_idx: int,
     seen_fingerprints: dict[str, tuple[str, ...]],
+    large_threshold: int = _LARGE_OBSERVATION_CHARS,
 ) -> ZenObservationClassification:
     compact = _compact(text)
     fingerprint = _observation_fingerprint(compact)
@@ -427,7 +749,7 @@ def _classify_observation(
         observation_class = "failed"
     elif fingerprint in seen_fingerprints:
         observation_class = "repeated"
-    elif len(compact) > _LARGE_OBSERVATION_CHARS:
+    elif len(compact) > large_threshold:
         observation_class = "large"
     elif _paths(compact):
         observation_class = "path_bearing"
@@ -496,7 +818,9 @@ def _has_conflicting_constraints(notes: list[ZenNote]) -> bool:
 
 __all__ = [
     "ZenContextEngine",
+    "ZenDecisionTrace",
     "ZenMaskingMetadata",
+    "ZenMetrics",
     "ZenNote",
     "ZenObservationClassification",
     "ZenSourcePointer",
