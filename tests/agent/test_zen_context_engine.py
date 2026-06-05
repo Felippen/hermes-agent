@@ -3,7 +3,17 @@ from __future__ import annotations
 import copy
 import json
 
-from plugins.context_engine.zen import ZenContextEngine
+from plugins.context_engine.zen import ZenContextEngine, ZenContextNeed, ZenContextSlice
+
+
+class FakeContextNeedProvider:
+    def __init__(self, slices):
+        self.slices = slices
+        self.calls = []
+
+    def resolve_context_need(self, need: ZenContextNeed, budget: int):
+        self.calls.append((need, budget))
+        return self.slices
 
 
 def test_zen_compiles_source_backed_request_copy_brief() -> None:
@@ -47,6 +57,9 @@ def test_zen_keeps_notes_in_memory_and_clears_on_reset_and_end() -> None:
     engine.on_session_reset()
     assert engine.zen_notes == ()
     assert engine.zen_source_pointers == {}
+    assert engine.zen_context_needs == ()
+    assert engine.zen_context_slices == ()
+    assert engine.zen_metrics["context_need_count"] == 0
 
     engine.compile_turn_context(
         session_id="s1",
@@ -58,6 +71,9 @@ def test_zen_keeps_notes_in_memory_and_clears_on_reset_and_end() -> None:
     engine.on_session_end("s1", [])
     assert engine.zen_notes == ()
     assert engine.zen_source_pointers == {}
+    assert engine.zen_context_needs == ()
+    assert engine.zen_context_slices == ()
+    assert engine.zen_metrics["context_need_count"] == 0
 
 
 def test_zen_exposes_no_model_callable_tools() -> None:
@@ -423,3 +439,305 @@ def test_zen_configure_hook_applies_host_controls() -> None:
         current_turn_user_idx=0,
     ) is None
     assert engine.zen_decision_traces[-1].reason_code == "zen_disabled"
+
+
+def test_context_need_schema_is_session_local_and_privacy_safe() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "user", "content": "Continue."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context advisory" in brief
+    need = engine.zen_context_needs[0]
+    safe = need.to_safe_dict()
+    assert set(safe) == {
+        "need_id",
+        "reason",
+        "confidence",
+        "triggering_source",
+        "desired_context_type",
+        "risk_level",
+        "acquisition_policy",
+        "trace_id",
+        "token_budget",
+        "lifecycle_state",
+        "redacted",
+    }
+    assert need.reason == "continue_without_prior_goal"
+    assert need.trace_id == "context_need_continue_without_prior_goal"
+    assert need.lifecycle_state == "advised"
+    assert safe["redacted"] is True
+    assert "Continue." not in json.dumps(safe, sort_keys=True)
+    assert any(
+        trace.reason_code == "context_need_continue_without_prior_goal"
+        for trace in engine.zen_decision_traces
+    )
+    assert any(
+        trace.reason_code == "context_need_advisory_continue_without_prior_goal"
+        for trace in engine.zen_decision_traces
+    )
+
+
+def test_repeated_failed_action_need_is_detected() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    failure = "command failed with exit code 1: missing dependency in build.sh"
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue without repeating the failed path.",
+        conversation_history=[
+            {"role": "tool", "content": failure},
+            {"role": "assistant", "content": "I will inspect the failing path."},
+            {"role": "tool", "content": failure},
+            {"role": "user", "content": "Continue without repeating the failed path."},
+        ],
+        current_turn_user_idx=3,
+    )
+
+    assert brief
+    reasons = {need.reason for need in engine.zen_context_needs}
+    assert "repeated_failed_action" in reasons
+    assert "needed_context advisory: failed_path" in brief
+    need = next(item for item in engine.zen_context_needs if item.reason == "repeated_failed_action")
+    assert need.triggering_source.startswith("turn:")
+
+
+def test_continue_without_prior_goal_detects_empty_brief() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "user", "content": "Continue."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert [need.reason for need in engine.zen_context_needs] == ["continue_without_prior_goal"]
+    assert "prior_goal needed because continue_without_prior_goal" in brief
+
+
+def test_source_claim_missing_evidence_need_is_detected() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+    messages = [
+        {"role": "tool", "content": "pytest passed successfully"},
+        {"role": "user", "content": "Continue."},
+    ]
+
+    engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=messages,
+        current_turn_user_idx=1,
+    )
+    engine._zen_source_pointers.clear()
+
+    brief = engine._assemble_working_brief(user_message="Continue.")
+
+    assert brief
+    need = next(item for item in engine.zen_context_needs if item.reason == "source_claim_missing_evidence")
+    assert need.risk_level == "high"
+    assert need.acquisition_policy == "provider_blocked"
+    assert "source_evidence needed because source_claim_missing_evidence" in brief
+
+
+def test_missing_referenced_artifact_need_is_detected() -> None:
+    engine = ZenContextEngine(model="test", quiet_mode=True, config_context_length=200000)
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Inspect specs/openspec/changes/example/spec.md before continuing PR #123.",
+        conversation_history=[
+            {"role": "assistant", "content": "Plan: inspect the current branch."},
+            {
+                "role": "user",
+                "content": "Inspect specs/openspec/changes/example/spec.md before continuing PR #123.",
+            },
+        ],
+        current_turn_user_idx=1,
+    )
+
+    assert brief
+    need = next(item for item in engine.zen_context_needs if item.reason == "missing_referenced_artifact")
+    assert need.desired_context_type == "referenced_artifact"
+    assert need.confidence == 0.82
+
+
+def test_verification_or_rollback_gap_stays_high_risk_advisory() -> None:
+    provider = FakeContextNeedProvider([
+        {"summary": "Validation evidence exists", "source_id": "fake:validation", "token_estimate": 20},
+    ])
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Verify rollback and merge order before opening the PR.",
+        conversation_history=[
+            {"role": "assistant", "content": "Plan: finish implementation."},
+            {"role": "user", "content": "Verify rollback and merge order before opening the PR."},
+        ],
+        current_turn_user_idx=1,
+    )
+
+    assert brief
+    need = next(item for item in engine.zen_context_needs if item.reason == "missing_verification_context")
+    assert need.risk_level == "high"
+    assert need.lifecycle_state == "advised"
+    assert provider.calls == []
+    assert engine.zen_metrics["provider_call_count"] == 0
+
+
+def test_provider_disabled_keeps_context_need_advisory() -> None:
+    provider = FakeContextNeedProvider([
+        {"summary": "The referenced spec says to keep changes bounded", "source_id": "fake:spec", "token_estimate": 15},
+    ])
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Read docs/handoff/phase3.md next.",
+        conversation_history=[{"role": "user", "content": "Read docs/handoff/phase3.md next."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context advisory" in brief
+    assert provider.calls == []
+    assert engine.zen_metrics["provider_call_count"] == 0
+    assert engine.zen_metrics["context_need_advisory_count"] == len(engine.zen_context_needs)
+
+
+def test_provider_enabled_injects_only_bounded_source_backed_slices() -> None:
+    provider = FakeContextNeedProvider([
+        ZenContextSlice(
+            need_id="different",
+            summary="Prior goal: finish Phase 3 proactive sensing tests.",
+            source_id="fake:handoff",
+            token_estimate=30,
+        ),
+        {"summary": "Oversized context should be rejected", "source_id": "fake:large", "token_estimate": 999},
+        {"summary": "Missing source should be rejected", "token_estimate": 10},
+    ])
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True, "context_need_token_budget": 60},
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "user", "content": "Continue."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context resolved: Prior goal: finish Phase 3 proactive sensing tests." in brief
+    assert "fake:handoff" in brief
+    assert "Oversized context should be rejected" not in brief
+    assert len(provider.calls) == 1
+    need, budget = provider.calls[0]
+    assert budget == 60
+    assert need.reason == "continue_without_prior_goal"
+    assert engine.zen_context_needs[0].lifecycle_state == "resolved"
+    assert engine.zen_metrics["provider_budget_used"] == 30
+    assert engine.zen_metrics["injected_slice_count"] == 1
+    assert engine.zen_metrics["rejected_slice_count"] == 2
+    assert any(
+        trace.reason_code == "context_need_rejected_continue_without_prior_goal"
+        for trace in engine.zen_decision_traces
+    )
+
+
+def test_low_confidence_need_does_not_call_provider() -> None:
+    provider = FakeContextNeedProvider([
+        {"summary": "Prior goal exists", "source_id": "fake:goal", "token_estimate": 10},
+    ])
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={
+            "context_need_provider_enabled": True,
+            "context_need_min_confidence": 0.95,
+        },
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[{"role": "user", "content": "Continue."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context advisory" in brief
+    assert provider.calls == []
+    assert engine.zen_metrics["provider_call_count"] == 0
+
+
+def test_fallback_and_bypass_suppress_proactive_sensing_and_provider_calls() -> None:
+    provider = FakeContextNeedProvider([
+        {"summary": "Should never be requested", "source_id": "fake:blocked", "token_estimate": 5},
+    ])
+    fallback = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={
+            "force_compressor_fallback": True,
+            "context_need_provider_enabled": True,
+        },
+        context_need_provider=provider,
+    )
+
+    assert fallback.compile_turn_context(
+        session_id="s1",
+        user_message="Continue and read docs/handoff/phase3.md.",
+        conversation_history=[{"role": "user", "content": "Continue and read docs/handoff/phase3.md."}],
+        current_turn_user_idx=0,
+    ) is None
+    assert fallback.zen_context_needs == ()
+    assert fallback.zen_context_slices == ()
+    assert fallback.zen_metrics["provider_call_count"] == 0
+
+    bypass = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={
+            "bypass_session_ids": {"s2"},
+            "context_need_provider_enabled": True,
+        },
+        context_need_provider=provider,
+    )
+
+    assert bypass.compile_turn_context(
+        session_id="s2",
+        user_message="Continue and read docs/handoff/phase3.md.",
+        conversation_history=[{"role": "user", "content": "Continue and read docs/handoff/phase3.md."}],
+        current_turn_user_idx=0,
+    ) is None
+    assert bypass.zen_context_needs == ()
+    assert bypass.zen_context_slices == ()
+    assert bypass.zen_metrics["provider_call_count"] == 0
+    assert provider.calls == []
