@@ -324,16 +324,24 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                     file=sys.stderr,
                 )
 
-    result = apply_bitwarden_secrets(
-        enabled=True,
-        access_token_env=bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN"),
-        project_id=bw_cfg.get("project_id", ""),
-        override_existing=bool(bw_cfg.get("override_existing", False)),
-        cache_ttl_seconds=float(bw_cfg.get("cache_ttl_seconds", 300)),
-        auto_install=bool(bw_cfg.get("auto_install", True)),
-        server_url=str(bw_cfg.get("server_url", "") or "").strip(),
-        home_path=home_path,
-    )
+    # --- 1Password -----------------------------------------------------------
+    op_cfg = (cfg or {}).get("onepassword") or {}
+    if op_cfg.get("enabled"):
+        try:
+            from agent.secret_sources.onepassword import apply_onepassword_secrets
+        except ImportError:
+            pass
+        else:
+            result = apply_onepassword_secrets(
+                enabled=True,
+                mode=str(op_cfg.get("mode", "desktop")),
+                service_account_token_env=op_cfg.get(
+                    "service_account_token_env",
+                    "OP_SERVICE_ACCOUNT_TOKEN",
+                ),
+                cache_ttl_seconds=float(op_cfg.get("cache_ttl_seconds", 300)),
+                override_existing=bool(op_cfg.get("override_existing", False)),
+            )
 
             if result.applied:
                 _sanitize_loaded_credentials()
