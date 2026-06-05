@@ -275,7 +275,9 @@ class ChatCompletionsTransport(ProviderTransport):
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
-        sanitized = self.convert_messages(messages, model=model)
+        sanitized = sanitize_chat_completion_messages_for_wire(
+            self.convert_messages(messages, model=model)
+        )
 
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
@@ -465,7 +467,9 @@ class ChatCompletionsTransport(ProviderTransport):
         from providers.base import OMIT_TEMPERATURE
 
         # Message preprocessing
-        sanitized = profile.prepare_messages(sanitized)
+        sanitized = sanitize_chat_completion_messages_for_wire(
+            profile.prepare_messages(sanitized)
+        )
 
         # Developer role swap — model-name-based, applies to all providers
         _model_lower = (model or "").lower()

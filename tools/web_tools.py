@@ -929,6 +929,7 @@ async def web_extract_tool(
     
     try:
         logger.info("Extracting content from %d URL(s)", len(urls))
+        _ensure_web_plugins_loaded()
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []
@@ -955,7 +956,6 @@ async def web_extract_tool(
             # detect coroutine functions and await; sync functions run
             # inline (the policy gate, SSRF re-check, etc. live inside the
             # provider itself for the firecrawl per-URL loop).
-            _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
                 get_active_extract_provider,
                 get_provider as _wsp_get_provider,

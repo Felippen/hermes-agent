@@ -1,6 +1,7 @@
 """Tests for utils.atomic_json_write — crash-safe JSON file writes."""
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 

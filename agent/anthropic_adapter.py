@@ -836,7 +836,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -870,7 +870,7 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """
     # Try macOS Keychain first (covers Claude Code >=2.1.114)
     kc_creds = _read_claude_code_credentials_from_keychain()
-    if kc_creds:
+    if kc_creds and is_claude_code_token_valid(kc_creds):
         return kc_creds
 
     # Fall back to JSON file
