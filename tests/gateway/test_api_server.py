@@ -1261,6 +1261,40 @@ class TestCalendarEndpoints:
             assert data["provider"] == "google_calendar"
 
     @pytest.mark.asyncio
+    async def test_calendar_events_use_axon_when_spine_dsn_is_configured(self, adapter, monkeypatch):
+        from tools import axon_calendar_tools, google_calendar_tools
+
+        def legacy_dispatch(_tool_name, _args):
+            raise AssertionError("Axon-backed calendar routes must not call legacy Google Calendar tools")
+
+        def axon_dispatch(tool_name, args):
+            assert tool_name == "list_calendar_events"
+            assert args["calendar_id"] == "primary"
+            assert args["start"] == "2026-06-01T00:00:00Z"
+            assert args["end"] == "2026-06-10T00:00:00Z"
+            return {
+                "provider": "google_calendar",
+                "calendar_id": "primary",
+                "events": [{"event_id": "evt-axon", "summary": "Axon"}],
+                "cache_source": "axon_spine",
+            }
+
+        monkeypatch.setenv("ORYN_SPINE_POSTGRES_DSN", "postgresql://localhost/oryn-test")
+        monkeypatch.setattr(google_calendar_tools, "dispatch_calendar_tool", legacy_dispatch)
+        monkeypatch.setattr(axon_calendar_tools, "dispatch_calendar_tool", axon_dispatch)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/calendar/events?calendar_id=primary"
+                "&start=2026-06-01T00:00:00Z&end=2026-06-10T00:00:00Z"
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["cache_source"] == "axon_spine"
+            assert data["events"][0]["event_id"] == "evt-axon"
+
+    @pytest.mark.asyncio
     async def test_calendar_sync_dispatches_tool(self, adapter, monkeypatch):
         from tools import google_calendar_tools
 

@@ -3361,6 +3361,476 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             },
         })
 
+    async def _mail_json_response(self, tool_name: str, args: Dict[str, Any]) -> "web.Response":
+        try:
+            from tools.gmail_mail_tools import MailError, dispatch_mail_tool
+
+            return web.json_response(dispatch_mail_tool(tool_name, args))
+        except ImportError as exc:
+            logger.exception("Mail tool import failed")
+            return web.json_response(
+                _openai_error(f"Mail tools unavailable: {exc}", err_type="server_error"),
+                status=500,
+            )
+        except MailError as exc:
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            return web.json_response(_openai_error(message), status=400)
+        except Exception as exc:
+            logger.exception("Mail tool %s failed", tool_name)
+            return web.json_response(
+                _openai_error(f"Mail tool failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    def _mail_public_base_url(self, request: "web.Request") -> str:
+        """Resolve the public Hermes base URL used for Gmail OAuth callbacks."""
+        import os
+
+        from hermes_cli.dashboard_auth.prefix import _normalise_public_url, resolve_public_url
+
+        for env_name in ("HERMES_MAIL_PUBLIC_URL", "HERMES_DASHBOARD_PUBLIC_URL"):
+            configured = _normalise_public_url(os.environ.get(env_name, ""))
+            if configured:
+                return configured
+
+        configured = resolve_public_url()
+        if configured:
+            return configured
+
+        scheme = str(request.headers.get("X-Forwarded-Proto") or request.scheme or "http").split(",", 1)[0].strip()
+        host = (
+            request.headers.get("X-Forwarded-Host")
+            or request.headers.get("Host")
+            or request.host
+        )
+        host = str(host or "").split(",", 1)[0].strip()
+        return f"{scheme}://{host}".rstrip("/")
+
+    def _mail_oauth_callback_url(self, request: "web.Request") -> str:
+        return f"{self._mail_public_base_url(request)}/v1/mail/oauth/callback"
+
+    async def _mail_request_body(self, request: "web.Request") -> Dict[str, Any]:
+        if not request.can_read_body:
+            return {}
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            raise ValueError("Invalid JSON in request body")
+        if not isinstance(body, dict):
+            raise ValueError("JSON request body must be an object")
+        return body
+
+    async def _handle_mail_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response("list_email_accounts", {})
+
+    async def _handle_mail_messages(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "label": request.query.get("label", request.query.get("folder", "inbox")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+        }
+        return await self._mail_json_response("list_emails", args)
+
+    async def _handle_mail_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "label": request.query.get("label", request.query.get("folder", "")),
+            "query": request.query.get("q", request.query.get("query", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+        }
+        return await self._mail_json_response("search_emails", args)
+
+    async def _handle_mail_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("sync_email", body)
+
+    async def _handle_mail_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError, start_gmail_oauth
+
+            redirect_uri = self._mail_oauth_callback_url(request)
+            return web.json_response(start_gmail_oauth(redirect_uri))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "gmail.oauth_start",
+                    "provider": "gmail",
+                    "status": exc.status,
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:
+            logger.exception("Gmail OAuth start failed")
+            return web.json_response(
+                _openai_error(f"Gmail OAuth start failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_mail_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import gmail_oauth_status
+
+            return web.json_response(gmail_oauth_status())
+        except Exception as exc:
+            logger.exception("Gmail OAuth status failed")
+            return web.json_response(
+                _openai_error(f"Gmail OAuth status failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_mail_oauth_callback(self, request: "web.Request") -> "web.Response":
+        try:
+            from tools.gmail_oauth import GmailOAuthError, complete_gmail_oauth_callback
+
+            complete_gmail_oauth_callback(
+                code=request.query.get("code"),
+                state=request.query.get("state"),
+                granted_scope=request.query.get("scope"),
+                error=request.query.get("error"),
+            )
+            title = "Gmail connected"
+            detail = "You can close this tab and return to Oryn Workspace."
+            status = 200
+        except GmailOAuthError as exc:
+            title = "Gmail connection failed"
+            detail = str(exc)
+            status = 400
+        except Exception as exc:
+            logger.exception("Gmail OAuth callback failed")
+            title = "Gmail connection failed"
+            detail = "Hermes could not finish Gmail connection."
+            status = 500
+
+        html = (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>{html_escape(title)}</title>"
+            "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
+            "padding:48px;line-height:1.45;color:#111}main{max-width:560px}</style>"
+            "</head><body><main>"
+            f"<h1>{html_escape(title)}</h1>"
+            f"<p>{html_escape(detail)}</p>"
+            "</main></body></html>"
+        )
+        return web.Response(text=html, status=status, content_type="text/html")
+
+    async def _handle_mail_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "message_id": request.match_info.get("message_id", ""),
+        }
+        return await self._mail_json_response("read_email", args)
+
+    async def _handle_mail_send(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("send_email", body)
+
+    async def _handle_mail_reply(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("reply_to_email", body)
+
+    async def _handle_mail_modify(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        if not any(key in body for key in ("approved", "confirmed", "approval_confirmed")):
+            body["approved"] = True
+        operation = str(body.get("operation") or "").lower()
+        if operation == "archive":
+            return await self._mail_json_response("archive_email", body)
+        if operation == "delete":
+            return await self._mail_json_response("delete_email", body)
+        if operation in {"mark_read", "mark_unread"}:
+            body["unread"] = operation == "mark_unread"
+            return await self._mail_json_response("mark_email_read", body)
+        return web.json_response(
+            _openai_error("operation must be archive, delete, mark_read, or mark_unread"),
+            status=400,
+        )
+
+    async def _handle_mail_bulk(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._mail_json_response("bulk_email", body)
+
+    async def _handle_mail_summary(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("summarize_email", body)
+
+    async def _handle_mail_draft_reply(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["message_id"] = request.match_info.get("message_id", "")
+        return await self._mail_json_response("draft_email_reply", body)
+
+    async def _calendar_json_response(self, tool_name: str, args: Dict[str, Any]) -> "web.Response":
+        try:
+            try:
+                from tools.axon_calendar_tools import axon_calendar_requested
+            except ImportError:
+                axon_calendar_requested = None
+
+            if axon_calendar_requested is not None and axon_calendar_requested():
+                from tools.axon_calendar_tools import CalendarError, dispatch_calendar_tool
+            else:
+                from tools.google_calendar_tools import CalendarError, dispatch_calendar_tool
+
+            return web.json_response(dispatch_calendar_tool(tool_name, args))
+        except ImportError as exc:
+            logger.exception("Calendar tool import failed")
+            return web.json_response(
+                _openai_error(f"Calendar tools unavailable: {exc}", err_type="server_error"),
+                status=500,
+            )
+        except CalendarError as exc:
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            return web.json_response(_openai_error(message), status=400)
+        except Exception as exc:
+            logger.exception("Calendar tool %s failed", tool_name)
+            return web.json_response(
+                _openai_error(f"Calendar tool failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.google_calendar_oauth import calendar_oauth_status
+
+            return web.json_response(calendar_oauth_status())
+        except Exception as exc:
+            logger.exception("Google Calendar OAuth status failed")
+            return web.json_response(
+                _openai_error(f"Google Calendar OAuth status failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError
+            from tools.google_calendar_oauth import start_calendar_oauth
+
+            redirect_uri = self._mail_oauth_callback_url(request)
+            return web.json_response(start_calendar_oauth(redirect_uri))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "google_calendar.oauth_start",
+                    "provider": "google_calendar",
+                    "status": exc.status,
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:
+            logger.exception("Google Calendar OAuth start failed")
+            return web.json_response(
+                _openai_error(f"Google Calendar OAuth start failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_calendar_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("list_calendar_accounts", {})
+
+    async def _handle_calendar_calendars(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "refresh": request.query.get("refresh", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("list_calendars", args)
+
+    async def _handle_calendar_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("sync_calendar", body)
+
+    async def _handle_calendar_events(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "start": request.query.get("start", request.query.get("time_min", "")),
+            "end": request.query.get("end", request.query.get("time_max", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+            "include_deleted": request.query.get("include_deleted", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("list_calendar_events", args)
+
+    async def _handle_calendar_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "query": request.query.get("q", request.query.get("query", "")),
+            "start": request.query.get("start", request.query.get("time_min", "")),
+            "end": request.query.get("end", request.query.get("time_max", "")),
+            "limit": request.query.get("limit", ""),
+            "page_token": request.query.get("page_token", ""),
+            "include_deleted": request.query.get("include_deleted", "").lower() in {"1", "true", "yes"},
+        }
+        return await self._calendar_json_response("search_calendar_events", args)
+
+    async def _handle_calendar_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "account_id": request.query.get("account_id", ""),
+            "calendar_id": request.query.get("calendar_id", request.query.get("calendar", "primary")),
+            "event_id": request.match_info.get("event_id", ""),
+            "occurrence_id": request.query.get("occurrence_id", ""),
+        }
+        return await self._calendar_json_response("read_calendar_event", args)
+
+    async def _handle_calendar_create(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("create_calendar_event", body)
+
+    async def _handle_calendar_update(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("update_calendar_event", body)
+
+    async def _handle_calendar_delete(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("delete_calendar_event", body)
+
+    async def _handle_calendar_respond(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        body["event_id"] = request.match_info.get("event_id", "")
+        return await self._calendar_json_response("respond_to_calendar_event", body)
+
+    async def _handle_calendar_bulk(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await self._mail_request_body(request)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return await self._calendar_json_response("bulk_calendar_events", body)
+
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
 
