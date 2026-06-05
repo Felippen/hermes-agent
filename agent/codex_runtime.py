@@ -291,44 +291,6 @@ def _event_field(event: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
-def _extract_reasoning_item_text(item: Any) -> str:
-    """Assemble reasoning text from a completed Responses ``reasoning`` item.
-
-    Codex reasoning models frequently deliver their thinking as a single
-    completed ``reasoning`` item (``response.output_item.done``) carrying
-    ``summary`` / ``content`` lists, rather than as incremental
-    ``response.reasoning_summary_text.delta`` events.  When that happens the
-    delta-only forwarding path never fires, so the client's reasoning trace
-    stays empty and vanishes on completion.  This pulls the text out of the
-    completed item so it can be forwarded to ``on_reasoning_delta`` as a
-    fallback.
-
-    Mirrors :class:`CodexEventProjector`'s handling of reasoning ``summary``
-    and ``content`` fields, but flattens the embedded ``text`` payloads.
-    """
-    parts: List[str] = []
-    for field in ("summary", "content"):
-        sequence = _event_field(item, field, None)
-        if not sequence:
-            continue
-        if isinstance(sequence, (str, bytes)):
-            sequence = [sequence]
-        try:
-            iterator = list(sequence)
-        except TypeError:
-            continue
-        for element in iterator:
-            if isinstance(element, str):
-                text = element
-            else:
-                text = getattr(element, "text", None)
-                if text is None and isinstance(element, dict):
-                    text = element.get("text")
-            if text:
-                parts.append(text)
-    return "\n".join(parts)
-
-
 def _raise_stream_error(event: Any) -> None:
     """Raise a ``_StreamErrorEvent`` from a ``type=error`` SSE frame.
 
@@ -389,10 +351,8 @@ def _consume_codex_event_stream(
     """
     collected_output_items: List[Any] = []
     collected_text_deltas: List[str] = []
-    collected_reasoning_parts: List[str] = []
     has_tool_calls = False
     first_delta_fired = False
-    any_reasoning_delta = False
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
@@ -451,41 +411,17 @@ def _consume_codex_event_stream(
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
-            if reasoning_text:
-                collected_reasoning_parts.append(reasoning_text)
-                if on_reasoning_delta is not None:
-                    any_reasoning_delta = True
-                    try:
-                        on_reasoning_delta(reasoning_text)
-                    except Exception:
-                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+            if reasoning_text and on_reasoning_delta is not None:
+                try:
+                    on_reasoning_delta(reasoning_text)
+                except Exception:
+                    logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             continue
 
         if event_type == "response.output_item.done":
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
-                # Fallback: when reasoning arrives only as a completed
-                # ``reasoning`` item (no ``*.delta`` events were streamed),
-                # forward its assembled text so the client's reasoning trace
-                # is populated instead of showing an empty "Thinking…" panel
-                # that vanishes on completion.  Skipped when deltas already
-                # streamed the same content, to avoid duplicating it.
-                if (
-                    not any_reasoning_delta
-                    and _event_field(done_item, "type") == "reasoning"
-                ):
-                    reasoning_text = _extract_reasoning_item_text(done_item)
-                    if reasoning_text:
-                        collected_reasoning_parts.append(reasoning_text)
-                        if on_reasoning_delta is not None:
-                            try:
-                                on_reasoning_delta(reasoning_text)
-                            except Exception:
-                                logger.debug(
-                                    "Codex stream on_reasoning_delta (item) raised",
-                                    exc_info=True,
-                                )
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
@@ -549,7 +485,6 @@ def _consume_codex_event_stream(
         )
 
     assembled_text = "".join(collected_text_deltas)
-    assembled_reasoning = "\n".join(p for p in collected_reasoning_parts if p).strip()
 
     final = SimpleNamespace(
         output=output,
@@ -561,12 +496,6 @@ def _consume_codex_event_stream(
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
     )
-    # Expose the streamed reasoning so normalization can persist it onto the
-    # assistant message even when the terminal ``reasoning`` item carries no
-    # readable ``summary`` (text arrived only via ``*.delta`` events).  This
-    # is what lets the client's reasoning trace survive resume/resync rather
-    # than vanishing once the live stream ends.
-    final._hermes_streamed_reasoning = assembled_reasoning or None
     return final
 
 
@@ -585,19 +514,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
-    # Accumulate streamed reasoning so it can be persisted onto the assistant
-    # message even when the terminal ``reasoning`` item carries no readable
-    # ``summary`` (the text lived only in ``reasoning_summary_text.delta``
-    # events).  Without this the live reasoning trace renders but is lost on
-    # resume/resync because nothing reasoning-shaped reaches the sessions DB.
-    agent._codex_streamed_reasoning_parts: list = []
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 
     def _on_reasoning_delta(text: str) -> None:
-        agent._codex_streamed_reasoning_parts.append(text)
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:

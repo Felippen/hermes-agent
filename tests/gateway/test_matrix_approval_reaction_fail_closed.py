@@ -28,32 +28,13 @@ def _stub_mautrix():
         sys.modules.setdefault(sub, types.ModuleType(sub))
     sys.modules.setdefault("mautrix", stub)
     m = sys.modules["mautrix.types"]
-    for attr in ("ContentURI", "EventID", "RoomID", "SyncToken", "UserID"):
+    for attr in (
+        "ContentURI", "EventID", "EventType", "PaginationDirection",
+        "PresenceState", "RoomCreatePreset", "RoomID", "SyncToken",
+        "TrustState", "UserID",
+    ):
         if not hasattr(m, attr):
             setattr(m, attr, str)
-    if not hasattr(m, "EventType"):
-        m.EventType = types.SimpleNamespace(
-            ROOM_MESSAGE="m.room.message",
-            REACTION="m.reaction",
-            ROOM_ENCRYPTED="m.room.encrypted",
-            ROOM_NAME="m.room.name",
-        )
-    if not hasattr(m, "PaginationDirection"):
-        m.PaginationDirection = types.SimpleNamespace(BACKWARD="b", FORWARD="f")
-    if not hasattr(m, "PresenceState"):
-        m.PresenceState = types.SimpleNamespace(
-            ONLINE="online",
-            OFFLINE="offline",
-            UNAVAILABLE="unavailable",
-        )
-    if not hasattr(m, "RoomCreatePreset"):
-        m.RoomCreatePreset = types.SimpleNamespace(
-            PRIVATE="private_chat",
-            PUBLIC="public_chat",
-            TRUSTED_PRIVATE="trusted_private_chat",
-        )
-    if not hasattr(m, "TrustState"):
-        m.TrustState = types.SimpleNamespace(UNVERIFIED=0, VERIFIED=1)
 
 
 _stub_mautrix()

@@ -47,7 +47,6 @@ _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
 
 from tools.thread_context import propagate_context_to_thread
-from tools.cwd_recovery import resolve_tool_cwd
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see

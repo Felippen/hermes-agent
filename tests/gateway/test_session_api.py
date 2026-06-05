@@ -39,8 +39,6 @@ def auth_adapter(session_db):
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
-    app.router.add_get("/v1/sessions", adapter._handle_v1_list_sessions)
-    app.router.add_get("/v1/sessions/{session_id}/messages", adapter._handle_v1_get_session_messages)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
@@ -121,38 +119,6 @@ async def test_session_crud_and_message_history(adapter, session_db):
         deleted = await delete_resp.json()
         assert deleted == {"object": "hermes.session.deleted", "id": session_id, "deleted": True}
         assert session_db.get_session(session_id) is None
-
-
-@pytest.mark.asyncio
-async def test_v1_session_reads_return_etag_and_304_on_matching_fingerprint(adapter, session_db):
-    session_id = session_db.create_session("etag-session", "api_server")
-    session_db.set_session_title(session_id, "Cached")
-    session_db.append_message(session_id, "user", "hello")
-
-    app = _create_session_app(adapter)
-    async with TestClient(TestServer(app)) as cli:
-        list_resp = await cli.get("/v1/sessions?limit=10&offset=0")
-        assert list_resp.status == 200
-        list_etag = list_resp.headers.get("ETag")
-        assert list_etag
-        list_payload = await list_resp.json()
-        assert list_payload["fingerprint"] == list_etag.strip('"')
-
-        list_304 = await cli.get("/v1/sessions?limit=10&offset=0", headers={"If-None-Match": list_etag})
-        assert list_304.status == 304
-
-        messages_resp = await cli.get(f"/v1/sessions/{session_id}/messages")
-        assert messages_resp.status == 200
-        messages_etag = messages_resp.headers.get("ETag")
-        assert messages_etag
-        messages_payload = await messages_resp.json()
-        assert messages_payload["messages"][0]["content"] == "hello"
-
-        messages_304 = await cli.get(
-            f"/v1/sessions/{session_id}/messages",
-            headers={"If-None-Match": messages_etag},
-        )
-        assert messages_304.status == 304
 
 
 @pytest.mark.asyncio
