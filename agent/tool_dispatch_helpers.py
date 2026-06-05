@@ -319,11 +319,20 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict:
-    """Build a tool-result message dict for provider adapters and session DB.
+    """Build a tool-result message dict with both the OpenAI-format ``name``
+    field (required by the wire format and provider adapters) and the internal
+    ``tool_name`` field (written to the session DB messages table).
 
-    High-risk tool output gets wrapped in semantic delimiters so the model
-    treats it as untrusted data rather than instructions. Plain-string content
-    is sanitized first to strip control characters that broke Ovyon streaming.
+    Content from high-risk tools (``web_extract``, ``web_search``, ``browser_*``,
+    ``mcp_*``) gets wrapped in semantic delimiters telling the model the content
+    is untrusted data, not instructions.  This is the architectural defense
+    against indirect prompt injection from poisoned web pages, GitHub issues,
+    and MCP responses — it changes how the model interprets the content rather
+    than relying on regex pattern matching catching every payload.
+
+    Wrapping only happens for plain string content.  Multimodal results
+    (content lists with image_url parts) pass through unwrapped so the
+    list structure stays valid for vision-capable adapters.
     """
     if isinstance(content, str):
         content = _strip_disallowed_control_chars(content)

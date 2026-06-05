@@ -35,6 +35,7 @@ class CodexRuntimeStatus:
     requires_new_session: bool = False
     codex_binary_ok: bool = True
     codex_version: Optional[str] = None
+    plugin_migration_deferred: bool = False
 
 
 def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
@@ -98,11 +99,59 @@ def check_codex_binary_ok() -> tuple[bool, Optional[str]]:
         return False, f"codex check failed: {exc}"
 
 
+def append_plugin_migration_lines(msg_lines: list[str], mig_report) -> None:
+    """Append human-readable migration results to a slash-command message."""
+    user_servers = [s for s in mig_report.migrated if s != "hermes-tools"]
+    if user_servers:
+        msg_lines.append(
+            f"Migrated {len(user_servers)} MCP server(s): "
+            f"{', '.join(user_servers)}"
+        )
+    if mig_report.migrated_plugins:
+        msg_lines.append(
+            f"Migrated {len(mig_report.migrated_plugins)} native "
+            f"Codex plugin(s): {', '.join(mig_report.migrated_plugins)}"
+        )
+    elif mig_report.plugin_query_error:
+        msg_lines.append(
+            f"Codex plugin discovery skipped: "
+            f"{mig_report.plugin_query_error}"
+        )
+    if mig_report.wrote_permissions_default:
+        msg_lines.append(
+            f"Default sandbox: {mig_report.wrote_permissions_default} "
+            f"(no approval prompt on every write)"
+        )
+    if "hermes-tools" in mig_report.migrated:
+        msg_lines.append(
+            "Hermes tool callback registered: codex can now use "
+            "web_search, web_extract, browser_*, vision_analyze, "
+            "image_generate, skill_view, skills_list, text_to_speech, "
+            "kanban_* (worker + orchestrator) via MCP."
+        )
+        msg_lines.append(
+            "  (delegate_task, memory, session_search, todo run "
+            "only on the default Hermes runtime — they need the "
+            "agent loop context.)"
+        )
+    if mig_report.target_path:
+        msg_lines.append(f"  (config: {mig_report.target_path})")
+    for err in mig_report.errors:
+        msg_lines.append(f"⚠ MCP migration: {err}")
+
+
+def run_plugin_migration(config: dict):
+    from hermes_cli.codex_runtime_plugin_migration import migrate
+
+    return migrate(config)
+
+
 def apply(
     config: dict,
     new_value: Optional[str],
     *,
     persist_callback=None,
+    defer_plugin_migration: bool = False,
 ) -> CodexRuntimeStatus:
     """Top-level entry point used by both CLI and gateway handlers.
 
@@ -188,63 +237,30 @@ def apply(
     msg_lines = [
         f"openai_runtime: {current} → {new_value}",
     ]
+    plugin_migration_deferred = False
     if new_value == "codex_app_server":
         ok, ver = _check_binary_cached()
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
-        # Auto-migrate Hermes' MCP servers + Codex's installed curated
-        # plugins into ~/.codex/config.toml so the spawned codex subprocess
-        # sees the same tool surface AND can call back into Hermes for
-        # browser/web/delegate_task/vision/memory tools (#7 fix).
-        # Failures are non-fatal — the runtime change still proceeds.
-        try:
-            from hermes_cli.codex_runtime_plugin_migration import migrate
-            mig_report = migrate(config)
-            # Tools/MCP servers (excluding the hermes-tools callback,
-            # which is internal plumbing — surface separately).
-            user_servers = [
-                s for s in mig_report.migrated if s != "hermes-tools"
-            ]
-            if user_servers:
-                msg_lines.append(
-                    f"Migrated {len(user_servers)} MCP server(s): "
-                    f"{', '.join(user_servers)}"
+        should_migrate = new_value != current
+        if should_migrate and defer_plugin_migration:
+            plugin_migration_deferred = True
+            msg_lines.append(
+                "Codex runtime enabled. Finishing setup in background "
+                "(MCP servers, plugins, Hermes tools)…"
+            )
+        elif should_migrate:
+            try:
+                from hermes_cli.codex_runtime_migration_state import (
+                    format_migration_summary,
+                    mark_complete,
                 )
-            # Native Codex plugin migration (Linear, GitHub, etc.)
-            if mig_report.migrated_plugins:
-                msg_lines.append(
-                    f"Migrated {len(mig_report.migrated_plugins)} native "
-                    f"Codex plugin(s): {', '.join(mig_report.migrated_plugins)}"
-                )
-            elif mig_report.plugin_query_error:
-                msg_lines.append(
-                    f"Codex plugin discovery skipped: "
-                    f"{mig_report.plugin_query_error}"
-                )
-            # Permissions + Hermes tool callback are always-on production
-            # bits the user benefits from knowing about.
-            if mig_report.wrote_permissions_default:
-                msg_lines.append(
-                    f"Default sandbox: {mig_report.wrote_permissions_default} "
-                    f"(no approval prompt on every write)"
-                )
-            if "hermes-tools" in mig_report.migrated:
-                msg_lines.append(
-                    "Hermes tool callback registered: codex can now use "
-                    "web_search, web_extract, browser_*, vision_analyze, "
-                    "image_generate, skill_view, skills_list, text_to_speech, "
-                    "kanban_* (worker + orchestrator) via MCP."
-                )
-                msg_lines.append(
-                    "  (delegate_task, memory, session_search, todo run "
-                    "only on the default Hermes runtime — they need the "
-                    "agent loop context.)"
-                )
-            msg_lines.append(f"  (config: {mig_report.target_path})")
-            for err in mig_report.errors:
-                msg_lines.append(f"⚠ MCP migration: {err}")
-        except Exception as exc:
-            msg_lines.append(f"⚠ MCP migration skipped: {exc}")
+
+                mig_report = run_plugin_migration(config)
+                append_plugin_migration_lines(msg_lines, mig_report)
+                mark_complete(message=format_migration_summary(mig_report))
+            except Exception as exc:
+                msg_lines.append(f"⚠ MCP migration skipped: {exc}")
         msg_lines.append(
             "OpenAI/Codex turns now run through `codex app-server` "
             "(terminal/file ops/patching inside Codex; "
@@ -263,4 +279,5 @@ def apply(
         old_value=current,
         message="\n".join(msg_lines),
         requires_new_session=True,
+        plugin_migration_deferred=plugin_migration_deferred,
     )

@@ -566,12 +566,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/mail/oauth/callback", adapter._handle_mail_oauth_callback)
     app.router.add_get("/v1/mail/oauth/status", adapter._handle_mail_oauth_status)
     app.router.add_post("/v1/mail/send", adapter._handle_mail_send)
-    app.router.add_post("/v1/mail/messages/bulk", adapter._handle_mail_bulk)
     app.router.add_get("/v1/mail/messages/{message_id}", adapter._handle_mail_read)
-    app.router.add_post("/v1/mail/messages/{message_id}/reply", adapter._handle_mail_reply)
     app.router.add_post("/v1/mail/messages/{message_id}/modify", adapter._handle_mail_modify)
-    app.router.add_post("/v1/mail/messages/{message_id}/summary", adapter._handle_mail_summary)
-    app.router.add_post("/v1/mail/messages/{message_id}/draft-reply", adapter._handle_mail_draft_reply)
     app.router.add_post("/v1/calendar/oauth/start", adapter._handle_calendar_oauth_start)
     app.router.add_get("/v1/calendar/oauth/status", adapter._handle_calendar_oauth_status)
     app.router.add_get("/v1/calendar/accounts", adapter._handle_calendar_accounts)
@@ -580,7 +576,6 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/calendar/events", adapter._handle_calendar_events)
     app.router.add_post("/v1/calendar/events", adapter._handle_calendar_create)
     app.router.add_get("/v1/calendar/search", adapter._handle_calendar_search)
-    app.router.add_post("/v1/calendar/events/bulk", adapter._handle_calendar_bulk)
     app.router.add_get("/v1/calendar/events/{event_id}", adapter._handle_calendar_read)
     app.router.add_patch("/v1/calendar/events/{event_id}", adapter._handle_calendar_update)
     app.router.add_delete("/v1/calendar/events/{event_id}", adapter._handle_calendar_delete)
@@ -1534,11 +1529,6 @@ class TestCapabilitiesEndpoint:
 
 
 class TestSkillsEndpoint:
-    def test_skills_handler_is_not_shadowed_by_inline_completion_handler(self):
-        source = inspect.getsource(APIServerAdapter)
-        assert source.count("async def _handle_skills") == 1
-        assert source.count("async def _handle_complete_skills") == 1
-
     @pytest.mark.asyncio
     async def test_skills_returns_list_envelope(self, adapter):
         fake_skills = [

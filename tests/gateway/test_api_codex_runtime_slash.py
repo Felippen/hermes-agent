@@ -35,7 +35,9 @@ def test_codex_runtime_enable_persists(api_server):
     with patch("hermes_cli.config.load_config", return_value=cfg):
         with patch("hermes_cli.config.save_config") as save_config:
             with patch("hermes_cli.codex_runtime_switch.check_codex_binary_ok", return_value=(True, "0.130.0")):
-                with patch("hermes_cli.codex_runtime_plugin_migration.migrate"):
+                with patch(
+                    "hermes_cli.codex_runtime_migration_state.schedule_plugin_migration"
+                ) as schedule:
                     result = api_server._dispatch_slash_command(
                         "/codex-runtime on",
                         "session-1",
@@ -44,6 +46,8 @@ def test_codex_runtime_enable_persists(api_server):
     assert result["type"] == "text"
     assert cfg["model"]["openai_runtime"] == "codex_app_server"
     save_config.assert_called_once()
+    schedule.assert_called_once()
+    assert "background" in result["content"].lower()
 
 
 def test_codex_runtime_blocks_while_agent_running(api_server):

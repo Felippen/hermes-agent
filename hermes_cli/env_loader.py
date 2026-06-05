@@ -251,17 +251,18 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from external sources (Bitwarden, 1Password) into env.
 
     Runs AFTER dotenv loads so .env values are visible (we use them to
-    locate access tokens and detect ``op://`` references) but BEFORE
-    the rest of Hermes reads ``os.environ`` for credentials.  Any
-    failure here is logged and swallowed — external secret sources
-    must never block startup.
+    locate the access token) but BEFORE the rest of Hermes reads
+    ``os.environ`` for credentials.  Any failure here is logged and
+    swallowed — external secret sources must never block startup.
 
     Idempotent within a process: subsequent calls for the same
-    ``home_path`` are no-ops. ``load_hermes_dotenv()`` runs at import
-    time from several hot modules, so without this guard the secret
-    source status lines would print repeatedly during one startup.
-    Call ``reset_secret_source_cache()`` to force a re-pull in tests or
-    long-lived processes after config changes.
+    ``home_path`` are no-ops.  ``load_hermes_dotenv()`` runs at import
+    time from several hot modules (cli.py, hermes_cli/main.py,
+    run_agent.py, trajectory_compressor.py, ...), so without this guard
+    the Bitwarden status line would print 3-5x per CLI startup.  Use
+    ``reset_secret_source_cache()`` if you need to force a re-pull
+    (tests, future ``hermes secrets bitwarden sync`` from a long-running
+    process).
     """
     home_key = str(Path(home_path).resolve())
     if home_key in _APPLIED_HOMES:
@@ -323,7 +324,7 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                     file=sys.stderr,
                 )
 
-    # --- 1Password SDK (op:// references) -----------------------------------
+    # --- 1Password -----------------------------------------------------------
     op_cfg = (cfg or {}).get("onepassword") or {}
     if op_cfg.get("enabled"):
         try:
@@ -333,9 +334,10 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         else:
             result = apply_onepassword_secrets(
                 enabled=True,
-                mode=op_cfg.get("mode", "desktop"),
+                mode=str(op_cfg.get("mode", "desktop")),
                 service_account_token_env=op_cfg.get(
-                    "service_account_token_env", "OP_SERVICE_ACCOUNT_TOKEN"
+                    "service_account_token_env",
+                    "OP_SERVICE_ACCOUNT_TOKEN",
                 ),
                 cache_ttl_seconds=float(op_cfg.get("cache_ttl_seconds", 300)),
                 override_existing=bool(op_cfg.get("override_existing", False)),
