@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_diagnostics as kd
 from hermes_cli import kanban_http as kh
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,22 @@ def _map_error(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc))
     raise exc
+
+
+def _resolve_board(board: Optional[str]) -> Optional[str]:
+    """Validate and normalise a board slug from a query param."""
+    if board is None or board == "":
+        return None
+    try:
+        normed = kanban_db._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+        raise HTTPException(
+            status_code=404,
+            detail=f"board {normed!r} does not exist",
+        )
+    return normed
 
 
 def _conn(board: Optional[str] = None):
