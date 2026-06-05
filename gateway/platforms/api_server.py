@@ -34,6 +34,7 @@ Requires:
 import asyncio
 import base64
 import binascii
+from datetime import datetime
 import hashlib
 import hmac
 from html import escape as html_escape
@@ -2140,6 +2141,760 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             plan_artifact_store=self._ensure_dev_plan_artifact_store(),
         )
 
+    def _is_api_slash_command(self, text: Any) -> bool:
+        """Return True when ``text`` is a recognised gateway slash command."""
+        raw_text = ""
+        if isinstance(text, str):
+            raw_text = text
+        elif isinstance(text, list):
+            for part in text:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    raw_text = part.get("text", "")
+                    break
+
+        raw_text = raw_text.strip()
+        if not raw_text.startswith("/"):
+            return False
+
+        cmd_name = raw_text.split(maxsplit=1)[0][1:].lower()
+        from hermes_cli.commands import resolve_command
+
+        return resolve_command(cmd_name) is not None
+
+    def _find_active_run_id_for_session(self, session_id: str) -> Optional[str]:
+        """Return the run/completion id for an in-flight agent turn on a session."""
+        if not session_id:
+            return None
+        normalized = session_id.casefold()
+        for run_id, status in self._run_statuses.items():
+            active_session = str(status.get("session_id") or "").casefold()
+            if active_session != normalized:
+                continue
+            if status.get("status") in {"running", "waiting_for_approval", "stopping"}:
+                return run_id
+        return None
+
+    def _interrupt_run(self, run_id: str) -> str:
+        """Stop an active run by id; returns user-facing markdown."""
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+
+        if agent is None and task is None:
+            return f"No active run found for `{run_id}`."
+
+        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+
+        if agent is not None:
+            try:
+                agent.interrupt("Stop requested via slash command")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if task is not None and not task.done():
+            task.cancel()
+
+        return f"Stop requested for run `{run_id}`."
+
+    def _dispatch_codex_runtime_slash(self, cmd_arg: str, session_id: str) -> dict:
+        """Toggle or query the optional codex app-server runtime."""
+        if self._find_active_run_id_for_session(session_id):
+            return {
+                "type": "error",
+                "message": "Agent is running — wait or /stop first, then change runtime.",
+            }
+
+        from hermes_cli import codex_runtime_switch as crs
+
+        new_value, errors = crs.parse_args(cmd_arg)
+        if errors:
+            return {"type": "error", "message": "❌ " + "\n❌ ".join(errors)}
+
+        try:
+            from hermes_cli.config import load_config, save_config
+        except Exception as exc:  # noqa: BLE001
+            return {"type": "error", "message": f"Could not load config: {exc}"}
+
+        cfg = load_config()
+        defer_migration = new_value == "codex_app_server"
+        result = crs.apply(
+            cfg,
+            new_value,
+            persist_callback=(save_config if new_value is not None else None),
+            defer_plugin_migration=defer_migration,
+        )
+        if result.success and result.plugin_migration_deferred:
+            from hermes_cli.codex_runtime_migration_state import schedule_plugin_migration
+
+            schedule_plugin_migration(cfg)
+        elif result.success and new_value == "auto":
+            from hermes_cli.codex_runtime_migration_state import mark_idle
+
+            mark_idle()
+        prefix = "✓" if result.success else "✗"
+        if result.success:
+            return {"type": "text", "content": f"{prefix} {result.message}"}
+        return {"type": "error", "message": f"{prefix} {result.message}"}
+
+    def _apply_session_model_from_slash(
+        self,
+        session_id: str,
+        model_arg: str,
+    ) -> tuple[bool, str]:
+        """Apply a /model slash argument to a session override."""
+        model_arg = (model_arg or "").strip()
+        if not model_arg:
+            return False, "usage: /model <provider/model> or /model <model-name>"
+        try:
+            return self._set_session_model_override(session_id, model_arg)
+        except AttributeError:
+            return False, "Session model switching is unavailable in this build."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("slash /model failed for %s: %s", session_id, exc)
+            return False, f"Could not switch model: {exc}"
+
+    def _dispatch_slash_command(
+        self,
+        command_text: str,
+        session_id: str,
+        gateway_session_key: str = None,
+    ) -> dict:
+        """Dispatch a slash command and return a structured result dict."""
+        command_text = (command_text or "").strip()
+        if not command_text.startswith("/"):
+            return {"type": "error", "message": "Not a slash command."}
+
+        parts = command_text.split(maxsplit=1)
+        cmd_name = parts[0][1:].lower()
+        cmd_arg = parts[1] if len(parts) > 1 else ""
+
+        from hermes_cli.commands import resolve_command
+
+        cmd = resolve_command(cmd_name)
+        canonical = cmd.name if cmd is not None else cmd_name
+
+        if cmd is None and cmd_name not in NATIVE_APP_SLASH_COMMANDS:
+            return {
+                "type": "error",
+                "message": f"Unknown command `/{cmd_name}`. Send `/help` for available commands.",
+            }
+
+        if canonical == "queue" or cmd_name in {"queue", "q"}:
+            if not cmd_arg:
+                return {"type": "error", "message": "usage: /queue <prompt>"}
+            return {"type": "send", "message": cmd_arg}
+
+        if canonical == "background" or cmd_name in {"bg", "btw"}:
+            if not cmd_arg.strip():
+                return {"type": "error", "message": "usage: /background <prompt>"}
+            return self._dispatch_api_background_command(
+                session_id,
+                cmd_arg.strip(),
+                gateway_session_key=gateway_session_key,
+            )
+
+        if canonical == "stop":
+            run_id = self._find_active_run_id_for_session(session_id)
+            if not run_id:
+                return {"type": "error", "message": "No active agent run to stop for this session."}
+            return {"type": "text", "content": self._interrupt_run(run_id)}
+
+        if canonical == "model":
+            ok, message = self._apply_session_model_from_slash(session_id, cmd_arg)
+            return {"type": "text" if ok else "error", "content" if ok else "message": message}
+
+        if canonical in ("help", "commands"):
+            from hermes_cli.commands import gateway_help_lines
+
+            lines = gateway_help_lines()
+            body = "\n".join(f"- {line}" for line in lines) or "_(no commands available)_"
+            return {"type": "text", "content": "**Available commands**\n\n" + body}
+
+        if canonical == "status":
+            title = None
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    title = db.get_session_title(session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("status command: could not load session title: %s", exc)
+            content = "**Session status**\n\n" + "\n".join(
+                [
+                    f"- **Session ID:** `{session_id}`",
+                    f"- **Title:** {title or '(untitled)'}",
+                    "- **Platform:** API Server",
+                ]
+            )
+            return {"type": "text", "content": content}
+
+        if canonical == "profile":
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                profile_name = get_active_profile_name()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("profile command: could not resolve profile: %s", exc)
+                profile_name = "unknown"
+            try:
+                from hermes_constants import get_hermes_home
+
+                home = str(get_hermes_home())
+            except Exception:  # noqa: BLE001
+                home = os.path.expanduser("~/.hermes")
+            return {
+                "type": "text",
+                "content": (
+                    "**Active profile**\n\n"
+                    f"- **Profile:** `{profile_name}`\n"
+                    f"- **Home:** `{home}`"
+                ),
+            }
+
+        if canonical == "yolo":
+            key = gateway_session_key or session_id
+            try:
+                from tools import approval
+
+                if approval.is_session_yolo_enabled(key):
+                    approval.disable_session_yolo(key)
+                    return {"type": "text", "content": "YOLO mode **disabled** for this session."}
+                approval.enable_session_yolo(key)
+                return {
+                    "type": "text",
+                    "content": (
+                        "YOLO mode **enabled** for this session — tool approvals "
+                        "will be auto-accepted."
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("yolo command failed: %s", exc)
+                return {"type": "error", "message": f"Could not toggle YOLO mode: {exc}"}
+
+        if canonical == "codex-runtime":
+            return self._dispatch_codex_runtime_slash(cmd_arg, session_id)
+
+        if canonical == "goal":
+            return self._dispatch_goal_slash(session_id, cmd_arg)
+
+        if canonical == "subgoal":
+            return self._dispatch_subgoal_slash(session_id, cmd_arg)
+
+        if canonical in {"project", "vision", "milestone", "pgoal", "psubgoal"}:
+            return self._dispatch_project_goal_slash(canonical, cmd_arg)
+
+        if canonical in ("new", "reset", "clear"):
+            try:
+                db = self._ensure_session_db()
+                if db is None:
+                    return {
+                        "type": "text",
+                        "content": "Conversation cleared (no session database configured).",
+                    }
+                db.clear_messages(session_id)
+                return {
+                    "type": "text",
+                    "content": f"Conversation cleared. Session `{session_id}` now has no messages.",
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("clear command failed for %s: %s", session_id, exc)
+                return {"type": "error", "message": f"Could not clear the conversation: {exc}"}
+
+        return {
+            "type": "error",
+            "message": (
+                f"The command `/{cmd_name}` is recognised but is not available "
+                "over the API server. Send `/help` for the list of supported commands."
+            ),
+        }
+
+    def _dispatch_api_background_command(
+        self,
+        parent_session_id: str,
+        prompt: str,
+        gateway_session_key: str = None,
+    ) -> dict:
+        """Start a Hermes-native /background task for an API session."""
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+
+        self._persist_subagent_event(
+            {
+                "event": "subagent.start",
+                "subagent_id": task_id,
+                "run_id": task_id,
+                "depth": 0,
+                "goal": prompt,
+                "status": "running",
+                "runtime": "background",
+                "preview": preview,
+                "timestamp": time.time(),
+            },
+            session_id=parent_session_id,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return {
+                "type": "error",
+                "message": "Background tasks require an active API server loop.",
+            }
+
+        task = loop.create_task(
+            self._run_api_background_task(
+                parent_session_id=parent_session_id,
+                prompt=prompt,
+                task_id=task_id,
+                gateway_session_key=gateway_session_key,
+            )
+        )
+        try:
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is not None:
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+        except Exception:  # noqa: BLE001
+            pass
+
+        content = (
+            f'🔄 Background task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            "You can keep chatting — results will appear when done."
+        )
+        return {"type": "text", "content": content}
+
+    async def _run_api_background_task(
+        self,
+        *,
+        parent_session_id: str,
+        prompt: str,
+        task_id: str,
+        gateway_session_key: str = None,
+        is_follow_up: bool = False,
+    ) -> None:
+        """Execute a background prompt in an isolated session and mirror progress."""
+        started = time.time()
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        status = "completed"
+        summary = ""
+        usage: Dict[str, Any] = {}
+
+        try:
+            result, usage = await self._run_agent(
+                user_message=prompt,
+                conversation_history=[],
+                session_id=task_id,
+                gateway_session_key=gateway_session_key,
+                run_id=task_id,
+            )
+            if isinstance(result, dict) and result.get("failed"):
+                status = "failed"
+                summary = str(result.get("error") or "Background task failed.")
+            else:
+                summary = (
+                    str(result.get("final_response") or "")
+                    if isinstance(result, dict)
+                    else str(result or "")
+                )
+                if not summary.strip():
+                    summary = "Background task completed."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_server background task %s failed: %s", task_id, exc)
+            status = "failed"
+            summary = str(exc)
+        finally:
+            self._active_run_agents.pop(task_id, None)
+
+        complete_payload: Dict[str, Any] = {
+            "event": "subagent.complete",
+            "subagent_id": task_id,
+            "status": status,
+            "summary": summary[:4000],
+            "preview": preview,
+            "duration_seconds": round(time.time() - started, 2),
+        }
+        if is_follow_up:
+            complete_payload["follow_up"] = True
+        if status == "completed" and usage:
+            complete_payload["input_tokens"] = usage.get("input_tokens")
+            complete_payload["output_tokens"] = usage.get("output_tokens")
+        self._persist_subagent_event(complete_payload, session_id=parent_session_id)
+
+    def _execute_api_slash_command(
+        self,
+        command_text: str,
+        session_id: str,
+        gateway_session_key: str = None,
+    ) -> str:
+        """Execute a recognised gateway slash command server-side."""
+        result = self._dispatch_slash_command(
+            command_text,
+            session_id,
+            gateway_session_key=gateway_session_key,
+        )
+        result_type = result.get("type")
+        if result_type == "text":
+            return str(result.get("content") or "")
+        if result_type == "error":
+            return str(result.get("message") or "Command failed.")
+        if result_type == "send":
+            return f"Queued message for next turn: {result.get('message', '')}"
+        return str(result.get("message") or result.get("content") or "Command failed.")
+
+    async def _api_slash_command_chat_response(
+        self,
+        request: "web.Request",
+        command_feedback: str,
+        *,
+        stream: bool,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        gateway_session_key: str = None,
+    ) -> "web.Response":
+        """Pack a slash-command result into a Chat Completions response."""
+        if stream:
+            import queue as _q
+
+            cmd_q: "_q.Queue" = _q.Queue()
+            cmd_q.put(command_feedback)
+            cmd_q.put(None)
+            done_task: "asyncio.Future" = asyncio.get_running_loop().create_future()
+            done_task.set_result(
+                (
+                    {"final_response": command_feedback},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            )
+            return await self._write_sse_chat_completion(
+                request,
+                completion_id,
+                model_name,
+                created,
+                cmd_q,
+                done_task,
+                None,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+
+        response_headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": command_feedback},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+            headers=response_headers,
+        )
+
+    def _mail_public_base_url(self, request: "web.Request") -> str:
+        override = os.getenv("HERMES_MAIL_PUBLIC_URL", "").strip().rstrip("/")
+        if override:
+            return override
+        scheme = request.headers.get("X-Forwarded-Proto") or request.scheme
+        host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
+        return f"{scheme}://{host}".rstrip("/")
+
+    def _mail_redirect_uri(self, request: "web.Request") -> str:
+        return f"{self._mail_public_base_url(request)}/v1/mail/oauth/callback"
+
+    async def _request_json_or_empty(self, request: "web.Request") -> dict:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return body if isinstance(body, dict) else {}
+
+    async def _mail_json_response(self, tool_name: str, args: dict) -> "web.Response":
+        try:
+            from tools.gmail_mail_tools import MailError, dispatch_mail_tool
+
+            return web.json_response(dispatch_mail_tool(tool_name, args))
+        except MailError as exc:
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            logger.warning("mail API tool %s failed: %s", tool_name, exc)
+            return web.json_response(_openai_error(message), status=500)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mail API tool %s failed: %s", tool_name, exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _calendar_json_response(self, tool_name: str, args: dict) -> "web.Response":
+        try:
+            from tools.google_calendar_tools import CalendarError, dispatch_calendar_tool
+
+            return web.json_response(dispatch_calendar_tool(tool_name, args))
+        except CalendarError as exc:
+            message = str(exc)
+            if "requires explicit approval" in message:
+                return web.json_response({
+                    "ok": False,
+                    "status": "approval_required",
+                    "message": message,
+                })
+            logger.warning("calendar API tool %s failed: %s", tool_name, exc)
+            return web.json_response(_openai_error(message), status=500)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("calendar API tool %s failed: %s", tool_name, exc)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_mail_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response("list_email_accounts", {})
+
+    async def _handle_mail_messages(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "label": request.query.get("label", "inbox"),
+            "limit": int(request.query.get("limit", "25")),
+        }
+        return await self._mail_json_response("list_emails", args)
+
+    async def _handle_mail_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "query": request.query.get("q") or request.query.get("query", ""),
+            "label": request.query.get("label"),
+            "limit": int(request.query.get("limit", "25")),
+        }
+        return await self._mail_json_response("search_emails", args)
+
+    async def _handle_mail_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response("sync_email", await self._request_json_or_empty(request))
+
+    async def _handle_mail_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError, start_gmail_oauth
+
+            return web.json_response(start_gmail_oauth(self._mail_redirect_uri(request)))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "gmail.oauth_start",
+                    "provider": "gmail",
+                    "status": getattr(exc, "status", "failed"),
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_mail_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import gmail_oauth_status
+
+            return web.json_response(gmail_oauth_status())
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_mail_oauth_callback(self, request: "web.Request") -> "web.Response":
+        try:
+            from tools.gmail_oauth import GmailOAuthError, complete_gmail_oauth_callback
+
+            result = complete_gmail_oauth_callback(
+                code=request.query.get("code"),
+                state=request.query.get("state"),
+                granted_scope=request.query.get("scope"),
+                error=request.query.get("error"),
+            )
+            status = 200
+            title = "Gmail connected"
+            detail = result.get("message", "Gmail connected.")
+        except GmailOAuthError as exc:
+            status = 400
+            title = "Gmail connection failed"
+            detail = str(exc)
+        html = f"<html><body><h1>{html_escape(title)}</h1><p>{html_escape(detail)}</p></body></html>"
+        return web.Response(text=html, status=status, content_type="text/html")
+
+    async def _handle_mail_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response(
+            "read_email",
+            {"message_id": request.match_info.get("message_id", "")},
+        )
+
+    async def _handle_mail_send(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._mail_json_response("send_email", await self._request_json_or_empty(request))
+
+    async def _handle_mail_modify(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body = await self._request_json_or_empty(request)
+        body.setdefault("message_id", request.match_info.get("message_id", ""))
+        operation = str(body.get("operation") or "").strip().lower()
+        if operation == "archive":
+            return await self._mail_json_response("archive_email", body)
+        if operation == "delete":
+            return await self._mail_json_response("delete_email", body)
+        if operation in {"mark_read", "read"}:
+            return await self._mail_json_response("mark_email_read", body)
+        if operation in {"mark_unread", "unread"}:
+            return await self._mail_json_response("mark_email_read", {**body, "unread": True})
+        return web.json_response(
+            _openai_error("operation must be archive, delete, mark_read, or mark_unread"),
+            status=400,
+        )
+
+    async def _handle_calendar_oauth_start(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.gmail_oauth import GmailOAuthError
+            from tools.google_calendar_oauth import start_calendar_oauth
+
+            return web.json_response(start_calendar_oauth(self._mail_redirect_uri(request)))
+        except GmailOAuthError as exc:
+            return web.json_response(
+                {
+                    "object": "google_calendar.oauth_start",
+                    "provider": "google_calendar",
+                    "status": getattr(exc, "status", "failed"),
+                    "connected": False,
+                    "message": str(exc),
+                },
+                status=400,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_calendar_oauth_status(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.google_calendar_oauth import calendar_oauth_status
+
+            return web.json_response(calendar_oauth_status())
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+    async def _handle_calendar_accounts(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("list_calendar_accounts", {})
+
+    async def _handle_calendar_calendars(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("list_calendars", {})
+
+    async def _handle_calendar_sync(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("sync_calendar", await self._request_json_or_empty(request))
+
+    async def _handle_calendar_events(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "calendar_id": request.query.get("calendar_id", "primary"),
+            "start": request.query.get("start"),
+            "end": request.query.get("end"),
+            "limit": int(request.query.get("limit", "25")),
+        }
+        return await self._calendar_json_response("list_calendar_events", args)
+
+    async def _handle_calendar_search(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        args = {
+            "query": request.query.get("q") or request.query.get("query", ""),
+            "calendar_id": request.query.get("calendar_id", "primary"),
+            "limit": int(request.query.get("limit", "25")),
+        }
+        return await self._calendar_json_response("search_calendar_events", args)
+
+    async def _handle_calendar_read(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response(
+            "read_calendar_event",
+            {"event_id": request.match_info.get("event_id", "")},
+        )
+
+    async def _handle_calendar_create(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response("create_calendar_event", await self._request_json_or_empty(request))
+
+    async def _handle_calendar_update(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body = await self._request_json_or_empty(request)
+        body.setdefault("event_id", request.match_info.get("event_id", ""))
+        return await self._calendar_json_response("update_calendar_event", body)
+
+    async def _handle_calendar_delete(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._calendar_json_response(
+            "delete_calendar_event",
+            {"event_id": request.match_info.get("event_id", "")},
+        )
+
+    async def _handle_calendar_respond(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body = await self._request_json_or_empty(request)
+        body.setdefault("event_id", request.match_info.get("event_id", ""))
+        return await self._calendar_json_response("respond_to_calendar_event", body)
+
     @staticmethod
     def _serialize_message_content(content) -> str:
         if content is None:
@@ -2568,6 +3323,22 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
                 "complete_slash": {"method": "POST", "path": "/v1/complete/slash"},
                 "complete_skills": {"method": "POST", "path": "/v1/complete/skills"},
                 "slash": {"method": "POST", "path": "/v1/slash"},
+                "mail_accounts": {"method": "GET", "path": "/v1/mail/accounts"},
+                "mail_messages": {"method": "GET", "path": "/v1/mail/messages"},
+                "mail_search": {"method": "GET", "path": "/v1/mail/search"},
+                "mail_sync": {"method": "POST", "path": "/v1/mail/sync"},
+                "mail_oauth_start": {"method": "POST", "path": "/v1/mail/oauth/start"},
+                "mail_oauth_callback": {"method": "GET", "path": "/v1/mail/oauth/callback"},
+                "mail_oauth_status": {"method": "GET", "path": "/v1/mail/oauth/status"},
+                "mail_send": {"method": "POST", "path": "/v1/mail/send"},
+                "mail_modify": {"method": "POST", "path": "/v1/mail/messages/{message_id}/modify"},
+                "calendar_oauth_start": {"method": "POST", "path": "/v1/calendar/oauth/start"},
+                "calendar_oauth_status": {"method": "GET", "path": "/v1/calendar/oauth/status"},
+                "calendar_accounts": {"method": "GET", "path": "/v1/calendar/accounts"},
+                "calendar_calendars": {"method": "GET", "path": "/v1/calendar/calendars"},
+                "calendar_sync": {"method": "POST", "path": "/v1/calendar/sync"},
+                "calendar_events": {"method": "GET", "path": "/v1/calendar/events"},
+                "calendar_event_create": {"method": "POST", "path": "/v1/calendar/events"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -7311,8 +8082,35 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_get("/v1/sessions/{session_id}/subagents/events", self._handle_session_subagent_events)
             self._app.router.add_delete("/v1/sessions/{session_id}", self._handle_v1_delete_session)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/commands", self._handle_commands)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_get("/v1/mail/accounts", self._handle_mail_accounts)
+            self._app.router.add_get("/v1/mail/messages", self._handle_mail_messages)
+            self._app.router.add_get("/v1/mail/search", self._handle_mail_search)
+            self._app.router.add_post("/v1/mail/sync", self._handle_mail_sync)
+            self._app.router.add_post("/v1/mail/oauth/start", self._handle_mail_oauth_start)
+            self._app.router.add_get("/v1/mail/oauth/callback", self._handle_mail_oauth_callback)
+            self._app.router.add_get("/v1/mail/oauth/status", self._handle_mail_oauth_status)
+            self._app.router.add_post("/v1/mail/send", self._handle_mail_send)
+            self._app.router.add_get("/v1/mail/messages/{message_id}", self._handle_mail_read)
+            self._app.router.add_post("/v1/mail/messages/{message_id}/modify", self._handle_mail_modify)
+            self._app.router.add_post("/v1/calendar/oauth/start", self._handle_calendar_oauth_start)
+            self._app.router.add_get("/v1/calendar/oauth/status", self._handle_calendar_oauth_status)
+            self._app.router.add_get("/v1/calendar/accounts", self._handle_calendar_accounts)
+            self._app.router.add_get("/v1/calendar/calendars", self._handle_calendar_calendars)
+            self._app.router.add_post("/v1/calendar/sync", self._handle_calendar_sync)
+            self._app.router.add_get("/v1/calendar/events", self._handle_calendar_events)
+            self._app.router.add_post("/v1/calendar/events", self._handle_calendar_create)
+            self._app.router.add_get("/v1/calendar/search", self._handle_calendar_search)
+            self._app.router.add_get("/v1/calendar/events/{event_id}", self._handle_calendar_read)
+            self._app.router.add_patch("/v1/calendar/events/{event_id}", self._handle_calendar_update)
+            self._app.router.add_delete("/v1/calendar/events/{event_id}", self._handle_calendar_delete)
+            self._app.router.add_post("/v1/calendar/events/{event_id}/respond", self._handle_calendar_respond)
+            self._app.router.add_post("/v1/complete/slash", self._handle_complete_slash)
+            self._app.router.add_post("/v1/complete/skills", self._handle_complete_skills)
+            self._app.router.add_post("/v1/slash", self._handle_slash)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)

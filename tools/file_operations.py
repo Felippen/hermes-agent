@@ -726,6 +726,7 @@ class ShellFileOperations(FileOperations):
         (the model hand-counted and was off-by-one, 3/4) — so we keep the
         numbers, just not the padding.
         """
+        import os as _os
         from tools.tool_output_limits import get_max_line_length
         padded = (_os.environ.get("HERMES_READ_GUTTER") or "").lower() == "padded"
         max_line_length = get_max_line_length()

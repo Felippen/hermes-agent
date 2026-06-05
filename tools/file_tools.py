@@ -140,11 +140,20 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
         base = Path(live).expanduser()
     else:
         raw = os.environ.get("TERMINAL_CWD")
-        base = Path(raw).expanduser() if raw else Path(os.getcwd())
+        if raw:
+            base = Path(raw).expanduser()
+        else:
+            try:
+                base = Path(os.getcwd())
+            except FileNotFoundError:
+                base = Path(resolve_tool_cwd())
     if not base.is_absolute():
         # A relative base (".", "./sub", "..") is anchored to the process cwd
         # once, here, so the result no longer depends on cwd at resolve() time.
-        base = Path(os.getcwd()) / base
+        try:
+            base = Path(os.getcwd()) / base
+        except FileNotFoundError:
+            base = Path(resolve_tool_cwd()) / base
     return base.resolve()
 
 
