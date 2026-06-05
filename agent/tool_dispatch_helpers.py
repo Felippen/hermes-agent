@@ -334,6 +334,8 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     (content lists with image_url parts) pass through unwrapped so the
     list structure stays valid for vision-capable adapters.
     """
+    if isinstance(content, str):
+        content = _strip_disallowed_control_chars(content)
     wrapped = _maybe_wrap_untrusted(name, content)
     return {
         "role": "tool",

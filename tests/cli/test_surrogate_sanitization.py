@@ -9,7 +9,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
-from run_agent import (
+from agent.message_sanitization import (
     _sanitize_surrogates,
     _sanitize_messages_surrogates,
     _sanitize_messages_control_chars,

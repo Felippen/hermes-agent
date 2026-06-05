@@ -4194,6 +4194,19 @@ def run_conversation(
                             "⚠️ Model returned empty after tool calls — "
                             "nudging to continue"
                         )
+                        _latest_tool_results = []
+                        _idx = len(messages) - 1
+                        while (
+                            _idx >= 0
+                            and isinstance(messages[_idx], dict)
+                            and messages[_idx].get("role") == "tool"
+                        ):
+                            _latest_tool_results.append(dict(messages[_idx]))
+                            _idx -= 1
+                        if _latest_tool_results:
+                            agent._latest_tool_results_before_empty = list(
+                                reversed(_latest_tool_results)
+                            )
                         # Append the empty assistant message first so the
                         # message sequence stays valid:
                         #   tool(result) → assistant("(empty)") → user(nudge)
@@ -4313,6 +4326,28 @@ def run_conversation(
                     # Surface the buffered retry/fallback trace so the
                     # user can see what was attempted before "(empty)".
                     agent._flush_status_buffer()
+
+                    _latest_tool_results = getattr(
+                        agent, "_latest_tool_results_before_empty", None
+                    ) or []
+                    if _latest_tool_results:
+                        _lines = [
+                            "The model returned empty after the latest tool calls, so I'm returning the latest tool results:",
+                            "",
+                        ]
+                        for _tool_msg in _latest_tool_results:
+                            _tool_name = (
+                                str(_tool_msg.get("name") or "")
+                                or "tool"
+                            )
+                            _tool_content = str(_tool_msg.get("content") or "")
+                            _lines.append(f"{_tool_name}: {_tool_content}")
+                        final_response = "\n".join(_lines)
+                        _turn_exit_reason = "tool_result_empty_recovery"
+                        messages.append({"role": "assistant", "content": final_response})
+                        agent._latest_tool_results_before_empty = None
+                        break
+
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)

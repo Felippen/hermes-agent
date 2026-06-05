@@ -59,11 +59,19 @@ def _codex_app_server_text_parts(value: Any) -> List[str]:
 
 
 def _codex_app_server_completed_reasoning_text(item: Any) -> str:
-    if not isinstance(item, dict) or item.get("type") != "reasoning":
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        summary = item.get("summary")
+        content = item.get("content")
+    else:
+        item_type = getattr(item, "type", None)
+        summary = getattr(item, "summary", None)
+        content = getattr(item, "content", None)
+    if item_type != "reasoning":
         return ""
     parts: List[str] = []
-    parts.extend(_codex_app_server_text_parts(item.get("summary")))
-    parts.extend(_codex_app_server_text_parts(item.get("content")))
+    parts.extend(_codex_app_server_text_parts(summary))
+    parts.extend(_codex_app_server_text_parts(content))
     return "\n".join(part for part in parts if part).strip()
 
 
@@ -359,6 +367,7 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+    reasoning_delta_seen = False
 
     for event in event_iter:
         if on_event is not None:
@@ -412,6 +421,7 @@ def _consume_codex_event_stream(
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
             if reasoning_text and on_reasoning_delta is not None:
+                reasoning_delta_seen = True
                 try:
                     on_reasoning_delta(reasoning_text)
                 except Exception:
@@ -422,6 +432,13 @@ def _consume_codex_event_stream(
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
+                if on_reasoning_delta is not None and not reasoning_delta_seen:
+                    reasoning_text = _codex_app_server_completed_reasoning_text(done_item)
+                    if reasoning_text:
+                        try:
+                            on_reasoning_delta(reasoning_text)
+                        except Exception:
+                            logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
