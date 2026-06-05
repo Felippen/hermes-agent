@@ -22,12 +22,96 @@ import queue
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def _git_writable_roots(workspace: str) -> list[str]:
+    """Git-metadata directories that must be writable to commit/push in `workspace`.
+
+    A standalone repo keeps its index, objects, and refs under ``<workspace>/.git``.
+    A *linked worktree* (what Codex Kanban workers run in) instead stores its index
+    under the parent repo's ``.git/worktrees/<name>`` while the object store and
+    packed-refs live in the shared *common* dir — so committing writes to BOTH, and
+    neither sits under the worktree's working directory. Without granting them the
+    sandboxed worker gets ``index.lock: Operation not permitted`` and cannot deliver.
+
+    Parses ``.git`` directly (no subprocess) so it works even when the sandbox would
+    block spawning ``git``. Best-effort: returns ``[]`` if `workspace` is not a repo.
+    """
+    git_path = os.path.join(workspace, ".git")
+    roots: list[str] = []
+    try:
+        if os.path.isdir(git_path):
+            # Standalone repo: one root covers index + objects + refs.
+            roots.append(os.path.realpath(git_path))
+        elif os.path.isfile(git_path):
+            # Linked worktree: ".git" is a pointer file "gitdir: <abs gitdir>".
+            with open(git_path, "r", encoding="utf-8") as handle:
+                content = handle.read().strip()
+            prefix = "gitdir:"
+            if content.startswith(prefix):
+                gitdir = content[len(prefix):].strip()
+                if not os.path.isabs(gitdir):
+                    gitdir = os.path.join(workspace, gitdir)
+                gitdir = os.path.realpath(gitdir)
+                roots.append(gitdir)
+                # Resolve the shared common dir (object store / packed-refs).
+                commondir_file = os.path.join(gitdir, "commondir")
+                if os.path.isfile(commondir_file):
+                    with open(commondir_file, "r", encoding="utf-8") as handle:
+                        rel = handle.read().strip()
+                    common_dir = (
+                        rel if os.path.isabs(rel) else os.path.join(gitdir, rel)
+                    )
+                else:
+                    # Conventional layout: <repo>/.git/worktrees/<name> -> <repo>/.git
+                    common_dir = os.path.join(gitdir, os.pardir, os.pardir)
+                roots.append(os.path.realpath(common_dir))
+    except OSError:
+        return []
+    return roots
+
+
+def _kanban_writable_roots(env: "Mapping[str, str]") -> list[str]:
+    """Ordered, de-duplicated writable roots for a Kanban worker's Codex sandbox.
+
+    Covers (in order): the Kanban board DB directory, any dispatcher-pinned
+    workspace paths, and the git-metadata dirs of the worker's workspace so it can
+    commit and push its result. Keeps the sandbox tight — no broad home access.
+    """
+    candidates: list[str] = []
+    kanban_db = env.get("HERMES_KANBAN_DB")
+    if kanban_db:
+        candidates.append(os.path.dirname(kanban_db))
+    else:
+        candidates.append(
+            env.get(
+                "HERMES_KANBAN_ROOT",
+                os.path.join(
+                    env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                    "kanban",
+                ),
+            )
+        )
+    workspace = env.get("HERMES_KANBAN_WORKSPACE")
+    for key in ("HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT"):
+        candidates.append(env.get(key, ""))
+    if workspace:
+        candidates.extend(_git_writable_roots(workspace))
+
+    seen: set[str] = set()
+    roots: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            roots.append(candidate)
+    return roots
 
 
 @dataclass
@@ -81,30 +165,22 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
+        # Kanban workers must be able to write (a) their handoff/status back to
+        # the board DB and (b) the git metadata for their workspace — both live
+        # OUTSIDE the per-task working directory. The workspace is typically a
+        # linked git worktree whose index sits under the parent repo's
+        # .git/worktrees/<name>, so without granting it the worker finishes its
+        # work but then fails with `index.lock: Operation not permitted` and
+        # cannot commit/push its result. Keep the sandbox on and tight: add only
+        # the Kanban + workspace git roots, never danger-full-access.
         if spawn_env.get("HERMES_KANBAN_TASK"):
-            kanban_db = spawn_env.get("HERMES_KANBAN_DB")
-            kanban_root = (
-                os.path.dirname(kanban_db)
-                if kanban_db
-                else spawn_env.get(
-                    "HERMES_KANBAN_ROOT",
-                    os.path.join(
-                        spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                        "kanban",
-                    ),
-                )
-            )
+            writable_roots = _kanban_writable_roots(spawn_env)
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
+                    f"sandbox_workspace_write.writable_roots={json.dumps(writable_roots)}",
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]

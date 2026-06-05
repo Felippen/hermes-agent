@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -243,10 +245,10 @@ class TestSpawnEnvIsolation:
         assert captured["env"].get("HOME") == "/users/alice"
 
     def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
+        """With no pinned workspace, a Kanban worker still gets exactly the
+        board DB directory as its extra writable root, and never falls back to
+        danger-full-access. (Workspace git roots are covered separately when
+        HERMES_KANBAN_WORKSPACE is set.)
         """
         import subprocess
         from agent.transports import codex_app_server as cas
@@ -294,5 +296,171 @@ class TestSpawnEnvIsolation:
             'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
             in cmd
         )
+        assert "sandbox_workspace_write.network_access=false" in cmd
+        assert all("danger" not in part for part in cmd)
+
+
+class TestGitWritableRoots:
+    """`_git_writable_roots` resolves the metadata dirs a commit/push needs."""
+
+    def test_standalone_repo_grants_dotgit(self, tmp_path):
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+
+        roots = _git_writable_roots(str(repo))
+
+        assert roots == [os.path.realpath(str(repo / ".git"))]
+
+    def test_linked_worktree_grants_gitdir_and_common_dir(self, tmp_path):
+        """A worktree's index lives under .git/worktrees/<name> while objects
+        live in the common dir; BOTH must be writable to commit."""
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        git_dir = tmp_path / "repo" / ".git"
+        worktree_gitdir = git_dir / "worktrees" / "wt"
+        worktree_gitdir.mkdir(parents=True)
+        # commondir is relative to the worktree gitdir: ../.. -> the repo .git
+        (worktree_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / ".git").write_text(
+            f"gitdir: {worktree_gitdir}\n", encoding="utf-8"
+        )
+
+        roots = _git_writable_roots(str(workspace))
+
+        assert os.path.realpath(str(worktree_gitdir)) in roots
+        assert os.path.realpath(str(git_dir)) in roots
+
+    def test_worktree_falls_back_to_conventional_common_dir(self, tmp_path):
+        """If no commondir file exists, fall back to the conventional
+        .git/worktrees/<name> -> .git layout."""
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        git_dir = tmp_path / "repo" / ".git"
+        worktree_gitdir = git_dir / "worktrees" / "wt"
+        worktree_gitdir.mkdir(parents=True)
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / ".git").write_text(
+            f"gitdir: {worktree_gitdir}\n", encoding="utf-8"
+        )
+
+        roots = _git_writable_roots(str(workspace))
+
+        assert os.path.realpath(str(git_dir)) in roots
+
+    def test_non_repo_returns_empty(self, tmp_path):
+        from agent.transports.codex_app_server import _git_writable_roots
+
+        assert _git_writable_roots(str(tmp_path / "not-a-repo")) == []
+
+
+class TestKanbanWritableRoots:
+    """`_kanban_writable_roots` is ordered, de-duplicated, and DB-dir-first."""
+
+    def test_db_dir_is_first_then_workspace_git_roots(self, tmp_path):
+        from agent.transports.codex_app_server import _kanban_writable_roots
+
+        git_dir = tmp_path / "repo" / ".git"
+        worktree_gitdir = git_dir / "worktrees" / "wt"
+        worktree_gitdir.mkdir(parents=True)
+        (worktree_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / ".git").write_text(
+            f"gitdir: {worktree_gitdir}\n", encoding="utf-8"
+        )
+
+        env = {
+            "HERMES_KANBAN_DB": "/k/boards/smoke/kanban.db",
+            "HERMES_KANBAN_WORKSPACE": str(workspace),
+        }
+        roots = _kanban_writable_roots(env)
+
+        assert roots[0] == "/k/boards/smoke"
+        assert str(workspace) in roots
+        assert os.path.realpath(str(worktree_gitdir)) in roots
+        assert os.path.realpath(str(git_dir)) in roots
+        # No duplicates, and order is preserved.
+        assert len(roots) == len(set(roots))
+
+    def test_no_workspace_yields_only_db_dir(self):
+        from agent.transports.codex_app_server import _kanban_writable_roots
+
+        roots = _kanban_writable_roots(
+            {"HERMES_KANBAN_DB": "/k/boards/smoke/kanban.db"}
+        )
+        assert roots == ["/k/boards/smoke"]
+
+    def test_falls_back_to_kanban_root_without_db(self):
+        from agent.transports.codex_app_server import _kanban_writable_roots
+
+        roots = _kanban_writable_roots({"HERMES_KANBAN_ROOT": "/k/root"})
+        assert roots == ["/k/root"]
+
+
+class TestKanbanWorkerGrantsWorktreeGitRoot:
+    """End-to-end: a worker pinned to a worktree workspace gets its git
+    metadata dirs in the spawned app-server writable_roots."""
+
+    def test_worktree_git_roots_in_spawn_cmd(self, tmp_path, monkeypatch):
+        import json
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        git_dir = tmp_path / "repo" / ".git"
+        worktree_gitdir = git_dir / "worktrees" / "wt"
+        worktree_gitdir.mkdir(parents=True)
+        (worktree_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / ".git").write_text(
+            f"gitdir: {worktree_gitdir}\n", encoding="utf-8"
+        )
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = self.stdout = self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/k/boards/smoke/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        cmd = captured["cmd"]
+        roots_arg = next(
+            p
+            for p in cmd
+            if p.startswith("sandbox_workspace_write.writable_roots=")
+        )
+        roots = json.loads(roots_arg.split("=", 1)[1])
+        assert "/k/boards/smoke" in roots
+        assert os.path.realpath(str(worktree_gitdir)) in roots
+        assert os.path.realpath(str(git_dir)) in roots
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
