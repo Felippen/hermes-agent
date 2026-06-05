@@ -58,6 +58,7 @@ _TRACE_ACTIONS = {
 _NEED_STATES = {"detected", "advised", "resolved", "suppressed", "rejected"}
 _NEED_RISK_LEVELS = {"low", "medium", "high"}
 _NEED_POLICIES = {"advisory", "provider_allowed", "provider_blocked"}
+_PROVIDER_OUTCOMES = {"denied", "empty", "stale", "unsupported", "rejected"}
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,9 @@ class ZenMetrics:
     injected_slice_count: int = 0
     rejected_slice_count: int = 0
     provider_budget_used: int = 0
+    provider_denied_count: int = 0
+    provider_empty_count: int = 0
+    provider_stale_count: int = 0
 
     @property
     def compression_ratio(self) -> float:
@@ -151,6 +155,9 @@ class ZenMetrics:
             "injected_slice_count": self.injected_slice_count,
             "rejected_slice_count": self.rejected_slice_count,
             "provider_budget_used": self.provider_budget_used,
+            "provider_denied_count": self.provider_denied_count,
+            "provider_empty_count": self.provider_empty_count,
+            "provider_stale_count": self.provider_stale_count,
         }
 
 
@@ -189,6 +196,7 @@ class ZenContextSlice:
     summary: str
     source_id: str
     token_estimate: int
+    uncertain: bool = False
 
     def to_safe_dict(self) -> dict[str, Any]:
         return {
@@ -196,12 +204,35 @@ class ZenContextSlice:
             "summary": _sentence(self.summary, _MASKED_SUMMARY_CHARS),
             "source_id": self.source_id,
             "token_estimate": self.token_estimate,
+            "uncertain": self.uncertain,
+            "redacted": True,
+        }
+
+
+@dataclass(frozen=True)
+class ZenProviderOutcome:
+    status: str
+    reason: str = ""
+    summary: str = ""
+    source_id: str = ""
+    token_estimate: int = 0
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status if self.status in _PROVIDER_OUTCOMES else "rejected",
+            "reason": _sentence(self.reason, 120),
+            "source_id": self.source_id,
+            "token_estimate": max(0, int(self.token_estimate)),
             "redacted": True,
         }
 
 
 class ZenContextNeedProvider(Protocol):
-    def resolve_context_need(self, need: ZenContextNeed, budget: int) -> Iterable[ZenContextSlice | Dict[str, Any] | str]:
+    def resolve_context_need(
+        self,
+        need: ZenContextNeed,
+        budget: int,
+    ) -> Iterable[ZenContextSlice | ZenProviderOutcome | Dict[str, Any] | str]:
         ...
 
 
@@ -807,8 +838,9 @@ class ZenContextEngine(ContextCompressor):
             resolved = self._maybe_resolve_context_need(need)
             if resolved:
                 for item in resolved:
+                    label = "resolved uncertain" if item.uncertain else "resolved"
                     lines.append(
-                        f"- needed_context resolved: {item.summary} [source: {item.source_id}; need: {need.need_id}]"
+                        f"- needed_context {label}: {item.summary} [source: {item.source_id}; need: {need.need_id}]"
                     )
                 continue
             advised = self._replace_context_need(need, lifecycle_state="advised")
@@ -836,10 +868,26 @@ class ZenContextEngine(ContextCompressor):
         self._zen_metrics.provider_call_count += 1
         slices: list[ZenContextSlice] = []
         budget_used = 0
-        for raw in self._zen_context_need_provider.resolve_context_need(need, need.token_budget):
+        saw_candidate = False
+        try:
+            provider_items = list(self._zen_context_need_provider.resolve_context_need(need, need.token_budget))
+        except Exception as exc:
+            self._record_provider_outcome(need, _provider_outcome_from_exception(exc))
+            return []
+        if not provider_items:
+            self._record_provider_outcome(need, ZenProviderOutcome(status="empty", reason="provider_returned_no_slices"))
+            return []
+        for raw in provider_items:
+            saw_candidate = True
+            outcome = _coerce_provider_outcome(raw)
+            if outcome is not None:
+                self._record_provider_outcome(need, outcome)
+                if outcome.status != "stale" or not outcome.summary:
+                    continue
             item = _coerce_context_slice(need.need_id, raw)
             if not item or not item.source_id:
                 self._zen_metrics.rejected_slice_count += 1
+                self._replace_context_need(need, lifecycle_state="rejected")
                 self._record_trace(
                     action="dropped",
                     reason_code=f"context_need_rejected_{need.reason}",
@@ -850,6 +898,7 @@ class ZenContextEngine(ContextCompressor):
                 continue
             if item.token_estimate > need.token_budget - budget_used:
                 self._zen_metrics.rejected_slice_count += 1
+                self._replace_context_need(need, lifecycle_state="rejected")
                 self._record_trace(
                     action="dropped",
                     reason_code=f"context_need_rejected_{need.reason}",
@@ -861,6 +910,8 @@ class ZenContextEngine(ContextCompressor):
             slices.append(item)
             budget_used += item.token_estimate
         if not slices:
+            if saw_candidate:
+                self._replace_context_need(need, lifecycle_state="rejected")
             return []
         self._zen_metrics.provider_budget_used += budget_used
         self._zen_metrics.injected_slice_count += len(slices)
@@ -875,6 +926,32 @@ class ZenContextEngine(ContextCompressor):
             confidence="observed",
         )
         return slices
+
+    def _record_provider_outcome(self, need: ZenContextNeed, outcome: ZenProviderOutcome) -> None:
+        status = outcome.status if outcome.status in _PROVIDER_OUTCOMES else "rejected"
+        if status == "denied":
+            self._zen_metrics.provider_denied_count += 1
+            lifecycle = "advised"
+        elif status == "empty":
+            self._zen_metrics.provider_empty_count += 1
+            lifecycle = "advised"
+        elif status == "stale":
+            self._zen_metrics.provider_stale_count += 1
+            lifecycle = need.lifecycle_state
+        elif status == "unsupported":
+            lifecycle = "advised"
+        else:
+            self._zen_metrics.rejected_slice_count += 1
+            lifecycle = "rejected"
+        if lifecycle != need.lifecycle_state:
+            self._replace_context_need(need, lifecycle_state=lifecycle)
+        self._record_trace(
+            action="deferred" if status in {"denied", "empty", "unsupported", "stale"} else "dropped",
+            reason_code=f"context_need_provider_{status}_{need.reason}",
+            token_estimate=max(0, int(outcome.token_estimate)),
+            safety_policy=f"provider_{status}",
+            confidence="uncertain" if status == "stale" else "inferred",
+        )
 
     def _replace_context_need(self, need: ZenContextNeed, *, lifecycle_state: str) -> ZenContextNeed:
         if lifecycle_state not in _NEED_STATES:
@@ -1038,22 +1115,65 @@ def _artifact_references(text: str) -> list[str]:
     return refs[:6]
 
 
-def _coerce_context_slice(need_id: str, raw: ZenContextSlice | Dict[str, Any] | str) -> ZenContextSlice | None:
+def _coerce_provider_outcome(raw: ZenContextSlice | ZenProviderOutcome | Dict[str, Any] | str) -> ZenProviderOutcome | None:
+    if isinstance(raw, ZenProviderOutcome):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+    status = str(raw.get("status", "") or raw.get("outcome", "")).strip().lower()
+    if status not in _PROVIDER_OUTCOMES:
+        return None
+    return ZenProviderOutcome(
+        status=status,
+        reason=str(raw.get("reason", "") or raw.get("error", "")),
+        summary=str(raw.get("summary", "")),
+        source_id=str(raw.get("source_id", "") or raw.get("source", "")),
+        token_estimate=int(raw.get("token_estimate", 0) or 0),
+    )
+
+
+def _provider_outcome_from_exception(exc: Exception) -> ZenProviderOutcome:
+    code = str(getattr(exc, "code", "") or "").strip().lower()
+    if code in {"forbidden", "missing_authz_policy", "unauthorized", "authz_denied", "permission_denied"}:
+        return ZenProviderOutcome(status="denied", reason=code or "provider_denied")
+    if code in {"not_found", "empty"}:
+        return ZenProviderOutcome(status="empty", reason=code)
+    if code in {"stale", "stale_pointer", "stale_result"}:
+        return ZenProviderOutcome(status="stale", reason=code)
+    return ZenProviderOutcome(status="rejected", reason=code or exc.__class__.__name__)
+
+
+def _coerce_context_slice(
+    need_id: str,
+    raw: ZenContextSlice | ZenProviderOutcome | Dict[str, Any] | str,
+) -> ZenContextSlice | None:
     if isinstance(raw, ZenContextSlice):
         return raw if raw.need_id == need_id else ZenContextSlice(
             need_id=need_id,
             summary=raw.summary,
             source_id=raw.source_id,
             token_estimate=raw.token_estimate,
+            uncertain=raw.uncertain,
         )
+    if isinstance(raw, ZenProviderOutcome):
+        if raw.status != "stale":
+            return None
+        summary = _sentence(raw.summary, _MASKED_SUMMARY_CHARS)
+        source_id = raw.source_id
+        token_estimate = raw.token_estimate or _estimate_tokens(summary)
+        uncertain = True
     if isinstance(raw, dict):
         summary = _sentence(str(raw.get("summary", "")), _MASKED_SUMMARY_CHARS)
         source_id = str(raw.get("source_id", "") or raw.get("source", ""))
         token_estimate = int(raw.get("token_estimate", _estimate_tokens(summary)) or 0)
+        status = str(raw.get("status", "") or raw.get("outcome", "")).strip().lower()
+        uncertain = bool(raw.get("uncertain") or raw.get("stale") or status == "stale")
     else:
-        summary = _sentence(str(raw), _MASKED_SUMMARY_CHARS)
-        source_id = ""
-        token_estimate = _estimate_tokens(summary)
+        if not isinstance(raw, ZenProviderOutcome):
+            summary = _sentence(str(raw), _MASKED_SUMMARY_CHARS)
+            source_id = ""
+            token_estimate = _estimate_tokens(summary)
+            uncertain = False
     if not summary:
         return None
     return ZenContextSlice(
@@ -1061,6 +1181,7 @@ def _coerce_context_slice(need_id: str, raw: ZenContextSlice | Dict[str, Any] | 
         summary=summary,
         source_id=source_id,
         token_estimate=max(1, token_estimate),
+        uncertain=uncertain,
     )
 
 
@@ -1206,6 +1327,7 @@ __all__ = [
     "ZenMetrics",
     "ZenNote",
     "ZenObservationClassification",
+    "ZenProviderOutcome",
     "ZenSourcePointer",
     "register",
 ]
