@@ -3,7 +3,8 @@ from __future__ import annotations
 import copy
 import json
 
-from plugins.context_engine.zen import ZenContextEngine, ZenContextNeed, ZenContextSlice
+from plugins.context_engine.zen import ZenContextEngine, ZenContextNeed, ZenContextSlice, ZenProviderOutcome
+from plugins.context_engine.zen.synapse_provider import SynapseContextNeedProvider
 
 
 class FakeContextNeedProvider:
@@ -14,6 +15,31 @@ class FakeContextNeedProvider:
     def resolve_context_need(self, need: ZenContextNeed, budget: int):
         self.calls.append((need, budget))
         return self.slices
+
+
+class FakeSynapseError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class FakeSynapseClient:
+    def __init__(self, response=None, *, error: Exception | None = None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def retrieve_document(self, request):
+        self.calls.append(("retrieve_document", request))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    def retrieve_memory(self, request):
+        self.calls.append(("retrieve_memory", request))
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
 def test_zen_compiles_source_backed_request_copy_brief() -> None:
@@ -765,3 +791,279 @@ def test_fallback_and_bypass_suppress_proactive_sensing_and_provider_calls() -> 
     assert bypass.zen_context_slices == ()
     assert bypass.zen_metrics["provider_call_count"] == 0
     assert provider.calls == []
+
+
+def test_provider_denied_and_empty_outcomes_stay_advisory_and_traced() -> None:
+    denied_provider = FakeContextNeedProvider([
+        ZenProviderOutcome(status="denied", reason="forbidden"),
+    ])
+    denied = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=denied_provider,
+    )
+
+    denied_brief = denied.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+
+    assert denied_brief
+    assert "needed_context advisory" in denied_brief
+    assert "needed_context resolved" not in denied_brief
+    assert denied.zen_metrics["provider_denied_count"] == 1
+    assert denied.zen_metrics["injected_slice_count"] == 0
+    assert any(
+        trace.reason_code == "context_need_provider_denied_continue_without_prior_goal"
+        for trace in denied.zen_decision_traces
+    )
+
+    empty_provider = FakeContextNeedProvider([])
+    empty = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=empty_provider,
+    )
+
+    empty_brief = empty.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+
+    assert empty_brief
+    assert "needed_context advisory" in empty_brief
+    assert empty.zen_metrics["provider_empty_count"] == 1
+    assert any(
+        trace.reason_code == "context_need_provider_empty_continue_without_prior_goal"
+        for trace in empty.zen_decision_traces
+    )
+
+
+def test_stale_provider_outcome_injects_uncertain_source_backed_slice() -> None:
+    provider = FakeContextNeedProvider([
+        {
+            "status": "stale",
+            "summary": "Prior decision may be stale; verify against latest branch state.",
+            "source_id": "synapse:ptr-stale",
+            "token_estimate": 24,
+        }
+    ])
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context resolved uncertain" in brief
+    assert "synapse:ptr-stale" in brief
+    assert engine.zen_context_slices[0].uncertain is True
+    assert engine.zen_metrics["provider_stale_count"] == 1
+    assert engine.zen_context_needs[0].lifecycle_state == "resolved"
+
+
+def test_provider_exception_denial_is_converted_to_advisory_outcome() -> None:
+    class RaisingProvider:
+        def resolve_context_need(self, need: ZenContextNeed, budget: int):
+            raise FakeSynapseError("forbidden")
+
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=RaisingProvider(),
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context advisory" in brief
+    assert engine.zen_metrics["provider_denied_count"] == 1
+    assert engine.zen_metrics["injected_slice_count"] == 0
+
+
+def test_synapse_adapter_resolves_missing_artifact_with_bounded_source_slice() -> None:
+    client = FakeSynapseClient({
+        "slices": [
+            {
+                "entity_id": "doc-phase4",
+                "entity_type": "document",
+                "title": "Phase 4 implementation notes",
+                "fields": {"summary": "Use Synapse retrieval only for provider context."},
+                "pointers": [{"id": "synapse.ptr.phase4"}],
+            }
+        ]
+    })
+    provider = SynapseContextNeedProvider(client=client, agent_profile="agent.documents.reader")
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True, "context_need_token_budget": 80},
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Read docs/phase4.md before continuing.",
+        conversation_history=[
+            {"role": "assistant", "content": "Plan: inspect the current task."},
+            {"role": "user", "content": "Read docs/phase4.md before continuing."},
+        ],
+        current_turn_user_idx=1,
+    )
+
+    assert brief
+    assert "needed_context resolved" in brief
+    assert "synapse.ptr.phase4" in brief
+    assert client.calls
+    method, request = client.calls[0]
+    assert method == "retrieve_document"
+    assert request["domain"] == "documents"
+    assert request["token_budget"] == 80
+    assert engine.zen_metrics["provider_budget_used"] <= 80
+
+
+def test_synapse_adapter_denied_empty_and_stale_results_follow_policy() -> None:
+    denied_client = FakeSynapseClient(error=FakeSynapseError("forbidden"))
+    denied_provider = SynapseContextNeedProvider(client=denied_client, agent_profile="agent.denied")
+    denied = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=denied_provider,
+    )
+    denied_brief = denied.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+    assert denied_brief
+    assert "needed_context advisory" in denied_brief
+    assert denied.zen_metrics["provider_denied_count"] == 1
+    assert denied.zen_metrics["injected_slice_count"] == 0
+
+    empty_client = FakeSynapseClient({"slices": []})
+    empty_provider = SynapseContextNeedProvider(client=empty_client, agent_profile="agent.documents.reader")
+    empty = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=empty_provider,
+    )
+    empty_brief = empty.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+    assert empty_brief
+    assert "needed_context advisory" in empty_brief
+    assert empty.zen_metrics["provider_empty_count"] == 1
+
+    stale_client = FakeSynapseClient({
+        "slices": [
+            {
+                "entity_id": "mem-stale",
+                "title": "Prior goal",
+                "fields": {"summary": "May be stale."},
+                "pointers": [{"id": "synapse.ptr.stale"}],
+                "stale": True,
+            }
+        ]
+    })
+    stale_provider = SynapseContextNeedProvider(client=stale_client, agent_profile="agent.memory.reader")
+    stale = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True},
+        context_need_provider=stale_provider,
+    )
+    stale_brief = stale.compile_turn_context(
+        session_id="s1",
+        user_message="Continue.",
+        conversation_history=[],
+        current_turn_user_idx=0,
+    )
+    assert stale_brief
+    assert "needed_context resolved uncertain" in stale_brief
+    assert stale.zen_metrics["provider_stale_count"] == 1
+
+
+def test_synapse_adapter_rejects_missing_source_and_budget_overflow() -> None:
+    client = FakeSynapseClient({
+        "slices": [
+            {"title": "Missing source", "fields": {"summary": "No pointer or entity id."}},
+            {
+                "entity_id": "doc-large",
+                "title": "Large result",
+                "fields": {"summary": "large " * 500},
+                "pointers": [{"id": "synapse.ptr.large"}],
+            },
+        ]
+    })
+    provider = SynapseContextNeedProvider(client=client, agent_profile="agent.documents.reader")
+    engine = ZenContextEngine(
+        model="test",
+        quiet_mode=True,
+        config_context_length=200000,
+        zen_config={"context_need_provider_enabled": True, "context_need_token_budget": 40},
+        context_need_provider=provider,
+    )
+
+    brief = engine.compile_turn_context(
+        session_id="s1",
+        user_message="Read docs/phase4.md next.",
+        conversation_history=[{"role": "user", "content": "Read docs/phase4.md next."}],
+        current_turn_user_idx=0,
+    )
+
+    assert brief
+    assert "needed_context advisory" in brief
+    assert "needed_context resolved" not in brief
+    assert engine.zen_metrics["rejected_slice_count"] >= 2
+    assert engine.zen_metrics["injected_slice_count"] == 0
+
+
+def test_synapse_adapter_source_excludes_direct_backend_dependencies() -> None:
+    import inspect
+    import plugins.context_engine.zen.synapse_provider as synapse_provider
+
+    source = inspect.getsource(synapse_provider)
+
+    for forbidden in (
+        "Axon",
+        "Spine",
+        "Cortex",
+        "Postgres",
+        "InMemory",
+        "local store",
+    ):
+        assert forbidden not in source
