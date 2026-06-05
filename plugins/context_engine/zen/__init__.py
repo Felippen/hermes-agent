@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Protocol
 
 from agent.context_compressor import ContextCompressor
 
@@ -31,6 +31,9 @@ _EVIDENCE_RE = re.compile(r"\b(passed|validated|verified|succeeded|complete|comp
 _CONSTRAINT_RE = re.compile(r"\b(must|shall|required|do not|don't|never|only|preserve|avoid|without|explicitly)\b", re.I)
 _PLAN_RE = re.compile(r"\b(plan|next step|approach|decision|choose|chosen|implement|verify)\b", re.I)
 _OPEN_RE = re.compile(r"\b(todo|open question|blocked|remaining|unclear|unknown|need to|next)\b", re.I)
+_CONTINUE_RE = re.compile(r"\b(continue|resume|pick up|carry on|what'?s next|next)\b", re.I)
+_VERIFY_RE = re.compile(r"\b(verify|verification|validate|validation|test|rollback|merge order|pr)\b", re.I)
+_PR_RE = re.compile(r"(?:pull/\d+|PR\s*#?\d+|#\d+)", re.I)
 
 _LARGE_OBSERVATION_CHARS = 1200
 _MASKED_SUMMARY_CHARS = 280
@@ -52,6 +55,9 @@ _TRACE_ACTIONS = {
     "fallback",
     "bypassed",
 }
+_NEED_STATES = {"detected", "advised", "resolved", "suppressed", "rejected"}
+_NEED_RISK_LEVELS = {"low", "medium", "high"}
+_NEED_POLICIES = {"advisory", "provider_allowed", "provider_blocked"}
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,12 @@ class ZenMetrics:
     trace_event_count: int = 0
     trace_complete: bool = True
     privacy_safe: bool = True
+    context_need_count: int = 0
+    context_need_advisory_count: int = 0
+    provider_call_count: int = 0
+    injected_slice_count: int = 0
+    rejected_slice_count: int = 0
+    provider_budget_used: int = 0
 
     @property
     def compression_ratio(self) -> float:
@@ -133,7 +145,64 @@ class ZenMetrics:
             "trace_event_count": self.trace_event_count,
             "trace_complete": self.trace_complete,
             "privacy_safe": self.privacy_safe,
+            "context_need_count": self.context_need_count,
+            "context_need_advisory_count": self.context_need_advisory_count,
+            "provider_call_count": self.provider_call_count,
+            "injected_slice_count": self.injected_slice_count,
+            "rejected_slice_count": self.rejected_slice_count,
+            "provider_budget_used": self.provider_budget_used,
         }
+
+
+@dataclass(frozen=True)
+class ZenContextNeed:
+    need_id: str
+    reason: str
+    confidence: float
+    triggering_source: str
+    desired_context_type: str
+    risk_level: str
+    acquisition_policy: str
+    trace_id: str
+    token_budget: int
+    lifecycle_state: str = "detected"
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        return {
+            "need_id": self.need_id,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "triggering_source": self.triggering_source,
+            "desired_context_type": self.desired_context_type,
+            "risk_level": self.risk_level,
+            "acquisition_policy": self.acquisition_policy,
+            "trace_id": self.trace_id,
+            "token_budget": self.token_budget,
+            "lifecycle_state": self.lifecycle_state,
+            "redacted": True,
+        }
+
+
+@dataclass(frozen=True)
+class ZenContextSlice:
+    need_id: str
+    summary: str
+    source_id: str
+    token_estimate: int
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        return {
+            "need_id": self.need_id,
+            "summary": _sentence(self.summary, _MASKED_SUMMARY_CHARS),
+            "source_id": self.source_id,
+            "token_estimate": self.token_estimate,
+            "redacted": True,
+        }
+
+
+class ZenContextNeedProvider(Protocol):
+    def resolve_context_need(self, need: ZenContextNeed, budget: int) -> Iterable[ZenContextSlice | Dict[str, Any] | str]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -160,6 +229,7 @@ class ZenContextEngine(ContextCompressor):
         model: str = "",
         *args: Any,
         zen_config: Dict[str, Any] | None = None,
+        context_need_provider: ZenContextNeedProvider | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(model=model, *args, **kwargs)
@@ -170,6 +240,10 @@ class ZenContextEngine(ContextCompressor):
         self._zen_observation_fingerprints: dict[str, int] = {}
         self._zen_observation_sources: dict[str, tuple[str, ...]] = {}
         self._zen_decision_traces: list[ZenDecisionTrace] = []
+        self._zen_context_needs: list[ZenContextNeed] = []
+        self._zen_context_slices: list[ZenContextSlice] = []
+        self._zen_context_need_seen: set[str] = set()
+        self._zen_context_need_provider = context_need_provider
         self._zen_metrics = ZenMetrics()
         self._zen_last_brief_chars = 0
         self._zen_config = _normalize_zen_config(zen_config)
@@ -181,6 +255,9 @@ class ZenContextEngine(ContextCompressor):
 
     def configure_zen(self, config: Dict[str, Any] | None) -> None:
         self._zen_config = _normalize_zen_config(config)
+
+    def configure_context_need_provider(self, provider: ZenContextNeedProvider | None) -> None:
+        self._zen_context_need_provider = provider
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
@@ -231,7 +308,10 @@ class ZenContextEngine(ContextCompressor):
             self._zen_metrics.context_chars_out = 0
             return None
         self._ingest_messages(conversation_history, current_turn_user_idx)
-        brief = self._assemble_working_brief(user_message=user_message)
+        brief = self._assemble_working_brief(
+            user_message=user_message,
+            current_turn_user_idx=current_turn_user_idx,
+        )
         self._zen_last_brief_chars = len(brief)
         self._zen_metrics.context_chars_out = len(brief)
         return brief or None
@@ -293,6 +373,14 @@ class ZenContextEngine(ContextCompressor):
     def zen_metrics(self) -> dict[str, Any]:
         return self._zen_metrics.to_safe_dict()
 
+    @property
+    def zen_context_needs(self) -> tuple[ZenContextNeed, ...]:
+        return tuple(self._zen_context_needs)
+
+    @property
+    def zen_context_slices(self) -> tuple[ZenContextSlice, ...]:
+        return tuple(self._zen_context_slices)
+
     def _clear_zen_state(self) -> None:
         self._zen_notes.clear()
         self._zen_seen.clear()
@@ -300,6 +388,9 @@ class ZenContextEngine(ContextCompressor):
         self._zen_observation_fingerprints.clear()
         self._zen_observation_sources.clear()
         self._zen_decision_traces.clear()
+        self._zen_context_needs.clear()
+        self._zen_context_slices.clear()
+        self._zen_context_need_seen.clear()
         self._zen_metrics = ZenMetrics()
         self._zen_last_brief_chars = 0
 
@@ -540,15 +631,27 @@ class ZenContextEngine(ContextCompressor):
             )
         return note
 
-    def _assemble_working_brief(self, *, user_message: str) -> str:
-        if not self._zen_notes:
-            return ""
+    def _assemble_working_brief(self, *, user_message: str, current_turn_user_idx: int | None = None) -> str:
         ordered = sorted(
             self._zen_notes,
             key=lambda note: (_kind_rank(note.kind), note.source.message_index),
         )
         selected = _latest_by_kind_then_rank(ordered, self.max_brief_notes)
-        if not selected:
+        fallback_source = _latest_source(selected)
+        if fallback_source is None and user_message.strip():
+            fallback_source = self._source_pointer(
+                current_turn_user_idx if current_turn_user_idx is not None and current_turn_user_idx >= 0 else 0,
+                "user",
+                user_message,
+            )
+        needs = self._sense_context_needs(
+            selected,
+            user_message=user_message,
+            current_turn_user_idx=current_turn_user_idx,
+            fallback_source=fallback_source,
+        )
+        need_lines = self._context_need_brief_lines(needs)
+        if not selected and not need_lines:
             return ""
         lines = ["Hermes Zen working brief (session-local, source-backed):"]
         for note in selected:
@@ -570,7 +673,229 @@ class ZenContextEngine(ContextCompressor):
             )
         if _has_conflicting_constraints(selected):
             lines.append("- uncertainty: constraints may conflict; verify against the latest user turn before acting")
+        lines.extend(need_lines)
         return "\n".join(lines)
+
+    def _sense_context_needs(
+        self,
+        selected: list[ZenNote],
+        *,
+        user_message: str,
+        current_turn_user_idx: int | None = None,
+        fallback_source: ZenSourcePointer | None = None,
+    ) -> list[ZenContextNeed]:
+        if not self._zen_config["proactive_sensing_enabled"]:
+            self._record_trace(
+                action="deferred",
+                reason_code="proactive_sensing_disabled",
+                safety_policy="operator_control",
+            )
+            return []
+        needs: list[ZenContextNeed] = []
+        prior_selected = [
+            note for note in selected
+            if current_turn_user_idx is None or note.source.message_index != current_turn_user_idx
+        ]
+        selected_text = " ".join(note.summary for note in prior_selected).lower()
+        trigger = _latest_source(selected) or fallback_source
+
+        repeated_failed = _repeated_failed_fingerprint(self._zen_notes)
+        if repeated_failed and trigger is not None:
+            needs.append(self._make_context_need(
+                reason="repeated_failed_action",
+                confidence=0.92,
+                source=trigger,
+                desired_context_type="failed_path",
+                risk_level="medium",
+                acquisition_policy="provider_allowed",
+            ))
+
+        if _CONTINUE_RE.search(user_message) and not any(
+            note.kind in {"plan_anchor", "constraint", "user_guidance"} for note in prior_selected
+        ):
+            needs.append(self._make_context_need(
+                reason="continue_without_prior_goal",
+                confidence=0.78,
+                source=trigger,
+                desired_context_type="prior_goal",
+                risk_level="medium",
+                acquisition_policy="provider_allowed",
+            ))
+
+        if any(note.kind == "evidence" and note.source.pointer_id not in self._zen_source_pointers for note in selected):
+            needs.append(self._make_context_need(
+                reason="source_claim_missing_evidence",
+                confidence=0.86,
+                source=trigger,
+                desired_context_type="source_evidence",
+                risk_level="high",
+                acquisition_policy="provider_blocked",
+            ))
+
+        missing_refs = [
+            ref for ref in _artifact_references(user_message)
+            if ref.lower() not in selected_text
+        ]
+        if missing_refs:
+            needs.append(self._make_context_need(
+                reason="missing_referenced_artifact",
+                confidence=0.82,
+                source=trigger,
+                desired_context_type="referenced_artifact",
+                risk_level="medium",
+                acquisition_policy="provider_allowed",
+            ))
+
+        if _VERIFY_RE.search(user_message) and not any(
+            term in selected_text
+            for term in ("validate", "validated", "verification", "pytest", "rollback", "merge order", "openspec")
+        ):
+            needs.append(self._make_context_need(
+                reason="missing_verification_context",
+                confidence=0.88,
+                source=trigger,
+                desired_context_type="verification_context",
+                risk_level="high",
+                acquisition_policy="provider_blocked",
+            ))
+        return [need for need in needs if need.need_id in self._zen_context_need_seen]
+
+    def _make_context_need(
+        self,
+        *,
+        reason: str,
+        confidence: float,
+        source: ZenSourcePointer | None,
+        desired_context_type: str,
+        risk_level: str,
+        acquisition_policy: str,
+    ) -> ZenContextNeed:
+        source_id = source.pointer_id if source is not None else ""
+        base = f"{reason}:{source_id}:{desired_context_type}:{risk_level}"
+        need_id = hashlib.sha256(base.encode("utf-8", errors="replace")).hexdigest()[:12]
+        if need_id in self._zen_context_need_seen:
+            return next(need for need in self._zen_context_needs if need.need_id == need_id)
+        trace_id = f"context_need_{reason}"
+        need = ZenContextNeed(
+            need_id=need_id,
+            reason=reason,
+            confidence=round(max(0.0, min(1.0, confidence)), 2),
+            triggering_source=source_id,
+            desired_context_type=desired_context_type,
+            risk_level=risk_level if risk_level in _NEED_RISK_LEVELS else "medium",
+            acquisition_policy=acquisition_policy if acquisition_policy in _NEED_POLICIES else "advisory",
+            trace_id=trace_id,
+            token_budget=int(self._zen_config["context_need_token_budget"]),
+            lifecycle_state="detected",
+        )
+        self._zen_context_needs.append(need)
+        self._zen_context_need_seen.add(need_id)
+        self._zen_metrics.context_need_count = len(self._zen_context_needs)
+        self._record_trace(
+            action="deferred",
+            reason_code=trace_id,
+            source=source,
+            token_estimate=need.token_budget,
+            safety_policy="context_need_detected",
+            confidence="inferred",
+        )
+        return need
+
+    def _context_need_brief_lines(self, needs: list[ZenContextNeed]) -> list[str]:
+        lines: list[str] = []
+        for need in needs[:4]:
+            resolved = self._maybe_resolve_context_need(need)
+            if resolved:
+                for item in resolved:
+                    lines.append(
+                        f"- needed_context resolved: {item.summary} [source: {item.source_id}; need: {need.need_id}]"
+                    )
+                continue
+            advised = self._replace_context_need(need, lifecycle_state="advised")
+            self._zen_metrics.context_need_advisory_count += 1
+            self._record_trace(
+                action="selected",
+                reason_code=f"context_need_advisory_{need.reason}",
+                token_estimate=need.token_budget,
+                safety_policy="advisory_only",
+                confidence="inferred",
+            )
+            lines.append(
+                f"- needed_context advisory: {advised.desired_context_type} needed because {advised.reason} "
+                f"[need: {advised.need_id}; risk: {advised.risk_level}; policy: {advised.acquisition_policy}]"
+            )
+        return lines
+
+    def _maybe_resolve_context_need(self, need: ZenContextNeed) -> list[ZenContextSlice]:
+        if not self._zen_config["context_need_provider_enabled"] or self._zen_context_need_provider is None:
+            return []
+        if need.confidence < float(self._zen_config["context_need_min_confidence"]):
+            return []
+        if need.risk_level == "high" or need.acquisition_policy != "provider_allowed":
+            return []
+        self._zen_metrics.provider_call_count += 1
+        slices: list[ZenContextSlice] = []
+        budget_used = 0
+        for raw in self._zen_context_need_provider.resolve_context_need(need, need.token_budget):
+            item = _coerce_context_slice(need.need_id, raw)
+            if not item or not item.source_id:
+                self._zen_metrics.rejected_slice_count += 1
+                self._record_trace(
+                    action="dropped",
+                    reason_code=f"context_need_rejected_{need.reason}",
+                    token_estimate=need.token_budget,
+                    safety_policy="provider_slice_rejected",
+                    confidence="inferred",
+                )
+                continue
+            if item.token_estimate > need.token_budget - budget_used:
+                self._zen_metrics.rejected_slice_count += 1
+                self._record_trace(
+                    action="dropped",
+                    reason_code=f"context_need_rejected_{need.reason}",
+                    token_estimate=item.token_estimate,
+                    safety_policy="provider_budget_rejected",
+                    confidence="inferred",
+                )
+                continue
+            slices.append(item)
+            budget_used += item.token_estimate
+        if not slices:
+            return []
+        self._zen_metrics.provider_budget_used += budget_used
+        self._zen_metrics.injected_slice_count += len(slices)
+        self._zen_context_slices.extend(slices)
+        self._replace_context_need(need, lifecycle_state="resolved")
+        self._record_trace(
+            action="selected",
+            reason_code=f"context_need_resolved_{need.reason}",
+            token_estimate=budget_used,
+            budget_impact=budget_used,
+            safety_policy="provider_bounded",
+            confidence="observed",
+        )
+        return slices
+
+    def _replace_context_need(self, need: ZenContextNeed, *, lifecycle_state: str) -> ZenContextNeed:
+        if lifecycle_state not in _NEED_STATES:
+            lifecycle_state = "rejected"
+        updated = ZenContextNeed(
+            need_id=need.need_id,
+            reason=need.reason,
+            confidence=need.confidence,
+            triggering_source=need.triggering_source,
+            desired_context_type=need.desired_context_type,
+            risk_level=need.risk_level,
+            acquisition_policy=need.acquisition_policy,
+            trace_id=need.trace_id,
+            token_budget=need.token_budget,
+            lifecycle_state=lifecycle_state,
+        )
+        self._zen_context_needs = [
+            updated if item.need_id == need.need_id else item
+            for item in self._zen_context_needs
+        ]
+        return updated
 
     @property
     def _zen_large_observation_chars(self) -> int:
@@ -670,6 +995,10 @@ def _normalize_zen_config(config: Dict[str, Any] | None) -> dict[str, Any]:
         "masking_strictness": strictness,
         "trace_verbosity": verbosity,
         "bypass_session_ids": bypass_session_ids,
+        "proactive_sensing_enabled": bool(raw.get("proactive_sensing_enabled", True)),
+        "context_need_provider_enabled": bool(raw.get("context_need_provider_enabled", False)),
+        "context_need_token_budget": max(40, int(raw.get("context_need_token_budget", 240) or 240)),
+        "context_need_min_confidence": float(raw.get("context_need_min_confidence", 0.7) or 0.7),
     }
 
 
@@ -682,6 +1011,57 @@ def _estimate_tokens(text: str) -> int:
     if not compact:
         return 0
     return max(1, (len(compact) + 3) // 4)
+
+
+def _latest_source(notes: list[ZenNote]) -> ZenSourcePointer | None:
+    if not notes:
+        return None
+    return max(notes, key=lambda note: note.source.message_index).source
+
+
+def _repeated_failed_fingerprint(notes: list[ZenNote]) -> str:
+    seen: set[str] = set()
+    for note in notes:
+        if note.kind != "failed_path":
+            continue
+        fingerprint = note.masking.payload_fingerprint if note.masking else _observation_fingerprint(note.summary)
+        if fingerprint in seen:
+            return fingerprint
+        seen.add(fingerprint)
+    return ""
+
+
+def _artifact_references(text: str) -> list[str]:
+    refs = _paths(text)
+    for match in _PR_RE.finditer(text):
+        refs.append(match.group(0))
+    return refs[:6]
+
+
+def _coerce_context_slice(need_id: str, raw: ZenContextSlice | Dict[str, Any] | str) -> ZenContextSlice | None:
+    if isinstance(raw, ZenContextSlice):
+        return raw if raw.need_id == need_id else ZenContextSlice(
+            need_id=need_id,
+            summary=raw.summary,
+            source_id=raw.source_id,
+            token_estimate=raw.token_estimate,
+        )
+    if isinstance(raw, dict):
+        summary = _sentence(str(raw.get("summary", "")), _MASKED_SUMMARY_CHARS)
+        source_id = str(raw.get("source_id", "") or raw.get("source", ""))
+        token_estimate = int(raw.get("token_estimate", _estimate_tokens(summary)) or 0)
+    else:
+        summary = _sentence(str(raw), _MASKED_SUMMARY_CHARS)
+        source_id = ""
+        token_estimate = _estimate_tokens(summary)
+    if not summary:
+        return None
+    return ZenContextSlice(
+        need_id=need_id,
+        summary=summary,
+        source_id=source_id,
+        token_estimate=max(1, token_estimate),
+    )
 
 
 def _trace_complete(trace: ZenDecisionTrace) -> bool:
@@ -818,6 +1198,9 @@ def _has_conflicting_constraints(notes: list[ZenNote]) -> bool:
 
 __all__ = [
     "ZenContextEngine",
+    "ZenContextNeed",
+    "ZenContextNeedProvider",
+    "ZenContextSlice",
     "ZenDecisionTrace",
     "ZenMaskingMetadata",
     "ZenMetrics",
