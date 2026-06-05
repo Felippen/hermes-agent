@@ -195,6 +195,23 @@ def test_update_from_response_forwards_canonical_cache_buckets():
     assert usage_dict["output_tokens"] == 500
 
 
+def test_context_engine_default_turn_context_is_empty():
+    """Existing engines get a no-op turn-context hook by default."""
+    from tests.agent.test_context_engine import StubEngine
+
+    engine = StubEngine()
+
+    assert engine.compile_turn_context(
+        session_id="s1",
+        user_message="hello",
+        conversation_history=[{"role": "user", "content": "hello"}],
+        current_turn_user_idx=0,
+        model="fake-model",
+        platform="cli",
+        system_prompt_chars=10,
+    ) is None
+
+
 def test_discover_context_engines_includes_plugin_registered_engines(monkeypatch):
     """Plugin-registered context engines appear in the ``hermes plugins`` picker."""
     from hermes_cli import plugins_cmd
