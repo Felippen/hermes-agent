@@ -10919,11 +10919,24 @@ class GatewayRunner:
             return f"❌ Could not load config: {exc}"
         cfg = load_config()
 
+        defer_migration = new_value == "codex_app_server"
         result = crs.apply(
             cfg,
             new_value,
             persist_callback=(save_config if new_value is not None else None),
+            defer_plugin_migration=defer_migration,
         )
+
+        if result.success and result.plugin_migration_deferred:
+            from hermes_cli.codex_runtime_migration_state import (
+                schedule_plugin_migration,
+            )
+
+            schedule_plugin_migration(cfg)
+        elif result.success and new_value == "auto":
+            from hermes_cli.codex_runtime_migration_state import mark_idle
+
+            mark_idle()
 
         # On a real change, evict the cached agent so the new runtime takes
         # effect on the next message rather than waiting for cache TTL.

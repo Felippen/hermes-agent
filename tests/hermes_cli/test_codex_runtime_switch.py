@@ -236,3 +236,40 @@ class TestApply:
                           return_value=(True, "0.130.0")) as bin_check:
             crs.apply(cfg, None)
         assert bin_check.call_count == 1
+
+    def test_defer_plugin_migration_skips_sync_migrate(self):
+        cfg = {"mcp_servers": {}}
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")), \
+             patch.object(crs, "run_plugin_migration") as migrate, \
+             patch(
+                 "hermes_cli.codex_runtime_migration_state.schedule_plugin_migration"
+             ) as schedule:
+            r = crs.apply(cfg, "codex_app_server", defer_plugin_migration=True)
+        assert r.success
+        assert r.plugin_migration_deferred is True
+        migrate.assert_not_called()
+        schedule.assert_not_called()  # gateway schedules; apply only defers
+
+    def test_sync_enable_still_migrates_by_default(self):
+        cfg = {"mcp_servers": {}}
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")), \
+             patch.object(crs, "run_plugin_migration") as migrate, \
+             patch("hermes_cli.codex_runtime_migration_state.mark_complete"):
+            migrate.return_value = type(
+                "Report",
+                (),
+                {
+                    "migrated": ["hermes-tools"],
+                    "migrated_plugins": [],
+                    "plugin_query_error": None,
+                    "wrote_permissions_default": ":workspace",
+                    "target_path": "/tmp/config.toml",
+                    "errors": [],
+                },
+            )()
+            r = crs.apply(cfg, "codex_app_server")
+        assert r.success
+        assert not r.plugin_migration_deferred
+        migrate.assert_called_once()

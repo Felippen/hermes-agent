@@ -1585,6 +1585,26 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             logger.warning("Failed to list Codex picker models: %s", exc)
             return web.json_response(_openai_error(str(exc)), status=500)
 
+    async def _handle_codex_migration_status(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /v1/providers/codex/migration-status — background setup progress."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.codex_runtime_migration_state import get_status
+
+        status = get_status()
+        payload = status.as_dict()
+        return web.json_response(
+            {
+                "object": "hermes.provider.codex_migration_status",
+                "provider": "codex",
+                **payload,
+            }
+        )
+
     async def _handle_get_session_model(self, request: "web.Request") -> "web.Response":
         """GET /v1/sessions/{session_id}/model — read session model override."""
         auth_err = self._check_auth(request)
@@ -3733,11 +3753,23 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             return {"type": "error", "message": f"Could not load config: {exc}"}
 
         cfg = load_config()
+        defer_migration = new_value == "codex_app_server"
         result = crs.apply(
             cfg,
             new_value,
             persist_callback=(save_config if new_value is not None else None),
+            defer_plugin_migration=defer_migration,
         )
+        if result.success and result.plugin_migration_deferred:
+            from hermes_cli.codex_runtime_migration_state import (
+                schedule_plugin_migration,
+            )
+
+            schedule_plugin_migration(cfg)
+        elif result.success and new_value == "auto":
+            from hermes_cli.codex_runtime_migration_state import mark_idle
+
+            mark_idle()
         prefix = "✓" if result.success else "✗"
         if result.success:
             return {"type": "text", "content": f"{prefix} {result.message}"}
@@ -8547,6 +8579,10 @@ class APIServerAdapter(DevControlRouteMixin, BasePlatformAdapter):
             self._app.router.add_get(
                 "/v1/providers/codex/models",
                 self._handle_codex_models,
+            )
+            self._app.router.add_get(
+                "/v1/providers/codex/migration-status",
+                self._handle_codex_migration_status,
             )
             self._app.router.add_get("/v1/sessions/{session_id}/model", self._handle_get_session_model)
             self._app.router.add_post("/v1/sessions/{session_id}/model", self._handle_set_session_model)

@@ -1251,6 +1251,65 @@ def _fetch_openrouter_live_model_items(timeout: float = 8.0) -> list[dict[str, A
     return [item for item in live_items if isinstance(item, dict)]
 
 
+_OPENROUTER_PICKER_REASONING_PREFIXES = (
+    "deepseek/",
+    "anthropic/",
+    "openai/",
+    "x-ai/",
+    "google/gemini-2",
+    "google/gemini-3",
+    "google/gemma-4",
+    "qwen/qwen3",
+    "tencent/hy3-preview",
+    "xiaomi/",
+)
+
+_OPENROUTER_DEFAULT_REASONING_EFFORTS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
+
+def _openrouter_model_advertises_reasoning(item: dict[str, Any]) -> bool:
+    params = item.get("supported_parameters")
+    if isinstance(params, list) and "reasoning" in params:
+        return True
+    mid = str(item.get("id") or "").strip().lower()
+    return any(mid.startswith(prefix) for prefix in _OPENROUTER_PICKER_REASONING_PREFIXES)
+
+
+def _openrouter_picker_reasoning_efforts(model_id: str, *, advertises_reasoning: bool) -> list[str]:
+    """Return supported reasoning-effort levels for OpenRouter picker UIs."""
+    mid = str(model_id or "").strip().lower()
+    if not mid:
+        return []
+    if not advertises_reasoning and not any(
+        mid.startswith(prefix) for prefix in _OPENROUTER_PICKER_REASONING_PREFIXES
+    ):
+        return []
+
+    bare = mid.rsplit("/", 1)[-1]
+    if bare.startswith("grok-"):
+        if any(
+            bare.startswith(prefix)
+            for prefix in ("grok-3-mini", "grok-4.20-multi-agent", "grok-4.3")
+        ):
+            return ["low", "medium", "high"]
+        return []
+
+    if bare.startswith("o") and len(bare) > 1 and bare[1].isdigit():
+        return ["low", "medium", "high"]
+
+    if "gpt-5" in bare:
+        return ["minimal", "low", "medium", "high", "xhigh"]
+
+    return list(_OPENROUTER_DEFAULT_REASONING_EFFORTS)
+
+
 def _openrouter_picker_entry(item: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize one OpenRouter catalog item for external picker UIs."""
     mid = str(item.get("id") or "").strip()
@@ -1270,12 +1329,21 @@ def _openrouter_picker_entry(item: dict[str, Any]) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             context_length = None
 
+    advertises_reasoning = _openrouter_model_advertises_reasoning(item)
+    effort_levels = _openrouter_picker_reasoning_efforts(
+        mid, advertises_reasoning=advertises_reasoning
+    )
+
     return {
         "id": mid,
         "name": name,
         "context_length": context_length,
         "is_free": _openrouter_model_is_free(item.get("pricing")),
         "pricing": _openrouter_picker_pricing(item.get("pricing")),
+        "supports_reasoning": bool(effort_levels),
+        "reasoning_efforts": [
+            {"effort": effort, "description": ""} for effort in effort_levels
+        ],
     }
 
 
