@@ -55,6 +55,7 @@ AUTHOR_MAP = {
     "ilonagaja509-glitch@users.noreply.github.com": "ilonagaja509-glitch",
     "info@aminvakil.com": "aminvakil",
     "nikpolale@gmail.com": "nikpolale",
+    "naqerl@users.noreply.github.com": "naqerl",
     "redpiggy-cyber@users.noreply.github.com": "redpiggy-cyber",
     "roadhero@users.noreply.github.com": "roadhero",
     "sohyuanchin@gmail.com": "wysie",
