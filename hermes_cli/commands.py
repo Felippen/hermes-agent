@@ -1087,12 +1087,21 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
+    # Keep commands exposed by other gateway surfaces from being displaced by
+    # Slack's manifest cap as the registry grows.
+    priority_commands = {"version"}
+    for cmd in COMMAND_REGISTRY:
+        if cmd.name not in priority_commands:
+            continue
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        _add(cmd.name, cmd.description, cmd.args_hint or "")
+
     # Preserve the short forms operators rely on before canonical Dev commands
     # and plugin-provided commands consume Slack's 50-command manifest cap.
     priority_aliases = {
         "background": ("btw", "bg"),
         "new": ("reset",),
-        "queue": ("q",),
     }
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
